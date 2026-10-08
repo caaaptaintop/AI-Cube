@@ -1698,7 +1698,7 @@ impl KitterApp {
                     cx.listener(|this, _, window, cx| {
                         if this.projects_view.open_project.is_none() {
                             this.projects_view.open_project =
-                                this.model.library.config.project_paths().first().cloned();
+                                this.project_entries().first().map(|entry| entry.path.clone());
                         }
                         this.open_install_dialog(window, cx);
                     }),
@@ -2002,11 +2002,9 @@ impl KitterApp {
             .iter()
             .cloned()
             .chain(
-                self.model
-                    .library
-                    .config
-                    .project_paths()
+                self.project_entries()
                     .into_iter()
+                    .map(|entry| entry.path)
                     .filter(|path| Some(path) != home.as_ref()),
             )
             .collect::<Vec<_>>();

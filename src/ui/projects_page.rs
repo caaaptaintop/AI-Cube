@@ -599,14 +599,12 @@ impl KitterApp {
             .as_ref()
             .and_then(|path| self.project_snapshot(path, cx));
         let global_skill_count = global_skills.as_ref().map(Vec::len);
-        let projects = self
-            .model
-            .library
-            .config
-            .project_paths()
+        let projects = self.project_entries()
             .into_iter()
-            .filter(|path| {
+            .filter(|entry| {
+                let path = &entry.path;
                 let matches_query = query.is_empty()
+                    || entry.name.to_lowercase().contains(&query)
                     || path
                         .file_name()
                         .unwrap_or_default()
@@ -638,14 +636,16 @@ impl KitterApp {
                     .text_size(px(13.))
                     .text_color(p.muted)
                     .text_center()
-                    .child(if self.model.library.config.recent_projects.is_empty() {
+                    .child(if self.project_entries().is_empty() {
                         self.tr("还没有项目", "No projects yet")
                     } else {
                         self.tr("没有匹配的项目", "No matching projects")
                     }),
             );
         }
-        for path in projects {
+        for entry in projects {
+            let path = entry.path;
+            let project_label = entry.name;
             let selected_path = path.clone();
             let selected = !self.projects_view.global_project_view
                 && self.projects_view.open_project.as_ref() == Some(&path);
@@ -725,12 +725,7 @@ impl KitterApp {
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .truncate()
-                                    .child(
-                                        path.file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned(),
-                                    ),
+                                    .child(project_label),
                             )
                             .child(
                                 div()
@@ -745,6 +740,9 @@ impl KitterApp {
                                 content.child(project_tag_chips)
                             }),
                     )
+                    .child(self.effective_agent_badges(
+                        format!("project-sources-{}", path.display()), &entry.agents, cx,
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.projects_view.open_project.as_ref() != Some(&selected_path) {
                             this.projects_view.batch_project = None;
@@ -884,7 +882,7 @@ impl KitterApp {
                 self.panel_header(
                     "projects-panel-window-drag",
                     self.tr("项目", "Projects"),
-                    self.model.library.config.project_paths().len(),
+                    self.project_entries().len(),
                     cx,
                 )
                 .child(

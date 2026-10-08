@@ -94,6 +94,11 @@ enum Command {
         #[arg(long)]
         include_unmanaged: bool,
     },
+    /// List remembered projects and projects discovered from Codex
+    Projects {
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect direct and effective skills for a project
     Project {
         path: PathBuf,
@@ -447,6 +452,24 @@ fn run() -> Result<()> {
             view,
             json,
         } => inspect_project(&library, &path, agent, view, json),
+        Command::Projects { json } => {
+            let discovered = match kitter::project_discovery::codex_home() {
+                Some(home) => kitter::project_discovery::discover_codex_projects(&home)?,
+                None => Vec::new(),
+            };
+            let projects = kitter::project_discovery::merge_projects(
+                &library.config.project_paths(), &discovered,
+                &library.config.hidden_discovered_projects,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&projects)?);
+            } else {
+                for entry in projects {
+                    println!("{}  {}", entry.name, entry.path.display());
+                }
+            }
+            Ok(())
+        },
         Command::Update { skills, all } => update_skills(&mut library, &skills, all),
         Command::Check { json } => {
             let count = source::check_updates(&mut library)?;
