@@ -1454,7 +1454,8 @@ fn protected_data_nodes(root: &Path) -> Result<Vec<PathBuf>> {
 // Removed code is recoverable. This also preserves concurrent data writes that
 // arrive after a preflight check, instead of racing a recursive deletion.
 fn archive_directory(path: &Path, library_dir: &Path) -> Result<()> {
-    let recovery = library_dir.join(".kitter-recovery");
+    let recovery = library_dir.parent().context("技能库目录缺少管理父目录")?
+        .join("library-support").join("recovery");
     fs::create_dir_all(&recovery)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let slot = recovery.join(format!("{stamp}"));

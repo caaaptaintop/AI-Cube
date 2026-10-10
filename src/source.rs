@@ -617,6 +617,8 @@ fn npx_workspace(repository: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     repository.hash(&mut hasher);
     crate::config::app_data_dir()
+        .join("library-support")
+        .join("cache")
         .join("npx-sources")
         .join(format!("{:016x}", hasher.finish()))
 }
@@ -1054,7 +1056,7 @@ printf 'call\n' >> "$KITTER_IMPORT_FIXTURE/calls"
         assert!(
             matches!(library.record("skill-18").unwrap().origin, SkillOrigin::Npx { source_hash: Some(hash), .. } if hash == "hash-18")
         );
-        assert!(!root.join("data/npx-sources").exists());
+        assert!(!root.join("data/library-support/cache/npx-sources").exists());
     }
 
     #[test]
