@@ -390,6 +390,9 @@ fn update_record(library: &mut SkillLibrary, mut record: SkillRecord) -> Result<
         library.adopt(&candidate, &[])?;
         return Ok(());
     }
+    if !record.origin.is_builtin() && !library.has_package_baseline(&storage_name) {
+        bail!("缺少已安装版本的文件基线，无法确认本机修改，已停止更新：{}", record.name);
+    }
     let temp = TempDir::new()?;
     let mut updated_origin = None;
     let source = match record.origin.clone() {

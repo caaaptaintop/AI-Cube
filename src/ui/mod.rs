@@ -983,11 +983,7 @@ impl KitterApp {
         self.model.library.config.collapsed_skill_groups =
             self.skills_view.collapsed_groups.iter().cloned().collect();
         self.model.library.config.collapsed_skill_groups_initialized = true;
-        let _ = self
-            .model
-            .library
-            .config
-            .save_to(self.model.library.data_dir());
+        let _ = self.model.library.save();
     }
 
     fn tag_filter_for(&self, scope: TagScope) -> Option<TagId> {

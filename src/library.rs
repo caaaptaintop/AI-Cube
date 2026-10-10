@@ -1,4 +1,5 @@
 use std::{
+    sync::Mutex,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
@@ -6,8 +7,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::{
@@ -21,6 +26,12 @@ const KITTER_SKILL_MD: &str = include_str!("../resources/skills/kitter/SKILL.md"
 const KITTER_OPENAI_YAML: &str = include_str!("../resources/skills/kitter/agents/openai.yaml");
 const KITTER_INSTALL_CLI_MD: &str =
     include_str!("../resources/skills/kitter/references/install-cli.md");
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_UPDATE_COMMIT: RefCell<Option<fn(&Path, &Path, &Path)>> = RefCell::new(None);
+    static AFTER_CONFIG_READ: RefCell<Option<fn(&Path)>> = RefCell::new(None);
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Registry {
@@ -36,6 +47,8 @@ struct Registry {
     adopted_sources: HashMap<String, AdoptedSource>,
     #[serde(default)]
     trigger_overrides: HashMap<String, TriggerOverride>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    package_baselines: HashMap<String, crate::update_protection::Manifest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,6 +69,7 @@ pub struct SkillLibrary {
     pub config: AppConfig,
     registry: Registry,
     data_dir: PathBuf,
+    disk_revisions: Mutex<[Option<String>; 2]>,
 }
 
 impl SkillLibrary {
@@ -65,14 +79,25 @@ impl SkillLibrary {
 
     pub fn open_in(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
-        let config = AppConfig::load_from(&data_dir)?;
+        let config_bytes = read_optional(&data_dir.join("config.json"))?;
+        #[cfg(test)]
+        AFTER_CONFIG_READ.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().take() { callback(&data_dir); }
+        });
+        let config: AppConfig = match &config_bytes {
+            Some(bytes) => serde_json::from_slice(bytes).context("配置格式无效")?,
+            None => AppConfig { library_dir: data_dir.join("skills"), ..AppConfig::default() },
+        };
         fs::create_dir_all(&config.library_dir)?;
         ensure_builtin_skill(&config.library_dir)?;
         let path = data_dir.join("registry.json");
-        let mut registry: Registry = if path.exists() {
-            serde_json::from_slice(&fs::read(path)?)?
-        } else {
-            Registry::default()
+        let registry_bytes = read_optional(&path)?;
+        let disk_revisions = Mutex::new([
+            config_bytes.as_deref().map(bytes_revision), registry_bytes.as_deref().map(bytes_revision),
+        ]);
+        let mut registry: Registry = match &registry_bytes {
+            Some(bytes) => serde_json::from_slice(bytes)?,
+            None => Registry::default(),
         };
         let mut changed = false;
         let builtin = registry
@@ -203,6 +228,7 @@ impl SkillLibrary {
             config,
             registry,
             data_dir,
+            disk_revisions,
         };
         if changed {
             library.save()?;
@@ -211,8 +237,53 @@ impl SkillLibrary {
     }
 
     pub fn save(&self) -> Result<()> {
-        config::save_json(&self.data_dir.join("config.json"), &self.config)?;
-        config::save_json(&self.data_dir.join("registry.json"), &self.registry)
+        let lock = self.write_lock()?;
+        self.save_locked(&lock)
+    }
+
+    fn verify_disk_revisions(&self) -> Result<()> {
+        let paths = [self.data_dir.join("config.json"), self.data_dir.join("registry.json")];
+        for (path, expected) in paths.iter().zip(self.disk_revisions.lock().map_err(|_| anyhow::anyhow!("登记版本锁不可用"))?.iter()) {
+            if file_revision(path)? != *expected {
+                bail!("Kitter 登记或配置已被其他操作修改，请重新读取后再执行");
+            }
+        }
+        Ok(())
+    }
+
+    fn write_lock(&self) -> Result<fs::File> {
+        fs::create_dir_all(&self.data_dir)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW); }
+        let lock = options.open(self.data_dir.join("registry.lock"))?;
+        lock.try_lock().map_err(|_| anyhow::anyhow!("另一个 Kitter 写操作正在进行，请稍后重试"))?;
+        self.verify_disk_revisions()?;
+        Ok(lock)
+    }
+
+    fn save_locked(&self, _lock: &fs::File) -> Result<()> {
+        self.verify_disk_revisions()?;
+        let paths = [self.data_dir.join("config.json"), self.data_dir.join("registry.json")];
+        let old = paths.iter().map(|p| read_optional(p)).collect::<Result<Vec<_>>>()?;
+        let values = [serde_json::to_vec_pretty(&self.config)?, serde_json::to_vec_pretty(&self.registry)?];
+        for (index, path) in paths.iter().enumerate() {
+            if let Err(error) = write_json_bytes(path, &values[index]) {
+                for done in (0..index).rev() {
+                    if file_revision(&paths[done])? != Some(bytes_revision(&values[done])) {
+                        bail!("保存失败且文件发生并发修改，未覆盖并发版本：{error}");
+                    }
+                    match &old[done] {
+                        Some(bytes) => write_json_bytes(&paths[done], bytes)?,
+                        None => fs::remove_file(&paths[done])?,
+                    }
+                }
+                return Err(error);
+            }
+        }
+        *self.disk_revisions.lock().map_err(|_| anyhow::anyhow!("登记版本锁不可用"))? = [Some(bytes_revision(&values[0])), Some(bytes_revision(&values[1]))];
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -239,11 +310,45 @@ impl SkillLibrary {
         storage_name: &str,
         mode: TriggerMode,
     ) -> Result<()> {
+        let write_lock = self.write_lock()?;
         let path = self.skill_path_by_storage(storage_name)?;
         if self.is_linked_source(storage_name) {
             bail!("此技能暂不支持更改触发时机");
         }
+        let current = crate::update_protection::snapshot(&path)?;
+        let baseline = self.registry.package_baselines.get(storage_name).cloned();
+        if !self.record_by_storage(storage_name)?.origin.is_builtin() {
+            let base = baseline.as_ref().context("缺少文件基线，无法安全修改技能触发设置")?;
+            for name in ["SKILL.md", "agents/openai.yaml"] {
+                if current.get(name) != base.get(name) {
+                    bail!("技能触发文件存在本机修改，未覆盖：{name}");
+                }
+            }
+        }
+        for name in ["SKILL.md", "agents/openai.yaml"] {
+            if current.get(name).is_some_and(|node| !matches!(node, crate::update_protection::Node::File { .. })) {
+                bail!("技能触发文件类型已改变，未覆盖：{name}");
+            }
+        }
+        if current.get("agents").is_some_and(|node| !matches!(node, crate::update_protection::Node::Directory { .. })) {
+            bail!("技能配置父目录不是实体目录，未覆盖");
+        }
         let before = TriggerSource::read(&path)?;
+        if path.join("local-data/ADAPTATION.md").is_file() {
+            let previous = self.registry.trigger_overrides.get(storage_name).cloned();
+            if mode == TriggerMode::FollowSkill {
+                self.registry.trigger_overrides.remove(storage_name);
+            } else {
+                self.registry.trigger_overrides.insert(storage_name.to_owned(), TriggerOverride { mode, source: before });
+            }
+            let result = crate::update_protection::verify_unchanged(&path, &current)
+                .and_then(|_| self.save_locked(&write_lock));
+            if result.is_err() {
+                if let Some(previous) = previous { self.registry.trigger_overrides.insert(storage_name.to_owned(), previous); }
+                else { self.registry.trigger_overrides.remove(storage_name); }
+            }
+            return result;
+        }
         let source = self
             .registry
             .trigger_overrides
@@ -251,8 +356,19 @@ impl SkillLibrary {
             .map(|entry| entry.source.clone())
             .unwrap_or_else(|| before.clone());
         let rendered = source.render(mode)?;
+        let expected_trigger = tempfile::tempdir()?;
+        rendered.write(expected_trigger.path())?;
+        let mut expected_files = crate::update_protection::snapshot(expected_trigger.path())?;
+        for name in ["SKILL.md", "agents/openai.yaml"] {
+            if let Some(crate::update_protection::Node::File { mode, .. }) = current.get(name) {
+                if let Some(crate::update_protection::Node::File { mode: expected, .. }) = expected_files.get_mut(name) {
+                    *expected = *mode;
+                }
+            }
+        }
         let previous = self.registry.trigger_overrides.get(storage_name).cloned();
         let result = (|| -> Result<()> {
+            crate::update_protection::verify_unchanged(&path, &current)?;
             rendered.write(&path)?;
             if mode == TriggerMode::FollowSkill {
                 self.registry.trigger_overrides.remove(storage_name);
@@ -261,10 +377,36 @@ impl SkillLibrary {
                     .trigger_overrides
                     .insert(storage_name.to_string(), TriggerOverride { mode, source });
             }
-            self.save()
+            let after = crate::update_protection::snapshot(&path)?;
+            for name in ["SKILL.md", "agents/openai.yaml"] {
+                if after.get(name) != expected_files.get(name) {
+                    bail!("触发设置写入期间文件发生修改，已停止登记：{name}");
+                }
+            }
+            if let Some(base) = self.registry.package_baselines.get_mut(storage_name) {
+                for name in ["SKILL.md", "agents/openai.yaml"] {
+                    if let Some(node) = expected_files.get(name) { base.insert(name.into(), node.clone()); }
+                    else { base.remove(name); }
+                }
+                if current.get("agents").is_none() {
+                    if let Some(node) = after.get("agents") { base.insert("agents".into(), node.clone()); }
+                }
+            }
+            self.save_locked(&write_lock)
         })();
         if let Err(error) = result {
+            let after = crate::update_protection::snapshot(&path)?;
+            if ["SKILL.md", "agents/openai.yaml"].iter().any(|name| {
+                after.get(*name) != expected_files.get(*name) && after.get(*name) != current.get(*name)
+            }) {
+                // Preserve an external edit instead of overwriting it during rollback.
+                if let Some(base) = baseline { self.registry.package_baselines.insert(storage_name.to_owned(), base); }
+                if let Some(previous) = previous { self.registry.trigger_overrides.insert(storage_name.to_owned(), previous); }
+                else { self.registry.trigger_overrides.remove(storage_name); }
+                bail!("触发设置失败且文件发生并发修改，已保留当前文件，请检查：{error}");
+            }
             before.write(&path)?;
+            if let Some(base) = baseline { self.registry.package_baselines.insert(storage_name.to_owned(), base); }
             if let Some(previous) = previous {
                 self.registry
                     .trigger_overrides
@@ -422,7 +564,8 @@ impl SkillLibrary {
     }
 
     pub fn import(&mut self, source: &Path, mut record: SkillRecord) -> Result<()> {
-        if !source.join("SKILL.md").is_file() {
+        let write_lock = self.write_lock()?;
+        if !fs::symlink_metadata(source.join("SKILL.md"))?.is_file() {
             bail!("所选目录中没有 SKILL.md");
         }
         validate_name(&record.name)?;
@@ -467,16 +610,18 @@ impl SkillLibrary {
         }
         let before = self.registry.clone();
         self.registry.trigger_overrides.remove(&storage_name);
-        self.registry.skills.insert(storage_name, record);
         if local_source.is_none() {
-            return self.save();
+            self.registry.package_baselines.insert(
+                storage_name.clone(), crate::update_protection::snapshot(&destination)?,
+            );
         }
-        if let Err(error) = self.save() {
+        self.registry.skills.insert(storage_name, record);
+        if let Err(error) = self.save_locked(&write_lock) {
             self.registry = before;
             if let Some(link) = crate::directory_link::inspect(&destination)? {
                 crate::directory_link::remove(&destination, link)?;
             } else {
-                fs::remove_dir_all(&destination)?;
+                archive_directory(&destination, &self.config.library_dir)?;
             }
             return Err(error);
         }
@@ -497,6 +642,7 @@ impl SkillLibrary {
         candidate: &crate::adoption::AdoptionCandidate,
         references: &[crate::adoption::SkillReference],
     ) -> Result<String> {
+        let write_lock = self.write_lock()?;
         use crate::{adoption, directory_link};
         candidate.verify()?;
         if let Some(issue) = &candidate.issue {
@@ -596,6 +742,7 @@ impl SkillLibrary {
                 }
             }
             self.registry.skills.insert(storage.clone(), record);
+            self.registry.package_baselines.remove(&storage);
             let mut owned = self
                 .registry
                 .adopted_sources
@@ -627,7 +774,7 @@ impl SkillLibrary {
                     }),
                 },
             );
-            self.save()?;
+            self.save_locked(&write_lock)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -669,16 +816,21 @@ impl SkillLibrary {
         self.replace_by_storage(source, storage_name, record)
     }
 
+    pub(crate) fn has_package_baseline(&self, storage_name: &str) -> bool {
+        self.registry.package_baselines.contains_key(storage_name)
+    }
+
     pub fn replace_by_storage(
         &mut self,
         source: &Path,
         storage_name: String,
         mut record: SkillRecord,
     ) -> Result<()> {
+        let write_lock = self.write_lock()?;
         if self.is_linked_source(&storage_name) {
             bail!("此技能链接到原始目录，请在来源中更新");
         }
-        if !source.join("SKILL.md").is_file() {
+        if !fs::symlink_metadata(source.join("SKILL.md"))?.is_file() {
             bail!("更新来源中没有 SKILL.md");
         }
         let affected_projects = self
@@ -705,10 +857,13 @@ impl SkillLibrary {
         }
         if protected_data_nodes(&destination)?
             .iter()
-            .any(|p| p != Path::new("local-data"))
+            .any(|p| p != Path::new("local-data") && p != Path::new(".git"))
         {
-            bail!("技能包含嵌套 local-data，请先迁至技能根层再更新");
+            bail!("技能包含嵌套 local-data 或 .git，请先检查其归属再更新");
         }
+        let baseline = self.registry.package_baselines.get(&storage_name)
+            .context("缺少已安装版本的文件基线，无法确认本机修改，已停止更新")?.clone();
+        let current = crate::update_protection::snapshot(&destination)?;
         // Prepare code before touching the live package. Machine data stays at its
         // original path, including its directory inode and open file handles.
         if let Err(error) = copy_tree(source, &staging) {
@@ -717,6 +872,10 @@ impl SkillLibrary {
             }
             return Err(error);
         }
+        if !fs::symlink_metadata(staging.join("SKILL.md"))?.is_file() {
+            archive_directory(&staging, &self.config.library_dir)?;
+            bail!("更新来源的 SKILL.md 不是可复制的实体文件，未替换技能");
+        }
         let previous_registry = self.registry.clone();
         let previous_config = self.config.clone();
         let mut moved_old = Vec::new();
@@ -724,20 +883,31 @@ impl SkillLibrary {
         let result = (|| -> Result<()> {
             if let Some(override_entry) = self.registry.trigger_overrides.get_mut(&storage_name) {
                 override_entry.source = TriggerSource::read(&staging)?;
-                override_entry
-                    .source
-                    .render(override_entry.mode)?
-                    .write(&staging)?;
+                // Local adaptation carries host instructions separately; an
+                // upstream update must leave its original entry unchanged.
+                if !destination.join("local-data/ADAPTATION.md").is_file() {
+                    override_entry
+                        .source
+                        .render(override_entry.mode)?
+                        .write(&staging)?;
+                }
             }
+            let incoming = crate::update_protection::prepare(&destination, &staging, &baseline, &current)?;
+            let prepared = crate::update_protection::snapshot(&staging)?;
+            crate::update_protection::verify_unchanged(&destination, &current)?;
             fs::create_dir(&backup)?;
             for entry in fs::read_dir(&destination)? {
                 let entry = entry?;
                 let name = entry.file_name();
-                if name == "local-data" {
+                if name == "local-data" || name == ".git" {
                     continue;
                 }
-                fs::rename(entry.path(), backup.join(&name))?;
+                crate::package_fs::rename_exclusive(&entry.path(), &backup.join(&name))?;
                 moved_old.push(name);
+            }
+            crate::update_protection::verify_unchanged(&backup, &current)?;
+            if !protected_data_nodes(&backup)?.is_empty() {
+                bail!("原件出现新的本机数据目录，已停止更新并恢复原位");
             }
             for entry in fs::read_dir(&staging)? {
                 let entry = entry?;
@@ -745,16 +915,30 @@ impl SkillLibrary {
                 if path_entry_exists(&destination.join(&name))? {
                     bail!("更新期间代码位置被占用：{}", name.to_string_lossy());
                 }
-                fs::rename(entry.path(), destination.join(&name))?;
+                crate::package_fs::rename_exclusive(&entry.path(), &destination.join(&name))?;
                 moved_new.push(name);
             }
+            crate::update_protection::verify_unchanged(&backup, &current)?;
+            crate::update_protection::verify_unchanged(&destination, &prepared)?;
             record.storage_name = storage_name.clone();
             record.last_operated_at = operation_stamp();
+            self.registry.package_baselines.insert(storage_name.clone(), incoming);
             self.registry.skills.insert(storage_name, record);
             for project in affected_projects {
                 self.config.touch_project(&project);
             }
-            self.save()
+            #[cfg(test)]
+            BEFORE_UPDATE_COMMIT.with(|hook| {
+                if let Some(callback) = hook.borrow_mut().take() {
+                    callback(&destination, &backup, &self.data_dir);
+                }
+            });
+            crate::update_protection::verify_unchanged(&backup, &current)?;
+            crate::update_protection::verify_unchanged(&destination, &prepared)?;
+            if !protected_data_nodes(&backup)?.is_empty() {
+                bail!("原件出现新的本机数据目录，已停止更新并恢复原位");
+            }
+            self.save_locked(&write_lock)
         })();
         if let Err(error) = result {
             self.registry = previous_registry;
@@ -762,7 +946,7 @@ impl SkillLibrary {
             // Keep all new and old entries; never recursively delete a directory
             // that may have received data from another process during the update.
             for name in moved_new.into_iter().rev() {
-                fs::rename(destination.join(&name), staging.join(&name))
+                crate::package_fs::rename_exclusive(&destination.join(&name), &staging.join(&name))
                     .context("更新失败；移回新代码失败，已保留恢复目录")?;
             }
             for name in moved_old.into_iter().rev() {
@@ -772,7 +956,7 @@ impl SkillLibrary {
                         backup.display()
                     );
                 }
-                fs::rename(backup.join(&name), destination.join(&name))
+                crate::package_fs::rename_exclusive(&backup.join(&name), &destination.join(&name))
                     .context("更新失败；还原代码失败，已保留恢复目录")?;
             }
             if path_entry_exists(&backup)? {
@@ -792,6 +976,7 @@ impl SkillLibrary {
     }
 
     pub fn remove_by_storage(&mut self, storage_name: &str) -> Result<()> {
+        let write_lock = self.write_lock()?;
         let record = self.record_by_storage(storage_name)?;
         if record.origin.is_builtin() {
             bail!("Kitter 内置 Skill 不能删除");
@@ -842,13 +1027,14 @@ impl SkillLibrary {
         self.registry.skills.remove(storage_name);
         self.registry.adopted_sources.remove(storage_name);
         self.registry.trigger_overrides.remove(storage_name);
+        self.registry.package_baselines.remove(storage_name);
         if let Some(source) = self.registry.sources.get_mut(&source_key) {
             source.added_skills.retain(|skill| skill != &record.name);
         }
         for project in affected_projects {
             self.config.touch_project(&project);
         }
-        self.save()
+        self.save_locked(&write_lock)
     }
 
     pub fn record_source(
@@ -1215,33 +1401,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 pub(crate) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    for entry in WalkDir::new(source)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry.depth() == 0 || (entry.file_name() != "local-data" && entry.file_name() != ".git")
-        })
-    {
-        let entry = entry?;
-        let relative = entry.path().strip_prefix(source)?;
-        if relative
-            .components()
-            .next()
-            .is_some_and(|part| part.as_os_str() == ".git")
-        {
-            continue;
-        }
-        let target = destination.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), target)?;
-        }
-    }
-    Ok(())
+    crate::package_fs::copy_tree(source, destination)
 }
 
 fn path_entry_exists(path: &Path) -> Result<bool> {
@@ -1252,13 +1412,36 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn bytes_revision(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+
+fn file_revision(path: &Path) -> Result<Option<String>> {
+    Ok(read_optional(path)?.map(|bytes| bytes_revision(&bytes)))
+}
+
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("登记文件缺少父目录")?)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 // Stop at each reserved node; its contents are private and must not be read.
 fn protected_data_nodes(root: &Path) -> Result<Vec<PathBuf>> {
     let mut nodes = Vec::new();
     let mut walker = WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = walker.next() {
         let entry = entry?;
-        if entry.depth() > 0 && entry.file_name() == "local-data" {
+        if entry.depth() > 0 && (entry.file_name() == "local-data" || entry.file_name() == ".git") {
             nodes.push(entry.path().strip_prefix(root)?.to_path_buf());
             if entry.file_type().is_dir() {
                 walker.skip_current_dir();
@@ -1336,6 +1519,7 @@ mod tests {
             },
             registry,
             data_dir,
+            disk_revisions: Mutex::new([None, None]),
         };
         let skills = library.list().unwrap();
         assert_eq!(skills[0].record.name, KITTER_SKILL_NAME);
@@ -1390,6 +1574,7 @@ mod tests {
             },
             registry: Registry::default(),
             data_dir: root.join("data"),
+            disk_revisions: Mutex::new([None, None]),
         };
         (temp, library, home)
     }
@@ -1427,6 +1612,207 @@ mod tests {
             .unwrap();
         let record = library.record("demo").unwrap();
         (temp, library, source, record)
+    }
+
+    #[test]
+    fn adaptation_keeps_source_entry_original_and_retains_manual_mode_on_update() {
+        let (_temp, mut library, source, record) = copied_fixture();
+        library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::Manual).unwrap();
+        let path = library.skill_path("demo").unwrap();
+        fs::create_dir(path.join("local-data")).unwrap();
+        fs::write(path.join("local-data/ADAPTATION.md"), "manual local instructions").unwrap();
+        let updated = "---\nname: demo\ndescription: upstream update\n---\n";
+        fs::write(source.join("SKILL.md"), updated).unwrap();
+        library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).unwrap();
+        assert_eq!(fs::read_to_string(path.join("SKILL.md")).unwrap(), updated);
+        assert_eq!(library.trigger_mode_by_storage(&record.storage_name), TriggerMode::Manual);
+        assert_eq!(fs::read_to_string(path.join("local-data/ADAPTATION.md")).unwrap(), "manual local instructions");
+        assert_eq!(library.registry.package_baselines[&record.storage_name], crate::update_protection::snapshot(&source).unwrap());
+        library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::Automatic).unwrap();
+        assert_eq!(fs::read_to_string(path.join("SKILL.md")).unwrap(), updated);
+        assert_eq!(library.trigger_mode_by_storage(&record.storage_name), TriggerMode::Automatic);
+        library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::FollowSkill).unwrap();
+        assert_eq!(fs::read_to_string(path.join("SKILL.md")).unwrap(), updated);
+        assert_eq!(library.registry.package_baselines[&record.storage_name], crate::update_protection::snapshot(&source).unwrap());
+    }
+
+    #[test]
+    fn config_decode_and_revision_use_the_same_bytes_under_concurrent_edit() {
+        let (temp,_initial,_,_)=copied_fixture();
+        let _stable=SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        AFTER_CONFIG_READ.with(|hook| *hook.borrow_mut()=Some(|data| {
+            let p=data.join("config.json");let mut value:serde_json::Value=serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+            value["collapsed_skill_groups_initialized"]=serde_json::Value::Bool(true);
+            fs::write(p,serde_json::to_vec(&value).unwrap()).unwrap();
+        }));
+        let loaded=SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        assert!(!loaded.config.collapsed_skill_groups_initialized);
+        assert!(loaded.save().unwrap_err().to_string().contains("其他操作"));
+        let current:serde_json::Value=serde_json::from_slice(&fs::read(temp.path().join("data/config.json")).unwrap()).unwrap();
+        assert_eq!(current["collapsed_skill_groups_initialized"],true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_link_and_directory_permission_conflicts_stop_before_live_mutation() {
+        use std::os::unix::fs::{symlink,PermissionsExt};
+        for link in [false,true] {
+            let (_temp,mut library,source,record)=copied_fixture();let path=library.skill_path("demo").unwrap();
+            if link {
+                fs::write(path.join("collision"),"local file").unwrap();symlink("missing",source.join("collision")).unwrap();
+            } else {
+                fs::create_dir(source.join("refs")).unwrap();
+                library.replace_by_storage(&source,record.storage_name.clone(),record.clone()).unwrap();
+                fs::set_permissions(path.join("refs"),fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(source.join("refs"),fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            let before=crate::update_protection::snapshot(&path).unwrap();
+            assert!(library.replace_by_storage(&source,record.storage_name.clone(),record.clone()).is_err());
+            assert_eq!(crate::update_protection::snapshot(&path).unwrap(),before);
+        }
+    }
+
+    #[test]
+    fn protected_update_retains_local_files_across_reopen_and_two_updates() {
+        let (temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path("demo").unwrap();
+        fs::write(path.join("SKILL.md"), "---\nname: demo\ndescription: locally edited\n---\n").unwrap();
+        fs::create_dir(path.join("references")).unwrap();
+        fs::write(path.join("references/mine.md"), "local reference").unwrap();
+        fs::create_dir(path.join("scripts")).unwrap();
+        fs::write(path.join("scripts/mine.py"), "local script").unwrap();
+        fs::write(path.join("asset.png"), b"local asset").unwrap();
+        fs::write(source.join("keep.txt"), "version 2").unwrap();
+        library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).unwrap();
+        let mut reopened = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        fs::write(source.join("keep.txt"), "version 3").unwrap();
+        reopened.replace_by_storage(&source, record.storage_name.clone(), record).unwrap();
+        assert!(fs::read_to_string(path.join("SKILL.md")).unwrap().contains("locally edited"));
+        assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), "version 3");
+        assert_eq!(fs::read_to_string(path.join("scripts/mine.py")).unwrap(), "local script");
+        assert_eq!(fs::read_to_string(path.join("references/mine.md")).unwrap(), "local reference");
+        assert_eq!(fs::read(path.join("asset.png")).unwrap(), b"local asset");
+    }
+
+    #[test]
+    fn protected_conflict_and_missing_legacy_baseline_do_not_touch_live_files() {
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path("demo").unwrap();
+        fs::write(path.join("keep.txt"), "local edit").unwrap();
+        fs::write(source.join("keep.txt"), "source edit").unwrap();
+        let registry = fs::read(library.data_dir.join("registry.json")).unwrap();
+        assert!(library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).is_err());
+        assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), "local edit");
+        assert_eq!(fs::read(library.data_dir.join("registry.json")).unwrap(), registry);
+        assert!(!path.with_extension("kitter-backup").exists());
+        library.registry.package_baselines.clear();
+        library.save().unwrap();
+        assert!(library.replace_by_storage(&source, record.storage_name.clone(), record).unwrap_err().to_string().contains("基线"));
+        assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), "local edit");
+        assert!(!path.with_extension("kitter-staging").exists());
+    }
+
+    #[test]
+    fn trigger_changes_do_not_overwrite_edits_or_wash_unrelated_files() {
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path("demo").unwrap();
+        fs::write(path.join("keep.txt"), "local script edit").unwrap();
+        library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::Manual).unwrap();
+        library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).unwrap();
+        assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), "local script edit");
+        fs::write(source.join("keep.txt"), "source script edit").unwrap();
+        assert!(library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).is_err());
+        let original = fs::read(path.join("SKILL.md")).unwrap();
+        fs::write(path.join("SKILL.md"), "edited skill body").unwrap();
+        assert!(library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::Automatic).is_err());
+        assert_eq!(fs::read_to_string(path.join("SKILL.md")).unwrap(), "edited skill body");
+        fs::write(path.join("SKILL.md"), original).unwrap();
+        fs::write(path.join("agents/openai.yaml"), "interface: locally-edited\n").unwrap();
+        assert!(library.set_trigger_mode_by_storage(&record.storage_name, TriggerMode::Automatic).is_err());
+        assert_eq!(fs::read_to_string(path.join("agents/openai.yaml")).unwrap(), "interface: locally-edited\n");
+    }
+
+    #[test]
+    fn concurrent_writers_and_stale_registry_are_rejected_before_package_changes() {
+        let (temp, _initial_library, source, record) = copied_fixture();
+        let mut other = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        let lock = library.write_lock().unwrap();
+        assert!(other.replace_by_storage(&source, record.storage_name.clone(), record.clone()).is_err());
+        drop(lock);
+        other.config.recent_projects.push(temp.path().join("new-project"));
+        other.save().unwrap();
+        let path = library.skill_path("demo").unwrap();
+        fs::write(source.join("keep.txt"), "new source").unwrap();
+        assert!(library.replace_by_storage(&source, record.storage_name.clone(), record).unwrap_err().to_string().contains("其他操作"));
+        assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), "original source");
+    }
+
+    #[test]
+    fn late_original_edit_and_registry_conflict_roll_back_without_losing_edits() {
+        for registry_change in [false, true] {
+            let (_temp, mut library, source, record) = copied_fixture();
+            let path = library.skill_path("demo").unwrap();
+            fs::write(source.join("keep.txt"), "new source").unwrap();
+            if registry_change {
+                BEFORE_UPDATE_COMMIT.with(|hook| *hook.borrow_mut() = Some(|_,_,data| {
+                    let p=data.join("registry.json");let mut value:serde_json::Value=serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+                    value["source_groups_migrated"]=serde_json::Value::Bool(false);
+                    fs::write(p,serde_json::to_vec(&value).unwrap()).unwrap();
+                }));
+            } else {
+                BEFORE_UPDATE_COMMIT.with(|hook| *hook.borrow_mut() = Some(|_,backup,_| {
+                    fs::write(backup.join("keep.txt"), "late external edit").unwrap();
+                }));
+            }
+            assert!(library.replace_by_storage(&source, record.storage_name.clone(), record).is_err());
+            assert_eq!(fs::read_to_string(path.join("keep.txt")).unwrap(), if registry_change {"original source"} else {"late external edit"});
+            assert!(!path.with_extension("kitter-backup").exists());
+            if registry_change {
+                let value:serde_json::Value=serde_json::from_slice(&fs::read(library.data_dir.join("registry.json")).unwrap()).unwrap();
+                assert_eq!(value["source_groups_migrated"],false);
+            }
+        }
+    }
+
+    #[test]
+    fn late_nested_local_data_is_restored_with_original_code() {
+        let (_temp, mut library, source, record) = copied_fixture();
+        fs::create_dir(source.join("scripts")).unwrap();
+        fs::write(source.join("scripts/main"), "old code").unwrap();
+        library.replace_by_storage(&source, record.storage_name.clone(), record.clone()).unwrap();
+        let before = fs::read(library.data_dir.join("registry.json")).unwrap();
+        fs::write(source.join("scripts/main"), "new code").unwrap();
+        BEFORE_UPDATE_COMMIT.with(|hook| *hook.borrow_mut() = Some(|_, backup, _| {
+            fs::create_dir(backup.join("scripts/local-data")).unwrap();
+            fs::write(backup.join("scripts/local-data/state"), "late user state").unwrap();
+        }));
+        assert!(library.replace_by_storage(&source, record.storage_name.clone(), record).is_err());
+        let path = library.skill_path("demo").unwrap();
+        assert_eq!(fs::read_to_string(path.join("scripts/main")).unwrap(), "old code");
+        assert_eq!(fs::read_to_string(path.join("scripts/local-data/state")).unwrap(), "late user state");
+        assert_eq!(fs::read(library.data_dir.join("registry.json")).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_permissions_and_root_git_are_preserved_without_reading_targets() {
+        use std::os::unix::fs::{symlink,PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path("demo").unwrap();
+        fs::create_dir(path.join(".git")).unwrap();
+        fs::write(path.join(".git/config"), "private git settings").unwrap();
+        let inode=fs::metadata(path.join(".git")).unwrap().ino();
+        symlink("local-data/missing",path.join("runtime-link")).unwrap();
+        fs::set_permissions(path.join("keep.txt"),fs::Permissions::from_mode(0o755)).unwrap();
+        library.replace_by_storage(&source,record.storage_name.clone(),record.clone()).unwrap();
+        assert_eq!(fs::read_link(path.join("runtime-link")).unwrap(),Path::new("local-data/missing"));
+        assert_eq!(fs::metadata(path.join("keep.txt")).unwrap().permissions().mode() & 0o777,0o755);
+        assert_eq!(fs::metadata(path.join(".git")).unwrap().ino(),inode);
+        fs::write(source.join("keep.txt"),"changed source").unwrap();
+        assert!(library.replace_by_storage(&source,record.storage_name.clone(),record).is_err());
+        assert_eq!(fs::read_to_string(path.join(".git/config")).unwrap(),"private git settings");
     }
 
     #[test]
@@ -1818,6 +2204,7 @@ mod tests {
             },
             registry: Registry::default(),
             data_dir: temp.path().join("data"),
+            disk_revisions: Mutex::new([None, None]),
         };
 
         assert_eq!(library.list().unwrap()[0].record.description, "first");
