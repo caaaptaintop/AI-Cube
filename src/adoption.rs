@@ -264,6 +264,7 @@ pub fn excluded(path: &Path, home: &Path, library_dir: &Path) -> bool {
         matches!(
             name.as_ref(),
             ".git"
+                | "local-data"
                 | ".venv"
                 | "venv"
                 | "__pycache__"

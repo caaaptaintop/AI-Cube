@@ -381,6 +381,7 @@ impl SkillLibrary {
         let mut files = WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != "local-data")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
             .filter_map(|entry| entry.path().strip_prefix(&root).ok().map(Path::to_path_buf))
@@ -400,9 +401,22 @@ impl SkillLibrary {
     }
 
     fn read_file_in(&self, root: &Path, relative: &Path) -> Result<String> {
+        if relative
+            .components()
+            .any(|part| part.as_os_str() == "local-data")
+        {
+            bail!("本机数据不提供技能内容预览");
+        }
         let path = root.join(relative).canonicalize()?;
         if !path.starts_with(&root) {
             bail!("文件不在技能目录内");
+        }
+        if path
+            .strip_prefix(root)?
+            .components()
+            .any(|part| part.as_os_str() == "local-data")
+        {
+            bail!("本机数据不提供技能内容预览");
         }
         fs::read_to_string(path).context("该文件不是可预览的文本文件")
     }
@@ -664,6 +678,9 @@ impl SkillLibrary {
         if self.is_linked_source(&storage_name) {
             bail!("此技能链接到原始目录，请在来源中更新");
         }
+        if !source.join("SKILL.md").is_file() {
+            bail!("更新来源中没有 SKILL.md");
+        }
         let affected_projects = self
             .config
             .recent_projects
@@ -679,20 +696,57 @@ impl SkillLibrary {
             .collect::<Vec<_>>();
         let destination = self.skill_path_by_storage(&storage_name)?;
         let backup = destination.with_extension("kitter-backup");
-        if backup.exists() {
-            fs::remove_dir_all(&backup)?;
+        let staging = destination.with_extension("kitter-staging");
+        if path_entry_exists(&backup)? || path_entry_exists(&staging)? {
+            bail!(
+                "存在上次更新的恢复或准备目录，请先检查：{}",
+                backup.display()
+            );
         }
-        fs::rename(&destination, &backup)?;
+        if protected_data_nodes(&destination)?
+            .iter()
+            .any(|p| p != Path::new("local-data"))
+        {
+            bail!("技能包含嵌套 local-data，请先迁至技能根层再更新");
+        }
+        // Prepare code before touching the live package. Machine data stays at its
+        // original path, including its directory inode and open file handles.
+        if let Err(error) = copy_tree(source, &staging) {
+            if path_entry_exists(&staging)? {
+                archive_directory(&staging, &self.config.library_dir)?;
+            }
+            return Err(error);
+        }
         let previous_registry = self.registry.clone();
         let previous_config = self.config.clone();
+        let mut moved_old = Vec::new();
+        let mut moved_new = Vec::new();
         let result = (|| -> Result<()> {
-            copy_tree(source, &destination)?;
             if let Some(override_entry) = self.registry.trigger_overrides.get_mut(&storage_name) {
-                override_entry.source = TriggerSource::read(&destination)?;
+                override_entry.source = TriggerSource::read(&staging)?;
                 override_entry
                     .source
                     .render(override_entry.mode)?
-                    .write(&destination)?;
+                    .write(&staging)?;
+            }
+            fs::create_dir(&backup)?;
+            for entry in fs::read_dir(&destination)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name == "local-data" {
+                    continue;
+                }
+                fs::rename(entry.path(), backup.join(&name))?;
+                moved_old.push(name);
+            }
+            for entry in fs::read_dir(&staging)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if path_entry_exists(&destination.join(&name))? {
+                    bail!("更新期间代码位置被占用：{}", name.to_string_lossy());
+                }
+                fs::rename(entry.path(), destination.join(&name))?;
+                moved_new.push(name);
             }
             record.storage_name = storage_name.clone();
             record.last_operated_at = operation_stamp();
@@ -703,13 +757,32 @@ impl SkillLibrary {
             self.save()
         })();
         if let Err(error) = result {
-            let _ = fs::remove_dir_all(&destination);
-            fs::rename(&backup, &destination)?;
             self.registry = previous_registry;
             self.config = previous_config;
+            // Keep all new and old entries; never recursively delete a directory
+            // that may have received data from another process during the update.
+            for name in moved_new.into_iter().rev() {
+                fs::rename(destination.join(&name), staging.join(&name))
+                    .context("更新失败；移回新代码失败，已保留恢复目录")?;
+            }
+            for name in moved_old.into_iter().rev() {
+                if path_entry_exists(&destination.join(&name))? {
+                    bail!(
+                        "更新失败；还原位置被占用，已保留恢复目录：{}",
+                        backup.display()
+                    );
+                }
+                fs::rename(backup.join(&name), destination.join(&name))
+                    .context("更新失败；还原代码失败，已保留恢复目录")?;
+            }
+            if path_entry_exists(&backup)? {
+                archive_directory(&backup, &self.config.library_dir)?;
+            }
+            archive_directory(&staging, &self.config.library_dir)?;
             return Err(error);
         }
-        fs::remove_dir_all(backup)?;
+        archive_directory(&backup, &self.config.library_dir)?;
+        archive_directory(&staging, &self.config.library_dir)?;
         Ok(())
     }
 
@@ -725,6 +798,14 @@ impl SkillLibrary {
         }
         let source_key = record.origin.source().key();
         let path = self.skill_path_by_storage(storage_name)?;
+        if crate::directory_link::inspect(&path)?.is_none()
+            && !protected_data_nodes(&path)?.is_empty()
+        {
+            bail!(
+                "此技能包含本机数据，请先迁出 local-data 后再删除：{}",
+                path.display()
+            );
+        }
         let affected_projects = self
             .config
             .recent_projects
@@ -756,7 +837,7 @@ impl SkillLibrary {
         if let Some(link) = crate::directory_link::inspect(&path)? {
             crate::directory_link::remove(&path, link)?;
         } else {
-            fs::remove_dir_all(path)?;
+            archive_directory(&path, &self.config.library_dir)?;
         }
         self.registry.skills.remove(storage_name);
         self.registry.adopted_sources.remove(storage_name);
@@ -1134,7 +1215,13 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 pub(crate) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    for entry in WalkDir::new(source).follow_links(false) {
+    for entry in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || (entry.file_name() != "local-data" && entry.file_name() != ".git")
+        })
+    {
         let entry = entry?;
         let relative = entry.path().strip_prefix(source)?;
         if relative
@@ -1155,6 +1242,45 @@ pub(crate) fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("无法检查数据或恢复目录"),
+    }
+}
+
+// Stop at each reserved node; its contents are private and must not be read.
+fn protected_data_nodes(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut nodes = Vec::new();
+    let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry?;
+        if entry.depth() > 0 && entry.file_name() == "local-data" {
+            nodes.push(entry.path().strip_prefix(root)?.to_path_buf());
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+// Removed code is recoverable. This also preserves concurrent data writes that
+// arrive after a preflight check, instead of racing a recursive deletion.
+fn archive_directory(path: &Path, library_dir: &Path) -> Result<()> {
+    let recovery = library_dir.join(".kitter-recovery");
+    fs::create_dir_all(&recovery)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let slot = recovery.join(format!("{stamp}"));
+    fs::create_dir(&slot)?;
+    fs::rename(
+        path,
+        slot.join(path.file_name().context("恢复目录缺少名称")?),
+    )
+    .context("无法归档代码目录，原目录仍保留，请先检查")
 }
 
 #[cfg(test)]
@@ -1276,6 +1402,177 @@ mod tests {
         )
         .unwrap();
         fs::write(path.join("keep.txt"), "original source").unwrap();
+    }
+
+    fn copied_fixture() -> (tempfile::TempDir, SkillLibrary, PathBuf, SkillRecord) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fixture_skill(&source, "demo");
+        fs::create_dir(source.join("local-data")).unwrap();
+        fs::write(source.join("local-data/source.txt"), "source data").unwrap();
+        let mut library = SkillLibrary::open_in(temp.path().join("data")).unwrap();
+        library
+            .import(
+                &source,
+                SkillRecord {
+                    name: "demo".into(),
+                    storage_name: String::new(),
+                    description: String::new(),
+                    origin: SkillOrigin::Unknown,
+                    update_available: false,
+                    group_id: None,
+                    last_operated_at: 0,
+                },
+            )
+            .unwrap();
+        let record = library.record("demo").unwrap();
+        (temp, library, source, record)
+    }
+
+    #[test]
+    fn copied_import_and_preview_exclude_local_data() {
+        let (_temp, library, _source, record) = copied_fixture();
+        let path = library.skill_path_by_storage(&record.storage_name).unwrap();
+        assert!(!path.join("local-data").exists());
+        fs::create_dir(path.join("local-data")).unwrap();
+        fs::write(path.join("local-data/private.txt"), "private fixture").unwrap();
+        assert!(
+            !library
+                .files("demo")
+                .unwrap()
+                .iter()
+                .any(|p| p.starts_with("local-data"))
+        );
+        assert!(
+            library
+                .read_file("demo", Path::new("local-data/private.txt"))
+                .is_err()
+        );
+        assert!(library.read_file("demo", Path::new("keep.txt")).is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("local-data/private.txt", path.join("alias.txt")).unwrap();
+            assert!(library.read_file("demo", Path::new("alias.txt")).is_err());
+        }
+    }
+
+    #[test]
+    fn update_preserves_local_data_and_failed_update_restores_it() {
+        let (temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path_by_storage(&record.storage_name).unwrap();
+        fs::create_dir(path.join("local-data")).unwrap();
+        let data = path.join("local-data/private.bin");
+        fs::write(&data, [0, 1, 255, 2]).unwrap();
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&data).unwrap().ino()
+        };
+        fs::write(source.join("keep.txt"), "updated code").unwrap();
+        library
+            .replace_by_storage(&source, record.storage_name.clone(), record.clone())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "updated code"
+        );
+        assert_eq!(fs::read(&data).unwrap(), [0, 1, 255, 2]);
+        assert!(!path.join("local-data/source.txt").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&data).unwrap().ino(), original_inode);
+        }
+        fs::write(source.join("keep.txt"), "failing code").unwrap();
+        library.data_dir = temp.path().join("source/SKILL.md");
+        assert!(
+            library
+                .replace_by_storage(&source, record.storage_name.clone(), record.clone())
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "updated code"
+        );
+        assert_eq!(fs::read(&data).unwrap(), [0, 1, 255, 2]);
+        assert!(!path.with_extension("kitter-backup").exists());
+        // Protection runs before uninstalling references or changing registry.
+        assert!(library.remove_by_storage(&record.storage_name).is_err());
+        assert!(library.record("demo").is_ok());
+        assert!(data.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_data_links_and_existing_recovery_directories_are_protected() {
+        use std::os::unix::fs::symlink;
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path_by_storage(&record.storage_name).unwrap();
+        symlink("absent-directory", path.join("local-data")).unwrap();
+        assert!(library.remove_by_storage(&record.storage_name).is_err());
+        library
+            .replace_by_storage(&source, record.storage_name.clone(), record.clone())
+            .unwrap();
+        assert_eq!(
+            fs::read_link(path.join("local-data")).unwrap(),
+            Path::new("absent-directory")
+        );
+        let backup = path.with_extension("kitter-backup");
+        symlink("absent-recovery", &backup).unwrap();
+        assert!(
+            library
+                .replace_by_storage(&source, record.storage_name.clone(), record)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_link(&backup).unwrap(),
+            Path::new("absent-recovery")
+        );
+        assert!(path.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn nested_data_blocks_updates_and_removal_without_changing_the_package() {
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path_by_storage(&record.storage_name).unwrap();
+        fs::create_dir_all(path.join("nested/local-data")).unwrap();
+        fs::write(path.join("nested/local-data/state"), "retained").unwrap();
+        assert!(
+            library
+                .replace_by_storage(&source, record.storage_name.clone(), record.clone())
+                .is_err()
+        );
+        assert!(library.remove_by_storage(&record.storage_name).is_err());
+        assert_eq!(
+            fs::read_to_string(path.join("nested/local-data/state")).unwrap(),
+            "retained"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "original source"
+        );
+        assert!(library.record("demo").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_keeps_data_directory_and_open_handle_stable() {
+        use std::{io::Write, os::unix::fs::MetadataExt};
+        let (_temp, mut library, source, record) = copied_fixture();
+        let path = library.skill_path_by_storage(&record.storage_name).unwrap();
+        let local_data = path.join("local-data");
+        fs::create_dir(&local_data).unwrap();
+        let inode = fs::metadata(&local_data).unwrap().ino();
+        let mut handle = fs::File::create(local_data.join("active-state")).unwrap();
+        library
+            .replace_by_storage(&source, record.storage_name.clone(), record)
+            .unwrap();
+        handle.write_all(b"after update").unwrap();
+        assert_eq!(fs::metadata(&local_data).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read(local_data.join("active-state")).unwrap(),
+            b"after update"
+        );
     }
 
     #[cfg(unix)]
