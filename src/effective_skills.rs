@@ -28,6 +28,7 @@ pub enum AgentKind {
     Amp,
     Droid,
     Pi,
+    Proma,
     Omp,
     DimAgent,
     Grok,
@@ -47,6 +48,7 @@ impl AgentKind {
             Self::Amp => "amp",
             Self::Droid => "droid",
             Self::Pi => "pi",
+            Self::Proma => "proma",
             Self::Omp => "omp",
             Self::DimAgent => "dimagent",
             Self::Grok => "grok",
@@ -66,6 +68,7 @@ impl AgentKind {
             Self::Amp => "Amp",
             Self::Droid => "Droid",
             Self::Pi => "Pi",
+            Self::Proma => "Proma",
             Self::Omp => "omp",
             Self::DimAgent => "DimAgent",
             Self::Grok => "Grok",
@@ -475,6 +478,14 @@ struct AntigravityPolicy;
 struct AmpPolicy;
 struct DroidPolicy;
 struct PiAdapter;
+struct PromaAdapter;
+
+fn proma_workspaces(context: &DiscoveryContext) -> Vec<crate::proma::Workspace> {
+    let root = std::env::var_os("KITTER_PROMA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| context.home.join(".proma"));
+    crate::proma::workspaces_for_project(&root, &context.cwd).unwrap_or_default()
+}
 struct GrokAdapter;
 struct OpenClawPolicy;
 struct HermesPolicy;
@@ -1466,6 +1477,49 @@ impl AgentSkillPolicy for PiAdapter {
 
     fn estimate_tokens(&self, rendered: &str) -> usize {
         approx_token_count(rendered)
+    }
+}
+
+// Proma passes only its active native workspace directory to Pi. This is a
+// static catalog estimate, not evidence that a running session loaded a skill.
+impl AgentSkillPolicy for PromaAdapter {
+    fn agent(&self) -> AgentKind {
+        AgentKind::Proma
+    }
+
+    fn roots(&self, context: &DiscoveryContext) -> Vec<SkillRoot> {
+        proma_workspaces(context).into_iter().filter_map(|workspace| {
+            let active = workspace.path.join("skills");
+            (active.canonicalize().ok().as_ref() == Some(&active))
+                .then(|| SkillRoot::new(active, SkillScope::Repository))
+        }).collect()
+    }
+
+    fn is_enabled(&self, dir: &Path, metadata: &SkillMetadata, context: &DiscoveryContext) -> bool {
+        PiAdapter.is_enabled(dir, metadata, context)
+    }
+
+    fn prompt_path_for_entry(
+        &self, root: &SkillRoot, dir: &Path, file: &Path,
+        metadata: &SkillMetadata, context: &DiscoveryContext,
+    ) -> Option<String> {
+        PiAdapter.prompt_path_for_entry(root, dir, file, metadata, context)
+    }
+
+    fn name_collision(&self) -> NameCollision {
+        NameCollision::FirstWins
+    }
+
+    fn visibility(&self, dir: &Path, metadata: &SkillMetadata, context: &DiscoveryContext) -> SkillVisibility {
+        PiAdapter.visibility(dir, metadata, context)
+    }
+
+    fn render_visible_metadata(&self, skills: &[EffectiveSkill]) -> String {
+        PiAdapter.render_visible_metadata(skills)
+    }
+
+    fn estimate_tokens(&self, rendered: &str) -> usize {
+        PiAdapter.estimate_tokens(rendered)
     }
 }
 
@@ -3238,6 +3292,54 @@ struct OpenAiPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_project_scans_proma_native_skills_and_codex_business_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".proma");
+        let native = root.join("agent-workspaces/pilot");
+        let business = temp.path().join("business");
+        fs::create_dir_all(&home).unwrap();
+        write_skill(&native.join("skills"), "proma-only", "");
+        write_skill(&native.join("skills-inactive"), "inactive", "");
+        write_skill(&business.join(".codex/skills"), "codex-only", "");
+        write_skill(&business.join("skills"), "business-data", "");
+        fs::write(root.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({
+            "version": 2, "workspaces": [{"id": "pilot", "slug": "pilot", "name": "Pilot",
+                "projectRootPath": business}]
+        })).unwrap()).unwrap();
+        let estimates = estimate_project_with_home(&business, &home);
+        let proma = estimates.iter().find(|estimate| estimate.agent == AgentKind::Proma).unwrap();
+        assert_eq!(proma.skills.len(), 1);
+        assert_eq!(proma.skills[0].name, "proma-only");
+        assert!(proma.skills[0].path.starts_with(native.canonicalize().unwrap()));
+        let codex = estimates.iter().find(|estimate| estimate.agent == AgentKind::Codex).unwrap();
+        assert!(codex.skills.iter().any(|skill| skill.name == "codex-only"));
+        let native_estimates = estimate_project_with_home(&native, &home);
+        let native_proma = native_estimates.iter().find(|estimate| estimate.agent == AgentKind::Proma).unwrap();
+        assert_eq!(native_proma.skills[0].path, proma.skills[0].path);
+    }
+
+    #[test]
+    fn proma_metadata_uses_pi_invocation_rules_and_requires_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("SKILL.md");
+        let context = DiscoveryContext { cwd: temp.path().into(), home: temp.path().into(), repository_root: None };
+        fs::write(&file, "---\nname: alpha\ndescription: fixture\npaths: [src/**]\n---\n").unwrap();
+        let metadata = read_metadata(&file).unwrap();
+        assert!(PromaAdapter.is_enabled(temp.path(), &metadata, &context));
+        assert_eq!(PromaAdapter.visibility(temp.path(), &metadata, &context), SkillVisibility::Automatic);
+        fs::write(&file, "---\nname: alpha\ndescription: fixture\ndisable-model-invocation: true\n---\n").unwrap();
+        let metadata = read_metadata(&file).unwrap();
+        assert_eq!(PromaAdapter.visibility(temp.path(), &metadata, &context), SkillVisibility::ManualOnly);
+        fs::write(&file, "---\nname: alpha\n---\nBody fallback").unwrap();
+        let metadata = read_metadata(&file).unwrap();
+        assert!(!PromaAdapter.is_enabled(temp.path(), &metadata, &context));
+        fs::create_dir_all(temp.path().join("skills/alpha")).unwrap();
+        fs::write(temp.path().join("skills/alpha/SKILL.md"), "---\nname: alpha\ndescription: fixture\n---\n").unwrap();
+        assert!(PromaAdapter.roots(&context).is_empty());
+    }
     use tempfile::tempdir;
 
     fn write_skill(root: &Path, name: &str, extra: &str) {

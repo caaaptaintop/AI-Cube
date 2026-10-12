@@ -25,6 +25,8 @@ impl KitterApp {
                         &installation.path.join("SKILL.md"),
                         &skill.path.join("SKILL.md"),
                     )
+                        || (installation.target == InstallTarget::Proma
+                            && crate::proma::is_managed(&installation.path, &skill.path))
                 })
                 && match filter {
                     ProjectSkillFilter::Group(group) => {
@@ -439,6 +441,24 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
+        let proma_states = effective.direct_installations.iter()
+            .filter(|installation| installation.target == InstallTarget::Proma)
+            .map(|installation| {
+                let state = match installation.state.as_deref() {
+                    Some("active") => self.tr("已启用", "Active"),
+                    Some("inactive") => self.tr("已停用", "Inactive"),
+                    _ => self.tr("状态未知", "Unknown state"),
+                };
+                let status = match installation.status.as_deref() {
+                    Some("current") => self.tr("最新", "Current"),
+                    Some("update_pending") => self.tr("可同步", "Update pending"),
+                    Some("modified") => self.tr("副本已修改", "Modified"),
+                    Some("external_link") => self.tr("外部链接", "External link"),
+                    Some("unmanaged") => self.tr("未受管", "Unmanaged"),
+                    _ => self.tr("待核验", "Unverified"),
+                };
+                format!("Proma {state} · {status}")
+            }).collect::<Vec<_>>().join(" / ");
         let name = effective.name.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {
@@ -527,6 +547,10 @@ impl KitterApp {
                             })
                             .when(managed, |title| {
                                 title.child(self.managed_skill_badge().ml(px(8.)))
+                            })
+                            .when(!proma_states.is_empty(), |title| {
+                                title.child(div().ml(px(8.)).text_size(px(11.))
+                                    .text_color(p.muted).child(proma_states.clone()))
                             }),
                     )
                     .child(
@@ -1128,11 +1152,11 @@ impl KitterApp {
                                     if is_global {
                                         self.tr("全局生效", "Global").to_string()
                                     } else {
-                                        open_project
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned()
+                                        self.project_entries().into_iter()
+                                            .find(|entry| entry.path == *open_project)
+                                            .map(|entry| entry.name)
+                                            .unwrap_or_else(|| open_project.file_name().unwrap_or_default()
+                                                .to_string_lossy().into_owned())
                                     },
                                     window,
                                     cx,
@@ -1165,6 +1189,13 @@ impl KitterApp {
                         .border_color(p.border)
                         .child(context_panel),
                 )
+                .when(estimates.iter().any(|estimate| estimate.agent == AgentKind::Proma), |detail| {
+                    detail.child(div().px(px(28.)).pb(px(8.)).text_size(px(12.))
+                        .text_color(p.muted).child(self.tr(
+                            "Proma 仅静态扫描启用目录 skills；未验证运行时加载。",
+                            "Proma scans active skills statically; runtime loading is not verified.",
+                        )))
+                })
                 .child(tabs)
                 .child(skills)
                 .child(self.window_drag_strip("project-detail-window-drag", 24., cx))
@@ -1259,6 +1290,8 @@ mod tests {
                     target: InstallTarget::Universal,
                     path: PathBuf::from(path),
                     managed: true,
+                    state: None,
+                    status: None,
                 })
                 .collect(),
         }

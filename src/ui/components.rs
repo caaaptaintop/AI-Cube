@@ -34,9 +34,23 @@ impl KitterApp {
             .icon(Icon::default().path("icons/trash.svg").text_color(danger))
     }
 
-    pub(super) fn brand_icon(path: &'static str, size: f32, color: impl Into<Hsla>) -> AnyElement {
+    pub(super) fn brand_icon(
+        path: &'static str,
+        size: f32,
+        color: impl Into<Hsla>,
+        dark: bool,
+    ) -> AnyElement {
         let color = color.into();
-        if Self::is_color_brand_icon(path) {
+        if path == "icons/provider-proma-black.png" {
+            img(if dark {
+                "icons/provider-proma-black.png"
+            } else {
+                "icons/provider-proma-white.png"
+            })
+            .size(px(size))
+            .flex_none()
+            .into_any_element()
+        } else if Self::is_color_brand_icon(path) {
             Self::color_brand_icon(path, size).into_any_element()
         } else {
             svg()
@@ -262,6 +276,7 @@ impl KitterApp {
                                         icon,
                                         Self::brand_icon_size(icon, 18.),
                                         p.text,
+                                        self.uses_dark_theme(),
                                     )),
                             )
                             .child(estimate.agent.label()),
@@ -488,6 +503,7 @@ impl KitterApp {
                                 agent_icon,
                                 Self::brand_icon_size(agent_icon, 19.),
                                 p.text,
+                                self.uses_dark_theme(),
                             )),
                     )
                     .child(

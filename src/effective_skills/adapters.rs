@@ -11,7 +11,7 @@ use super::scanner::ScanProfile;
 use super::{
     AgentContextEstimate, AmpPolicy, AntigravityPolicy, ClaudeCodeAdapter, CodexAdapter,
     CopilotPolicy, CursorPolicy, DiscoveryContext, DroidPolicy, EffectiveSkill, GrokAdapter,
-    HermesPolicy, MetadataProfile, OpenClawPolicy, OpenCodePolicy, PiAdapter, SkillScope, discover,
+    HermesPolicy, MetadataProfile, OpenClawPolicy, OpenCodePolicy, PiAdapter, PromaAdapter, SkillScope, discover,
     estimate_skills, estimate_with_policy, estimate_with_profile, normalize_grok_name,
 };
 
@@ -64,6 +64,21 @@ impl AgentAdapter for PiAdapter {
             ScanProfile::PiIgnored,
             MetadataProfile::StrictFrontmatter,
         )
+    }
+}
+
+impl AgentAdapter for PromaAdapter {
+    fn inspect(&self, context: &DiscoveryContext) -> AgentContextEstimate {
+        let mut skills = discover(
+            self,
+            context,
+            ScanProfile::PromaActive,
+            MetadataProfile::StrictFrontmatter,
+        );
+        for skill in &mut skills {
+            skill.when_to_use = None;
+        }
+        estimate_skills(self, skills)
     }
 }
 
@@ -201,6 +216,9 @@ pub(super) fn inspect_project(
         .into_iter()
         .map(|adapter| adapter.inspect(context))
         .collect::<Vec<_>>();
+    if !super::proma_workspaces(context).is_empty() {
+        estimates.push(PromaAdapter.inspect(context));
+    }
     if include_global_only {
         estimates.extend([
             OpenClawAdapter.inspect(context),

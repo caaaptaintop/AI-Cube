@@ -66,8 +66,13 @@ impl KitterApp {
         let targets = crate::agents::PROJECT_INSTALL_TARGETS
             .iter()
             .copied()
+            .chain(std::iter::once(InstallTarget::Proma).filter(|_| self.can_install_proma()))
             .filter(|target| self.install_flow.selected_targets.contains(target))
             .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.show_notice(self.tr("请选择有效的安装目标", "Choose a valid install target"), cx);
+            return;
+        }
         let mut installed = 0usize;
         let mut failures = Vec::new();
         for storage_name in selected {

@@ -208,9 +208,17 @@ impl KitterApp {
             let _ = this.update(cx, |this, cx| {
                 this.model.updating_skill = None;
                 let message = match result {
-                    Ok(library) => {
+                    Ok(mut library) => {
+                        let warnings = library.take_proma_sync_warnings();
                         this.model.library = library;
-                        this.tr("技能已更新", "Skill updated").to_string()
+                        if warnings.is_empty() {
+                            this.tr("技能已更新", "Skill updated").to_string()
+                        } else {
+                            format!("{}：{}", this.tr(
+                                "来源已更新，部分 Proma 安装待同步",
+                                "Source updated; some Proma installations need synchronization",
+                            ), warnings.join("；"))
+                        }
                     }
                     Err(error) => this.error_message(error),
                 };

@@ -43,6 +43,7 @@ impl KitterApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let p = self.palette();
+        let dark = self.uses_dark_theme();
         let hidden = agents.len().saturating_sub(5);
         let visible = agents.len().min(5);
         let badge_width = if visible == 0 {
@@ -68,6 +69,7 @@ impl KitterApp {
                         icon,
                         Self::brand_icon_size(icon, 17.),
                         p.text,
+                        dark,
                     )),
             );
         }
@@ -124,6 +126,7 @@ impl KitterApp {
                                                 icon,
                                                 Self::brand_icon_size(icon, 18.),
                                                 brand_color,
+                                                dark,
                                             )),
                                     )
                                     .child(

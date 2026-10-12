@@ -52,11 +52,17 @@ pub fn install_from_path(
     if !project.is_dir() {
         bail!("项目文件夹不存在：{}", project.display());
     }
+    if targets.contains(&InstallTarget::Proma) {
+        // The mirror API validates the registered native workspace before writing.
+        let workspace = crate::proma::installation_workspace(project)?;
+        crate::proma::install(&workspace.path, source, name)?;
+    }
     install_to_roots(
         source,
         name,
         targets
             .iter()
+            .filter(|target| **target != InstallTarget::Proma)
             .map(|target| installation_root(project, *target)),
     )
 }
@@ -124,7 +130,25 @@ pub fn uninstall(
     let source = library_dir.join(name).canonicalize().ok();
     let mut removable = Vec::new();
     let mut removable_keys = HashSet::new();
+    if targets.contains(&InstallTarget::Proma) {
+        let workspace = crate::proma::installation_workspace(project)?;
+        for installation in crate::proma::inspect(&workspace.path)? {
+            if installation.name != name {
+                continue;
+            }
+            let Some(source) = &source else {
+                bail!("技能不存在，无法安全验证 Proma 镜像");
+            };
+            if !crate::proma::is_managed(&installation.path, source) {
+                bail!("不会删除来源不匹配的 Proma 安装");
+            }
+            crate::proma::uninstall_path(&installation.path)?;
+        }
+    }
     for target in targets {
+        if *target == InstallTarget::Proma {
+            continue;
+        }
         let link = installation_root(project, *target).join(name);
         match link.symlink_metadata() {
             Ok(_) => {}
@@ -164,7 +188,34 @@ pub fn uninstall_all_from_path(project: &Path, name: &str, source: &Path) -> Res
     uninstall_all_from_source(project, name, source.as_deref())
 }
 
+fn proma_removal_paths(project: &Path, name: &str, source: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let workspaces = crate::proma::project_workspaces(project).unwrap_or_default();
+    let mut proma_paths = Vec::new();
+    for workspace in &workspaces {
+        for installation in crate::proma::inspect(&workspace.path)? {
+            if installation.name == name
+                && source.is_some_and(|source| crate::proma::is_managed(&installation.path, source))
+            {
+                proma_paths.push(installation.path);
+            }
+        }
+    }
+    if workspaces.len() > 1 && !proma_paths.is_empty() {
+        bail!("项目关联多个 Proma 工作区，请指定一个原生工作区目录或精确安装位置");
+    }
+    Ok(proma_paths)
+}
+
+pub fn validate_uninstall_all_from_path(project: &Path, name: &str, source: &Path) -> Result<()> {
+    crate::library::validate_name(name)?;
+    let source = source.canonicalize().ok();
+    proma_removal_paths(project, name, source.as_deref()).map(|_| ())
+}
+
 fn uninstall_all_from_source(project: &Path, name: &str, source: Option<&Path>) -> Result<()> {
+    for path in proma_removal_paths(project, name, source)? {
+        crate::proma::uninstall_path(&path)?;
+    }
     for target in PROJECT_INSTALL_TARGETS.iter().copied() {
         let link = installation_root(project, target).join(name);
         let Some(directory_link) = directory_link::inspect(&link)? else {
@@ -206,6 +257,9 @@ fn is_supported_installation_path(installation: &ProjectSkillInstallation) -> bo
 }
 
 pub fn remove_project_skill(installation: &ProjectSkillInstallation) -> Result<()> {
+    if installation.target == InstallTarget::Proma {
+        return crate::proma::uninstall_path(&installation.path);
+    }
     if !is_supported_installation_path(installation) {
         bail!(
             "不会删除 skills 目标目录之外的技能：{}",
@@ -289,6 +343,17 @@ pub fn remove_project_skills<'a>(
 
 pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
     let mut grouped = BTreeMap::<String, Vec<ProjectSkillInstallation>>::new();
+    for workspace in crate::proma::project_workspaces(project).unwrap_or_default() {
+        for installation in crate::proma::inspect(&workspace.path)? {
+            grouped.entry(installation.name).or_default().push(ProjectSkillInstallation {
+                target: InstallTarget::Proma,
+                path: installation.path,
+                managed: installation.managed,
+                state: Some(installation.state),
+                status: Some(installation.status),
+            });
+        }
+    }
     let canonical_library = library_dir
         .canonicalize()
         .unwrap_or_else(|_| library_dir.to_path_buf());
@@ -332,6 +397,8 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                     target,
                     path,
                     managed,
+                    state: None,
+                    status: None,
                 });
         }
     }
@@ -353,6 +420,13 @@ pub fn is_installed_any_from_path(project: &Path, name: &str, source: &Path) -> 
     let Some(source) = source else {
         return false;
     };
+    if crate::proma::project_workspaces(project).unwrap_or_default().iter().any(|workspace| {
+        ["skills", "skills-inactive"].iter().any(|directory| {
+            crate::proma::is_managed(&workspace.path.join(directory).join(name), &source)
+        })
+    }) {
+        return true;
+    }
     PROJECT_INSTALL_TARGETS.iter().any(|target| {
         let parent = installation_root(project, *target);
         let path = parent.join(name);
@@ -401,6 +475,23 @@ mod tests {
         fn installation(&self, target: InstallTarget) -> PathBuf {
             self.project.join(target_directory(target)).join("example")
         }
+    }
+
+    #[test]
+    fn proma_rejects_business_repo_install_and_removal() {
+        let fixture = Fixture::new();
+        assert!(install_from_path(&fixture.project, &fixture.source, "example", &[InstallTarget::Proma]).is_err());
+        let path = fixture.project.join("skills/example");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), "business fixture").unwrap();
+        let installation = ProjectSkillInstallation {
+            target: InstallTarget::Proma, path: path.clone(), managed: true,
+            state: Some("active".into()), status: Some("current".into()),
+        };
+        assert!(remove_project_skill(&installation).is_err());
+        assert!(path.join("SKILL.md").is_file());
+        assert!(list(&fixture.project, &fixture.library).unwrap().is_empty());
+        assert!(!is_installed_any_from_path(&fixture.project, "example", &fixture.source));
     }
 
     #[test]
@@ -602,6 +693,8 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            state: None,
+            status: None,
         };
 
         let report = remove_project_skills(std::iter::once(&installation));
@@ -621,6 +714,8 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            state: None,
+            status: None,
         };
 
         let report = remove_project_skills(std::iter::once(&installation));

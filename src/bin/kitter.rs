@@ -11,7 +11,7 @@ use kitter::{
     InstallTarget, ProjectSkill, ProjectSkillInstallation, SkillGroup, SkillLibrary, SkillSummary,
     adoption,
     effective_skills::{self, AgentContextEstimate, AgentKind, group_effective_skills},
-    project, source,
+    project, proma, source,
     tags::{TagId, TagState, load_tag_states, save_tag_states},
 };
 use serde::Serialize;
@@ -94,7 +94,7 @@ enum Command {
         #[arg(long)]
         include_unmanaged: bool,
     },
-    /// List remembered projects and projects discovered from Codex
+    /// List remembered projects and native projects discovered from agents
     Projects {
         #[arg(long)]
         json: bool,
@@ -110,6 +110,11 @@ enum Command {
         view: ProjectViewArg,
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect and manage one explicitly selected native Proma workspace
+    Proma {
+        #[command(subcommand)]
+        action: PromaAction,
     },
     /// Update selected skills using their recorded sources
     Update {
@@ -138,6 +143,55 @@ enum Command {
         /// Change the skill library folder
         #[arg(long, value_name = "PATH")]
         set: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromaAction {
+    /// List registered native workspaces without initializing them
+    Workspaces {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect active and inactive installations; runtime loading is not verified
+    Status {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview mirror updates without changing the workspace or library
+    Plan {
+        #[arg(long)]
+        workspace: String,
+        #[arg(required = true)]
+        skills: Vec<String>,
+    },
+    /// Refresh only the specified workspace from registered library sources
+    Sync {
+        #[arg(long)]
+        workspace: String,
+        #[arg(required = true)]
+        skills: Vec<String>,
+    },
+    /// Move managed skills into the active directory
+    Enable {
+        #[arg(long)]
+        workspace: String,
+        #[arg(required = true)]
+        skills: Vec<String>,
+    },
+    /// Move managed skills into the inactive directory
+    Disable {
+        #[arg(long)]
+        workspace: String,
+        #[arg(required = true)]
+        skills: Vec<String>,
+    },
+    /// Recover an interrupted managed operation in the specified workspace
+    Recover {
+        #[arg(long)]
+        workspace: String,
     },
 }
 
@@ -271,6 +325,7 @@ enum TargetArg {
     Cursor,
     Opencode,
     Pi,
+    Proma,
     Omp,
     Grok,
     Antigravity,
@@ -287,6 +342,7 @@ impl From<TargetArg> for InstallTarget {
             TargetArg::Cursor => Self::Cursor,
             TargetArg::Opencode => Self::OpenCode,
             TargetArg::Pi => Self::Pi,
+            TargetArg::Proma => Self::Proma,
             TargetArg::Omp => Self::Omp,
             TargetArg::Grok => Self::Grok,
             TargetArg::Antigravity => Self::Antigravity,
@@ -308,6 +364,7 @@ enum AgentArg {
     Amp,
     Droid,
     Pi,
+    Proma,
     Omp,
     Grok,
     Openclaw,
@@ -326,6 +383,7 @@ impl From<AgentArg> for AgentKind {
             AgentArg::Amp => Self::Amp,
             AgentArg::Droid => Self::Droid,
             AgentArg::Pi => Self::Pi,
+            AgentArg::Proma => Self::Proma,
             AgentArg::Omp => Self::Omp,
             AgentArg::Dimagent => Self::DimAgent,
             AgentArg::Grok => Self::Grok,
@@ -399,9 +457,12 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let command = match Cli::parse().command {
+        Command::Proma { action } => return manage_proma(action),
+        command => command,
+    };
     let mut library = SkillLibrary::open()?;
-    match cli.command {
+    match command {
         Command::List { tag, json } => list_skills(&library, tag.as_deref(), json),
         Command::Show { skill, json } => show_skill(&library, &skill, json),
         Command::Files { skill } => {
@@ -452,11 +513,9 @@ fn run() -> Result<()> {
             view,
             json,
         } => inspect_project(&library, &path, agent, view, json),
+        Command::Proma { .. } => unreachable!("Proma commands are handled before library opening"),
         Command::Projects { json } => {
-            let discovered = match kitter::project_discovery::codex_home() {
-                Some(home) => kitter::project_discovery::discover_codex_projects(&home)?,
-                None => Vec::new(),
-            };
+            let discovered = kitter::project_discovery::discover_agent_projects()?;
             let projects = kitter::project_discovery::merge_projects(
                 &library.config.project_paths(), &discovered,
                 &library.config.hidden_discovered_projects,
@@ -847,12 +906,19 @@ fn uninstall_skills(
             .filter(|installation| {
                 library_matches
                     .first()
-                    .is_none_or(|skill| same_file(&installation.path, &skill.path))
+                    .is_none_or(|skill| same_file(&installation.path, &skill.path)
+                        || (installation.target == InstallTarget::Proma
+                            && proma::is_managed(&installation.path, &skill.path)))
             })
             .cloned()
             .collect::<Vec<_>>();
         if matching.is_empty() {
             bail!("这个项目中没有匹配的安装：{selector}");
+        }
+        if matching.iter().any(|installation| installation.target == InstallTarget::Proma)
+            && proma::project_workspaces(&project_path)?.len() > 1
+        {
+            bail!("项目关联多个 Proma 工作区，请指定一个原生工作区目录或使用 --path 精确安装位置");
         }
         selected.extend(matching);
     }
@@ -910,7 +976,14 @@ fn inspect_project(
         let targets = skill
             .installations
             .iter()
-            .map(|installation| format!("{:?}", installation.target))
+            .map(|installation| {
+                if let Some(state) = &installation.state {
+                    format!("{:?}:{state}:{}", installation.target,
+                        installation.status.as_deref().unwrap_or("unknown"))
+                } else {
+                    format!("{:?}", installation.target)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let origin = if skill
@@ -977,6 +1050,7 @@ fn update_skills(library: &mut SkillLibrary, selectors: &[String], all: bool) ->
             Ok(()) => updated += 1,
             Err(error) => failures.push(format!("{}：{error:#}", skill.record.name)),
         }
+        for warning in library.take_proma_sync_warnings() { eprintln!("{warning}"); }
     }
     finish_batch("Updated", "skill", updated, failures)
 }
@@ -1154,6 +1228,127 @@ fn manage_library(library: &mut SkillLibrary, set: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
+fn open_library_snapshot(data_dir: &Path) -> Result<(SkillLibrary, tempfile::TempDir)> {
+    let config = kitter::config::AppConfig::load_from(data_dir)?;
+    let snapshot = tempfile::tempdir()?;
+    let registry = data_dir.join("registry.json");
+    if registry.exists() {
+        std::fs::copy(registry, snapshot.path().join("registry.json"))?;
+    }
+    let mut library = SkillLibrary::open_in(snapshot.path())?;
+    library.config = config;
+    Ok((library, snapshot))
+}
+
+fn proma_workspace(root: &Path, slug: &str) -> Result<proma::Workspace> {
+    proma::workspaces(root)?.into_iter()
+        .find(|workspace| workspace.slug == slug)
+        .with_context(|| format!("没有找到已登记的 Proma 工作区：{slug}"))
+}
+
+fn manage_proma(action: PromaAction) -> Result<()> {
+    let root = proma::home().context("无法定位 Proma 配置根")?;
+    // Normal library opening can upgrade the builtin and registry. Resolve
+    // selectors in a temporary snapshot; inspections/recovery need no library.
+    let snapshot = if matches!(&action, PromaAction::Plan { .. } | PromaAction::Sync { .. }
+        | PromaAction::Enable { .. } | PromaAction::Disable { .. }) {
+        Some(open_library_snapshot(&kitter::config::app_data_dir())?)
+    } else {
+        None
+    };
+    let library = snapshot.as_ref().map(|(library, _)| library);
+    match action {
+        PromaAction::Workspaces { json } => {
+            let workspaces = proma::workspaces(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&workspaces)?);
+            } else {
+                for workspace in workspaces {
+                    println!("{}  {}  {}", workspace.slug, workspace.name, workspace.path.display());
+                }
+            }
+            Ok(())
+        }
+        PromaAction::Status { workspace, json } => {
+            let workspace = proma_workspace(&root, &workspace)?;
+            let installations = proma::inspect(&workspace.path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "workspace": workspace,
+                    "evidence": "static_inspection",
+                    "runtime_verified": false,
+                    "installations": installations,
+                }))?);
+            } else {
+                println!("Proma: {}（静态检查，未验证运行时加载）", workspace.slug);
+                for installation in installations {
+                    println!("{:<28} {:<10} {:<16} {}", installation.name,
+                        installation.state, installation.status, installation.path.display());
+                }
+            }
+            Ok(())
+        }
+        PromaAction::Plan { workspace, skills } => {
+            let workspace = proma_workspace(&root, &workspace)?;
+            let plans = resolve_skills(library.context("命令需要技能库")?, &skills)?.iter().map(|skill| {
+                proma::plan_install(&root, &workspace.path, &skill.path, &skill.record.name)
+            }).collect::<Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&plans)?);
+            Ok(())
+        }
+        PromaAction::Sync { workspace, skills } => {
+            let workspace = proma_workspace(&root, &workspace)?;
+            let skills = resolve_skills(library.context("命令需要技能库")?, &skills)?;
+            for skill in &skills {
+                proma::plan_install(&root, &workspace.path, &skill.path, &skill.record.name)?;
+            }
+            let mut succeeded = 0;
+            let mut failures = Vec::new();
+            for skill in skills {
+                match proma::install(&workspace.path, &skill.path, &skill.record.name) {
+                    Ok(()) => succeeded += 1,
+                    Err(error) => failures.push(format!("{}：{error:#}", skill.record.name)),
+                }
+            }
+            finish_batch("Synced", "skill", succeeded, failures)
+        }
+        PromaAction::Enable { workspace, skills } => {
+            set_proma_enabled(library.context("命令需要技能库")?, &root, &workspace, &skills, true)
+        }
+        PromaAction::Disable { workspace, skills } => {
+            set_proma_enabled(library.context("命令需要技能库")?, &root, &workspace, &skills, false)
+        }
+        PromaAction::Recover { workspace } => {
+            let workspace = proma_workspace(&root, &workspace)?;
+            proma::recover(&workspace.path)?;
+            println!("Recovered {}", workspace.slug);
+            Ok(())
+        }
+    }
+}
+
+fn set_proma_enabled(
+    library: &SkillLibrary, root: &Path, slug: &str, selectors: &[String], enabled: bool,
+) -> Result<()> {
+    let workspace = proma_workspace(root, slug)?;
+    let skills = resolve_skills(library, selectors)?;
+    let mut succeeded = 0;
+    let mut failures = Vec::new();
+    for skill in skills {
+        let directory = if enabled { "skills-inactive" } else { "skills" };
+        let path = workspace.path.join(directory).join(&skill.record.name);
+        if !proma::is_managed(&path, &skill.path) {
+            failures.push(format!("{}：没有与库来源匹配的受管安装", skill.record.name));
+            continue;
+        }
+        match proma::set_enabled(&workspace.path, &skill.record.name, enabled) {
+            Ok(()) => succeeded += 1,
+            Err(error) => failures.push(format!("{}：{error:#}", skill.record.name)),
+        }
+    }
+    finish_batch(if enabled { "Enabled" } else { "Disabled" }, "skill", succeeded, failures)
+}
+
 fn resolve_skills(library: &SkillLibrary, selectors: &[String]) -> Result<Vec<SkillSummary>> {
     let mut seen = HashSet::new();
     let mut skills = Vec::new();
@@ -1252,7 +1447,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use kitter::tags::TagState;
 
-    use super::{Cli, Command, ProjectViewArg, TagAction, resolve_tag};
+    use super::{Cli, Command, ProjectViewArg, PromaAction, TagAction, open_library_snapshot, resolve_tag};
 
     #[test]
     fn command_tree_is_valid() {
@@ -1297,6 +1492,47 @@ mod tests {
             panic!("expected project command");
         };
         assert!(matches!(view, ProjectViewArg::Plugins));
+    }
+
+    #[test]
+    fn proma_commands_require_one_explicit_workspace() {
+        for action in ["plan", "sync", "enable", "disable"] {
+            let cli = Cli::try_parse_from(["kitter", "proma", action,
+                "--workspace", "ai-cube-pilot", "alpha", "beta"]).unwrap();
+            assert!(matches!(cli.command, Command::Proma { .. }));
+            assert!(Cli::try_parse_from(["kitter", "proma", action, "alpha"]).is_err());
+            assert!(Cli::try_parse_from(["kitter", "proma", action,
+                "--workspace", "ai-cube-pilot"]).is_err());
+        }
+        let cli = Cli::try_parse_from(["kitter", "proma", "recover", "--workspace", "ai-cube-pilot"]).unwrap();
+        assert!(matches!(cli.command, Command::Proma { action: PromaAction::Recover { .. } }));
+        assert!(Cli::try_parse_from(["kitter", "proma", "recover"]).is_err());
+        assert!(Cli::try_parse_from(["kitter", "install", "alpha", "--project", "/tmp/native", "--target", "proma"]).is_ok());
+        assert!(Cli::try_parse_from(["kitter", "project", "/tmp/native", "--agent", "proma"]).is_ok());
+    }
+
+    #[test]
+    fn proma_library_snapshot_does_not_initialize_or_upgrade_live_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let (snapshot_library, _snapshot) = open_library_snapshot(temp.path()).unwrap();
+        assert_eq!(snapshot_library.config.library_dir, temp.path().join("skills"));
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+
+        let mut library = kitter::SkillLibrary::open_in(temp.path()).unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: alpha\ndescription: fixture\n---\n").unwrap();
+        kitter::source::scan_local(&source).unwrap()
+            .import_selected(&mut library, &std::collections::HashSet::from(["alpha".into()]), None).unwrap();
+        let registry_before = std::fs::read(temp.path().join("registry.json")).unwrap();
+        let config_before = std::fs::read(temp.path().join("config.json")).unwrap();
+        let builtin = library.config.library_dir.join("_kitter-builtin/SKILL.md");
+        std::fs::write(&builtin, "old fixture builtin").unwrap();
+        let (snapshot_library, _snapshot) = open_library_snapshot(temp.path()).unwrap();
+        assert_eq!(snapshot_library.resolve_skill("alpha").unwrap().path, library.resolve_skill("alpha").unwrap().path);
+        assert_eq!(std::fs::read(temp.path().join("registry.json")).unwrap(), registry_before);
+        assert_eq!(std::fs::read(temp.path().join("config.json")).unwrap(), config_before);
+        assert_eq!(std::fs::read_to_string(builtin).unwrap(), "old fixture builtin");
     }
 
     #[test]

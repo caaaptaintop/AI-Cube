@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    ProjectSkill, ProjectSkillInstallation,
+    InstallTarget, ProjectSkill, ProjectSkillInstallation,
     effective_skills::{
         AgentContextEstimate, AgentKind, SkillSource, SkillVisibility, group_effective_skills,
     },
@@ -118,7 +118,8 @@ pub(super) fn skill_rows(
 
             for installation in project_skills
                 .iter()
-                .filter(|installed| installed.name == skill.name)
+                .filter(|installed| installed.name == skill.name
+                    || installed.installations.iter().any(|item| item.target == InstallTarget::Proma))
                 .flat_map(|installed| &installed.installations)
             {
                 if same_file(&installation.path.join("SKILL.md"), &skill.path)
@@ -133,6 +134,44 @@ pub(super) fn skill_rows(
         }
         rows.push(row);
     }
+    // Inactive or invalid Proma packages belong in installation management,
+    // but must never be added to the effective catalog or token estimate.
+    if selected_agent.is_none_or(|agent| agent == AgentKind::Proma) {
+        for installed in project_skills {
+            for installation in &installed.installations {
+                if installation.target != InstallTarget::Proma
+                    || rows.iter().any(|row| row.direct_installations.iter().any(|item| {
+                        project::installation_key(&item.path) == project::installation_key(&installation.path)
+                    }))
+                {
+                    continue;
+                }
+                let row = if let Some(index) = rows.iter().position(|row| row.name == installed.name) {
+                    &mut rows[index]
+                } else {
+                    rows.push(EffectiveSkillRow {
+                        name: installed.name.clone(),
+                        description: String::new(),
+                        locations: Vec::new(),
+                        built_in: false,
+                        agents: Vec::new(),
+                        manual_only: false,
+                        direct_installations: Vec::new(),
+                    });
+                    rows.last_mut().unwrap()
+                };
+                if !row.agents.contains(&AgentKind::Proma) {
+                    row.agents.push(AgentKind::Proma);
+                }
+                if let Some(parent) = installation.path.parent()
+                    && !row.locations.iter().any(|path| path == parent)
+                {
+                    row.locations.push(parent.to_path_buf());
+                }
+                row.direct_installations.push(installation.clone());
+            }
+        }
+    }
     let agent_order = |agent: &AgentKind| {
         crate::agents::AGENT_ICON_ORDER
             .iter()
@@ -144,4 +183,28 @@ pub(super) fn skill_rows(
         row.agents.sort_by_key(agent_order);
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proma_inactive_installations_are_visible_with_distinct_state() {
+        let installations = ["active", "inactive"].into_iter().map(|state| ProjectSkillInstallation {
+            target: InstallTarget::Proma,
+            path: PathBuf::from(if state == "active" { "/pilot/skills/alpha" } else { "/pilot/skills-inactive/alpha" }),
+            managed: true,
+            state: Some(state.into()),
+            status: Some("current".into()),
+        }).collect();
+        let direct = [ProjectSkill { name: "alpha".into(), installations }];
+        let rows = skill_rows(&[], &direct, Some(AgentKind::Proma));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agents, [AgentKind::Proma]);
+        assert_eq!(rows[0].direct_installations.len(), 2);
+        assert_eq!(rows[0].direct_installations[0].state.as_deref(), Some("active"));
+        assert_eq!(rows[0].direct_installations[1].state.as_deref(), Some("inactive"));
+        assert!(skill_rows(&[], &direct, Some(AgentKind::Codex)).is_empty());
+    }
 }

@@ -485,21 +485,27 @@ pub struct KitterApp {
 impl KitterApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut app = Self::new_in(crate::config::app_data_dir(), window, cx);
-        if let Some(home) = crate::project_discovery::codex_home() {
+        {
             app.projects_view.discovered_projects =
-                crate::project_discovery::discover_codex_projects(&home).unwrap_or_default();
+                crate::project_discovery::discover_agent_projects().unwrap_or_default();
+            app.normalize_open_project();
             app.sync_project_select(window, cx);
             app.projects_view.discovery_task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(15)).await;
-                    let home = home.clone();
                     let discovered = cx.background_executor().spawn(async move {
-                        crate::project_discovery::discover_codex_projects(&home)
+                        crate::project_discovery::discover_agent_projects()
                     }).await;
                     if this.update(cx, |this, cx| {
                         if let Ok(discovered) = discovered {
                             if this.projects_view.discovered_projects != discovered {
                                 this.projects_view.discovered_projects = discovered;
+                                this.normalize_open_project();
+                                this.projects_view.scan_generation = this.projects_view.scan_generation.wrapping_add(1);
+                                this.projects_view.project_snapshots.borrow_mut().clear();
+                                this.projects_view.project_snapshot_tasks.borrow_mut().clear();
+                                this.projects_view.context_estimates.borrow_mut().clear();
+                                this.projects_view.context_estimate_tasks.borrow_mut().clear();
                                 cx.notify();
                             }
                         }
@@ -716,6 +722,9 @@ impl KitterApp {
                     return;
                 };
                 this.projects_view.open_project = Some(path.clone());
+                if !this.can_install_proma() {
+                    this.install_flow.selected_targets.remove(&InstallTarget::Proma);
+                }
                 this.notify_dialog(cx);
             },
         )
@@ -785,6 +794,9 @@ impl KitterApp {
         } else {
             known_groups.clone()
         };
+        let initial_project = std::env::var_os("KITTER_OPEN_PROJECT")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir());
         Self {
             model: AppModel {
                 library,
@@ -793,7 +805,7 @@ impl KitterApp {
                 updating_skill: None,
             },
             shell: ShellState {
-                page: Page::Skills,
+                page: if initial_project.is_some() { Page::Projects } else { Page::Skills },
                 focus_handle: cx.focus_handle(),
                 header_drag_armed: false,
                 shell_layout,
@@ -822,8 +834,8 @@ impl KitterApp {
             projects_view: ProjectsState {
                 discovered_projects: Vec::new(),
                 discovery_task: None,
-                open_project: None,
-                global_project_view: true,
+                open_project: initial_project.clone(),
+                global_project_view: initial_project.is_none(),
                 batch_project: None,
                 batch_selected: HashSet::new(),
                 batch_filter: None,
@@ -892,12 +904,19 @@ impl KitterApp {
         }
     }
 
-    fn palette(&self) -> Palette {
+    fn uses_dark_theme(&self) -> bool {
         match self.model.library.config.theme {
-            Theme::Light => Palette::light(),
-            Theme::Dark => Palette::dark(),
-            Theme::System if !self.shell.system_dark => Palette::light(),
-            Theme::System => Palette::dark(),
+            Theme::Light => false,
+            Theme::Dark => true,
+            Theme::System => self.shell.system_dark,
+        }
+    }
+
+    fn palette(&self) -> Palette {
+        if self.uses_dark_theme() {
+            Palette::dark()
+        } else {
+            Palette::light()
         }
     }
 

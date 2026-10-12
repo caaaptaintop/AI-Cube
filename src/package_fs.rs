@@ -75,6 +75,127 @@ pub(crate) fn rename_exclusive(source: &Path, destination: &Path) -> Result<()> 
 }
 
 impl Directory {
+    /// Resolve every absolute component without following directory links.
+    /// Proma writes retain these descriptors throughout a transaction.
+    pub(crate) fn open_anchored(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            if !path.is_absolute() { bail!("目录必须是绝对路径"); }
+            #[cfg(target_os = "macos")]
+            let normalized = ["/var", "/tmp"].into_iter().find_map(|alias| path.strip_prefix(alias).ok().map(|tail| Path::new("/private").join(alias.trim_start_matches('/')).join(tail))).unwrap_or_else(|| path.to_path_buf());
+            #[cfg(target_os = "macos")]
+            let path = normalized.as_path();
+            let mut directory = Self::open(Path::new("/"))?;
+            for component in path.components() {
+                match component {
+                    Component::RootDir => {},
+                    Component::Normal(name) => directory = directory.child(Path::new(name))?,
+                    _ => bail!("目录必须是安全绝对路径"),
+                }
+            }
+            Ok(directory)
+        }
+        #[cfg(not(unix))]
+        bail!("此平台尚未支持 Proma 受管写入")
+    }
+
+    pub(crate) fn child(&self, path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let (parent, name) = self.parent(path, false)?;
+            let fd = rustix::fs::openat(&parent, name.as_str(), OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+            Ok(Self { file: fd.into() })
+        }
+        #[cfg(not(unix))]
+        { let _ = path; bail!("此平台尚未支持 Proma 受管写入") }
+    }
+
+    pub(crate) fn identity(&self) -> Result<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = self.file.metadata()?;
+            Ok(format!("{}:{}", m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        bail!("此平台尚未支持 Proma 受管写入")
+    }
+
+    pub(crate) fn verify_location(&self, path: &Path) -> Result<()> {
+        if Self::open_anchored(path)?.identity()? != self.identity()? { bail!("目录身份发生变化，未执行写入"); }
+        Ok(())
+    }
+
+    pub(crate) fn lock(&self, name: &Path) -> Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let (parent, name) = self.parent(name, false)?;
+            let file: fs::File = rustix::fs::openat(&parent, name.as_str(), OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::from_raw_mode(0o600))?.into();
+            if !file.metadata()?.is_file() { bail!("Proma 工作区锁不是普通文件"); }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { bail!("Proma 工作区已有写操作，请稍后重试"); }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        { let _ = name; bail!("此平台尚未支持 Proma 受管写入") }
+    }
+
+    pub(crate) fn rename_to(&self, from: &Path, destination: &Self, to: &Path) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let (from_parent, from_name) = self.parent(from, false)?;
+            let (to_parent, to_name) = destination.parent(to, false)?;
+            rustix::fs::renameat_with(&from_parent, from_name.as_str(), &to_parent, to_name.as_str(), rustix::fs::RenameFlags::NOREPLACE)?;
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        { let _ = (from, destination, to); bail!("此平台尚未支持 Proma 受管写入") }
+    }
+
+    pub(crate) fn observation(&self, path: &Path) -> Result<String> {
+        #[cfg(unix)]
+        {
+            use sha2::{Digest, Sha256};
+            let (parent, name) = self.parent(path, false)?;
+            let stat = match rustix::fs::statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => return Ok("absent".into()),
+                Err(error) => return Err(error.into()),
+            };
+            let identity = format!("{}:{}", stat.st_dev, stat.st_ino);
+            let bytes = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Symlink => serde_json::to_vec(&(identity, rustix::fs::readlinkat(&parent, name.as_str(), Vec::new())?.to_str().context("链接目标不是 UTF-8")?))?,
+                FileType::Directory => {
+                    let child = self.child(path)?;
+                    serde_json::to_vec(&(child.identity()?, child.installation_snapshot()?))?
+                }
+                _ => bail!("安装位置不是技能目录"),
+            };
+            Ok(format!("{:x}", Sha256::digest(bytes)))
+        }
+        #[cfg(not(unix))]
+        { let _ = path; bail!("此平台尚未支持 Proma 受管写入") }
+    }
+
+    pub(crate) fn directory_names(&self) -> Result<Vec<String>> {
+        #[cfg(unix)]
+        {
+            let mut directory = rustix::fs::Dir::read_from(&self.file)?;
+            let mut names = Vec::new();
+            while let Some(entry) = directory.read() {
+                let entry = entry?;
+                let name = entry.file_name();
+                let label = name.to_str().context("目录名称不是 UTF-8")?;
+                if matches!(label, "." | "..") { continue; }
+                let stat = rustix::fs::statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                if FileType::from_raw_mode(stat.st_mode) == FileType::Directory { names.push(label.to_owned()); }
+            }
+            names.sort();
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        bail!("此平台尚未支持 Proma 受管写入")
+    }
     pub(crate) fn open(path: &Path) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -362,15 +483,34 @@ impl Directory {
 
     #[cfg(unix)]
     pub(crate) fn snapshot(&self) -> Result<Manifest> {
-        fn scan(dir: &fs::File, prefix: &Path, out: &mut Manifest) -> Result<()> {
+        self.snapshot_impl(false)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn installation_snapshot(&self) -> Result<Manifest> {
+        self.snapshot_impl(true)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn installation_snapshot(&self) -> Result<Manifest> {
+        bail!("此平台尚未支持 Proma 受管写入")
+    }
+
+    #[cfg(unix)]
+    fn snapshot_impl(&self, include_references: bool) -> Result<Manifest> {
+        fn scan(dir: &fs::File, prefix: &Path, out: &mut Manifest, include_references: bool) -> Result<()> {
             let mut entries = rustix::fs::Dir::read_from(dir)?;
             while let Some(entry) = entries.read() {
                 let entry = entry?;
                 let name = entry.file_name();
                 let label = name.to_str().context("包路径不是 UTF-8")?;
-                if matches!(label, "." | ".." | "local-data" | ".git") {
+                if matches!(label, "." | "..") {
                     continue;
                 }
+                let protected = if include_references {
+                    label.eq_ignore_ascii_case("local-data") || label.eq_ignore_ascii_case(".git")
+                } else { matches!(label, "local-data" | ".git") };
+                if protected && !include_references { continue; }
                 let path = prefix.join(label);
                 let key = path.to_str().context("包路径不是 UTF-8")?.to_owned();
                 let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
@@ -385,7 +525,7 @@ impl Directory {
                         .into();
                         use std::os::unix::fs::PermissionsExt;
                         let mode = child.metadata()?.permissions().mode() & 0o7777;
-                        scan(&child, &path, out)?;
+                        if !protected { scan(&child, &path, out, include_references)?; }
                         Node::Directory { mode }
                     }
                     FileType::RegularFile => {
@@ -404,7 +544,7 @@ impl Directory {
                         let mode = file.metadata()?.permissions().mode() & 0o7777;
                         let mut hash = Sha256::new();
                         let mut buffer = [0u8; 65536];
-                        loop {
+                        while !protected {
                             let count = file.read(&mut buffer)?;
                             if count == 0 {
                                 break;
@@ -430,7 +570,7 @@ impl Directory {
             Ok(())
         }
         let mut result = Manifest::new();
-        scan(&self.file, Path::new(""), &mut result)?;
+        scan(&self.file, Path::new(""), &mut result, include_references)?;
         Ok(result)
     }
 }

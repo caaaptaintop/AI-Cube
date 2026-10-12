@@ -3,7 +3,9 @@ use super::*;
 impl KitterApp {
     pub(super) fn install_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let p = self.palette();
-        let has_target = !self.install_flow.selected_targets.is_empty()
+        let has_target = self.install_flow.selected_targets.iter().any(|target| {
+            *target != InstallTarget::Proma || self.can_install_proma()
+        })
             && if self.install_flow.global {
                 dirs::home_dir().is_some()
             } else {
@@ -26,11 +28,10 @@ impl KitterApp {
         let project_label = if self.install_flow.global {
             global_label.clone()
         } else {
-            self.projects_view
-                .open_project
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
+            self.projects_view.open_project.as_ref()
+                .map(|path| self.project_entries().into_iter()
+                    .find(|entry| entry.path == *path).map(|entry| entry.name)
+                    .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned()))
                 .unwrap_or_else(|| self.tr("选择一个项目", "Choose a project").to_string())
         };
         let selected_global = self.install_flow.global;
@@ -39,13 +40,12 @@ impl KitterApp {
         let project_choices = home
             .iter()
             .cloned()
-            .map(|path| (true, path))
+            .map(|path| (true, path, global_label.clone()))
             .chain(
                 self.project_entries()
                     .into_iter()
-                    .map(|entry| entry.path)
-                    .filter(|path| Some(path) != home.as_ref())
-                    .map(|path| (false, path)),
+                    .filter(|entry| Some(&entry.path) != home.as_ref())
+                    .map(|entry| (false, entry.path, entry.name)),
             )
             .collect::<Vec<_>>();
         let app = cx.entity().downgrade();
@@ -70,19 +70,11 @@ impl KitterApp {
                     .border_color(p.border_strong)
                     .bg(menu_background)
                     .shadow_lg();
-                for (index, (global, path)) in project_choices.iter().cloned().enumerate() {
+                for (index, (global, path, name)) in project_choices.iter().cloned().enumerate() {
                     let active = if global {
                         selected_global
                     } else {
                         !selected_global && selected_project.as_ref() == Some(&path)
-                    };
-                    let name = if global {
-                        global_label.clone()
-                    } else {
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
                     };
                     let path_label = display_path(&path);
                     let app = app.clone();
@@ -122,6 +114,9 @@ impl KitterApp {
                                     this.install_flow.global = global;
                                     if !global {
                                         this.projects_view.open_project = Some(path.clone());
+                                    }
+                                    if !this.can_install_proma() {
+                                        this.install_flow.selected_targets.remove(&InstallTarget::Proma);
                                     }
                                     this.notify_dialog(cx);
                                 });
@@ -279,7 +274,15 @@ impl KitterApp {
         panel
     }
 
+    pub(super) fn can_install_proma(&self) -> bool {
+        !self.install_flow.global && self.projects_view.open_project.as_ref()
+            .is_some_and(|project| crate::proma::installation_workspace(project).is_ok())
+    }
+
     pub(super) fn toggle_install_target(&mut self, target: InstallTarget) {
+        if target == InstallTarget::Proma && !self.can_install_proma() {
+            return;
+        }
         if !self.install_flow.selected_targets.remove(&target) {
             self.install_flow.selected_targets.insert(target);
         }
@@ -319,7 +322,12 @@ impl KitterApp {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(Self::brand_icon(icon_path, 18., p.text)),
+                        .child(Self::brand_icon(
+                            icon_path,
+                            18.,
+                            p.text,
+                            self.uses_dark_theme(),
+                        )),
                 )
                 .child(div().text_size(px(12.)).text_color(p.secondary).child(name))
         };
@@ -393,6 +401,9 @@ impl KitterApp {
             .child(universal_rows);
         let mut independent_rows = div().flex().flex_col();
         for info in crate::agents::INDEPENDENT_INSTALL_TARGETS {
+            if info.target == InstallTarget::Proma && !self.can_install_proma() {
+                continue;
+            }
             independent_rows = independent_rows.child(self.target_row(*info, cx));
         }
         let independent_box = div()
@@ -428,6 +439,7 @@ impl KitterApp {
             InstallTarget::Cursor => "target-cursor",
             InstallTarget::OpenCode => "target-opencode",
             InstallTarget::Pi => "target-pi",
+            InstallTarget::Proma => "target-proma",
             InstallTarget::Omp => "target-omp",
             InstallTarget::Grok => "target-grok",
             InstallTarget::Antigravity => "target-antigravity",
@@ -467,7 +479,12 @@ impl KitterApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Self::brand_icon(info.icon_path, 18., p.text)),
+                    .child(Self::brand_icon(
+                        info.icon_path,
+                        18.,
+                        p.text,
+                        self.uses_dark_theme(),
+                    )),
             )
             .child(div().ml(px(9.)).text_size(px(13.)).child(info.name))
             .child(div().flex_1())
