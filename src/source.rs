@@ -206,13 +206,16 @@ pub fn scan_local(root: &Path) -> Result<SkillScan> {
         bail!("请选择一个文件夹");
     }
     let root = root.canonicalize()?;
+    reject_data_root(&root)?;
 
     let mut skill_dirs = BTreeSet::new();
     for entry in WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+            entry.depth() == 0
+                || (entry.file_name() != "local-data"
+                    && !entry.file_name().to_string_lossy().starts_with('.'))
         })
     {
         let entry = entry.with_context(|| format!("无法读取文件夹：{}", root.display()))?;
@@ -386,6 +389,9 @@ fn update_record(library: &mut SkillLibrary, mut record: SkillRecord) -> Result<
         let candidate = crate::adoption::AdoptionCandidate::from_local_record(&record)?;
         library.adopt(&candidate, &[])?;
         return Ok(());
+    }
+    if !record.origin.is_builtin() && !library.has_package_baseline(&storage_name) {
+        bail!("缺少已安装版本的文件基线，无法确认本机修改，已停止更新：{}", record.name);
     }
     let temp = TempDir::new()?;
     let mut updated_origin = None;
@@ -611,6 +617,8 @@ fn npx_workspace(repository: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     repository.hash(&mut hasher);
     crate::config::app_data_dir()
+        .join("library-support")
+        .join("cache")
         .join("npx-sources")
         .join(format!("{:016x}", hasher.finish()))
 }
@@ -685,7 +693,14 @@ fn npx_lock_hashes(workspace: &Path) -> Result<HashMap<String, String>> {
 fn same_tree(left: &Path, right: &Path) -> Result<bool> {
     let collect = |root: &Path| -> Result<Vec<(PathBuf, Vec<u8>)>> {
         let mut files = Vec::new();
-        for entry in WalkDir::new(root).follow_links(false) {
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || (entry.file_name() != "local-data" && entry.file_name() != ".git")
+            })
+        {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -818,15 +833,33 @@ fn tool_names(name: &str) -> Vec<String> {
     vec![name.to_string()]
 }
 
+fn reject_data_root(root: &Path) -> Result<()> {
+    if root
+        .components()
+        .any(|part| part.as_os_str() == "local-data")
+    {
+        bail!("本机数据目录不能作为技能来源");
+    }
+    Ok(())
+}
+
 fn find_skill_dir(root: &Path) -> Result<PathBuf> {
+    reject_data_root(&root.canonicalize()?)?;
     if root.join("SKILL.md").is_file() {
+        reject_data_root(&root.join("SKILL.md").canonicalize()?)?;
         return Ok(root.to_path_buf());
     }
     WalkDir::new(root)
         .max_depth(4)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != "local-data")
         .filter_map(Result::ok)
-        .find(|e| e.file_name() == "SKILL.md")
+        .find(|e| {
+            e.file_name() == "SKILL.md"
+                && e.path()
+                    .canonicalize()
+                    .is_ok_and(|path| reject_data_root(&path).is_ok())
+        })
         .and_then(|e| e.path().parent().map(Path::to_path_buf))
         .context("仓库中没有找到 SKILL.md")
 }
@@ -847,6 +880,7 @@ fn find_claude_skills(plugin: &str) -> Result<Vec<PathBuf>> {
     let mut candidates = WalkDir::new(root)
         .max_depth(7)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != "local-data")
         .filter_map(Result::ok)
         .filter(|entry| {
             let belongs_to_plugin = plugin.is_empty()
@@ -883,6 +917,33 @@ mod tests {
             format!("---\nname: {name}\ndescription: fixture\n---\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn scan_and_comparison_ignore_local_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        write_skill(&left, "demo");
+        write_skill(&right, "demo");
+        write_skill(&left.join("local-data/nested"), "private");
+        fs::write(left.join("local-data/private.txt"), "fixture").unwrap();
+        let scan = scan_local(&left).unwrap();
+        assert_eq!(scan.skills.len(), 1);
+        assert_eq!(scan.skills[0].name, "demo");
+        assert!(scan_local(&left.join("local-data")).is_err());
+        assert!(scan_local(&left.join("local-data/nested")).is_err());
+        assert!(find_skill_dir(&left.join("local-data/nested")).is_err());
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(left.join("local-data/nested"), &alias).unwrap();
+            assert!(scan_local(&alias).is_err());
+            assert!(find_skill_dir(&alias).is_err());
+        }
+        assert!(same_tree(&left, &right).unwrap());
+        assert_eq!(find_skill_dir(&left).unwrap(), left);
+        assert!(find_skill_dir(&temp.path().join("left/local-data/nested-missing")).is_err());
     }
 
     #[cfg(unix)]
@@ -995,7 +1056,7 @@ printf 'call\n' >> "$KITTER_IMPORT_FIXTURE/calls"
         assert!(
             matches!(library.record("skill-18").unwrap().origin, SkillOrigin::Npx { source_hash: Some(hash), .. } if hash == "hash-18")
         );
-        assert!(!root.join("data/npx-sources").exists());
+        assert!(!root.join("data/library-support/cache/npx-sources").exists());
     }
 
     #[test]

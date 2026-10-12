@@ -484,7 +484,30 @@ pub struct KitterApp {
 
 impl KitterApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_in(crate::config::app_data_dir(), window, cx)
+        let mut app = Self::new_in(crate::config::app_data_dir(), window, cx);
+        if let Some(home) = crate::project_discovery::codex_home() {
+            app.projects_view.discovered_projects =
+                crate::project_discovery::discover_codex_projects(&home).unwrap_or_default();
+            app.sync_project_select(window, cx);
+            app.projects_view.discovery_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(15)).await;
+                    let home = home.clone();
+                    let discovered = cx.background_executor().spawn(async move {
+                        crate::project_discovery::discover_codex_projects(&home)
+                    }).await;
+                    if this.update(cx, |this, cx| {
+                        if let Ok(discovered) = discovered {
+                            if this.projects_view.discovered_projects != discovered {
+                                this.projects_view.discovered_projects = discovered;
+                                cx.notify();
+                            }
+                        }
+                    }).is_err() { break; }
+                }
+            }));
+        }
+        app
     }
 
     fn new_in(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -797,6 +820,8 @@ impl KitterApp {
                 collapsed_content_directories: HashSet::new(),
             },
             projects_view: ProjectsState {
+                discovered_projects: Vec::new(),
+                discovery_task: None,
                 open_project: None,
                 global_project_view: true,
                 batch_project: None,
@@ -958,11 +983,7 @@ impl KitterApp {
         self.model.library.config.collapsed_skill_groups =
             self.skills_view.collapsed_groups.iter().cloned().collect();
         self.model.library.config.collapsed_skill_groups_initialized = true;
-        let _ = self
-            .model
-            .library
-            .config
-            .save_to(self.model.library.data_dir());
+        let _ = self.model.library.save();
     }
 
     fn tag_filter_for(&self, scope: TagScope) -> Option<TagId> {
@@ -1325,13 +1346,9 @@ impl KitterApp {
     }
 
     fn sync_project_select(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let choices = self
-            .model
-            .library
-            .config
-            .project_paths()
+        let choices = self.project_entries()
             .into_iter()
-            .map(|path| ProjectChoice { path })
+            .map(|entry| ProjectChoice { path: entry.path })
             .collect::<Vec<_>>();
         let selected = self
             .projects_view

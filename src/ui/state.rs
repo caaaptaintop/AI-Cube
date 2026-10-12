@@ -57,6 +57,8 @@ pub(super) struct SkillsState {
 }
 
 pub(super) struct ProjectsState {
+    pub discovered_projects: Vec<crate::project_discovery::ProjectEntry>,
+    pub discovery_task: Option<gpui::Task<()>>,
     pub open_project: Option<PathBuf>,
     pub global_project_view: bool,
     pub batch_project: Option<PathBuf>,

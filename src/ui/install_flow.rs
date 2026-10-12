@@ -41,11 +41,9 @@ impl KitterApp {
             .cloned()
             .map(|path| (true, path))
             .chain(
-                self.model
-                    .library
-                    .config
-                    .project_paths()
+                self.project_entries()
                     .into_iter()
+                    .map(|entry| entry.path)
                     .filter(|path| Some(path) != home.as_ref())
                     .map(|path| (false, path)),
             )

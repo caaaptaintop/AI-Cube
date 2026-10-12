@@ -62,6 +62,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub project_activity: BTreeMap<PathBuf, u64>,
     #[serde(default)]
+    pub hidden_discovered_projects: BTreeSet<PathBuf>,
+    #[serde(default)]
     pub collapsed_skill_groups: BTreeSet<String>,
     #[serde(default)]
     pub collapsed_skill_groups_initialized: bool,
@@ -75,6 +77,7 @@ impl Default for AppConfig {
             library_dir: app_data_dir().join("skills"),
             recent_projects: vec![],
             project_activity: BTreeMap::new(),
+            hidden_discovered_projects: BTreeSet::new(),
             collapsed_skill_groups: BTreeSet::new(),
             collapsed_skill_groups_initialized: false,
         }
@@ -122,8 +125,10 @@ impl AppConfig {
     }
 
     pub fn remember_project(&mut self, path: PathBuf) {
+        let path = crate::project_discovery::path_identity(&path);
+        self.hidden_discovered_projects.retain(|hidden| crate::project_discovery::path_identity(hidden) != path);
         let needs_activity = !self.project_activity.contains_key(&path);
-        self.recent_projects.retain(|item| item != &path);
+        self.recent_projects.retain(|item| crate::project_discovery::path_identity(item) != path);
         self.recent_projects.insert(0, path.clone());
         self.recent_projects.truncate(8);
         if needs_activity {
@@ -173,8 +178,10 @@ impl AppConfig {
     }
 
     pub fn remove_project(&mut self, path: &Path) {
-        self.recent_projects.retain(|project| project != path);
-        self.project_activity.remove(path);
+        let identity = crate::project_discovery::path_identity(path);
+        self.hidden_discovered_projects.insert(identity.clone());
+        self.recent_projects.retain(|project| crate::project_discovery::path_identity(project) != identity);
+        self.project_activity.retain(|project, _| crate::project_discovery::path_identity(project) != identity);
     }
 
     fn prune_project_activity(&mut self) {
@@ -198,6 +205,38 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AppConfig, Language};
+
+    #[test]
+    fn hiding_and_reselecting_a_discovered_project_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = crate::project_discovery::path_identity(temp.path());
+        let mut config = AppConfig::default();
+        config.remember_project(path.clone());
+        config.remove_project(&path);
+        assert!(config.recent_projects.is_empty());
+        let json = serde_json::to_string(&config).unwrap();
+        let mut loaded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(loaded.hidden_discovered_projects.contains(&path));
+        loaded.remember_project(path.clone());
+        assert!(loaded.hidden_discovered_projects.is_empty());
+        assert_eq!(loaded.project_paths(), vec![path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_canonical_project_also_removes_remembered_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real"); let alias = temp.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut config = AppConfig::default();
+        config.recent_projects = vec![alias.clone(), real.clone()];
+        config.project_activity.insert(alias, 1);
+        config.remove_project(&crate::project_discovery::path_identity(&real));
+        assert!(config.recent_projects.is_empty());
+        assert!(config.project_activity.is_empty());
+        assert!(real.is_dir());
+    }
 
     #[test]
     fn resolves_chinese_locale_variants() {

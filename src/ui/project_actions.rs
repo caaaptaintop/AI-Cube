@@ -1,6 +1,14 @@
 use super::*;
 
 impl KitterApp {
+    pub(super) fn project_entries(&self) -> Vec<crate::project_discovery::ProjectEntry> {
+        crate::project_discovery::merge_projects(
+            &self.model.library.config.project_paths(),
+            &self.projects_view.discovered_projects,
+            &self.model.library.config.hidden_discovered_projects,
+        )
+    }
+
     pub(super) fn browse_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -12,6 +20,7 @@ impl KitterApp {
             if let Ok(Ok(Some(paths))) = receiver.await
                 && let Some(path) = paths.into_iter().next()
             {
+                let path = crate::project_discovery::path_identity(&path);
                 let _ = this.update(cx, |this, cx| {
                     if this.projects_view.open_project.as_ref() != Some(&path) {
                         this.projects_view.batch_project = None;

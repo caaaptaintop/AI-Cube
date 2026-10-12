@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,13 +14,18 @@ pub(crate) struct TriggerSource {
 
 impl TriggerSource {
     pub fn read(root: &Path) -> Result<Self> {
+        use std::io::Read;
+        let directory = crate::package_fs::Directory::open(root)?;
+        let mut skill_md = String::new();
+        directory.read(Path::new("SKILL.md"))?.read_to_string(&mut skill_md)?;
+        let openai_yaml = match directory.read(Path::new("agents/openai.yaml")) {
+            Ok(mut file) => { let mut content = String::new(); file.read_to_string(&mut content)?; Some(content) },
+            Err(error) if crate::package_fs::is_not_found(&error) => None,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
-            skill_md: fs::read_to_string(root.join("SKILL.md"))?,
-            openai_yaml: match fs::read_to_string(root.join("agents/openai.yaml")) {
-                Ok(content) => Some(content),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            },
+            skill_md,
+            openai_yaml,
         })
     }
 
@@ -60,13 +65,16 @@ impl TriggerSource {
     }
 
     pub fn write(&self, root: &Path) -> Result<()> {
-        fs::write(root.join("SKILL.md"), &self.skill_md)?;
-        let openai_path = root.join("agents/openai.yaml");
+        let directory = crate::package_fs::Directory::open(root)?;
+        directory.write(Path::new("SKILL.md"), self.skill_md.as_bytes())?;
         if let Some(content) = &self.openai_yaml {
-            fs::create_dir_all(openai_path.parent().expect("openai.yaml has a parent"))?;
-            fs::write(openai_path, content)?;
-        } else if openai_path.exists() {
-            fs::remove_file(openai_path)?;
+            directory.write(Path::new("agents/openai.yaml"), content.as_bytes())?;
+        } else {
+            match directory.read(Path::new("agents/openai.yaml")) {
+                Ok(_) => directory.remove(Path::new("agents/openai.yaml"), &crate::update_protection::Node::File { sha256: String::new(), mode: 0 })?,
+                Err(error) if crate::package_fs::is_not_found(&error) => {},
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

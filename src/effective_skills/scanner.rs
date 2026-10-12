@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use ignore::WalkBuilder;
 
@@ -18,7 +22,13 @@ pub(super) enum ScanProfile {
 }
 
 pub(super) fn scan(root: &SkillRoot, profile: ScanProfile) -> Vec<PathBuf> {
+    if machine_data_path(&root.path) {
+        return Vec::new();
+    }
     if let Some(path) = &root.exact_skill_file {
+        if machine_data_path(path) {
+            return Vec::new();
+        }
         return path
             .is_file()
             .then(|| vec![path.clone()])
@@ -60,7 +70,9 @@ fn flat_markdown(root: &SkillRoot) -> Vec<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            path.is_file() && path.extension().is_some_and(|extension| extension == "md")
+            !machine_data_path(path)
+                && path.is_file()
+                && path.extension().is_some_and(|extension| extension == "md")
         })
         .collect::<Vec<_>>();
     files.sort();
@@ -75,17 +87,15 @@ fn provider_children(root: &SkillRoot) -> Vec<PathBuf> {
         .flatten()
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
         .map(|entry| entry.path().join("SKILL.md"))
-        .filter(|path| path.is_file())
+        .filter(|path| !machine_data_path(path) && path.is_file())
         .collect::<Vec<_>>();
     files.sort();
     files
 }
 
 fn direct_children(root: &SkillRoot) -> Vec<PathBuf> {
-    let mut result = root
-        .path
-        .join("SKILL.md")
-        .is_file()
+    let root_manifest = root.path.join("SKILL.md");
+    let mut result = (root_manifest.is_file() && !machine_data_path(&root_manifest))
         .then(|| vec![root.path.join("SKILL.md")])
         .unwrap_or_default();
     let Ok(entries) = fs::read_dir(&root.path) else {
@@ -93,13 +103,17 @@ fn direct_children(root: &SkillRoot) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if machine_data_path(&path) {
+            continue;
+        }
         if path.is_dir() {
             let manifest = path.join("SKILL.md");
-            if manifest.is_file() {
+            if manifest.is_file() && !machine_data_path(&manifest) {
                 result.push(manifest);
             }
         } else if root.include_root_markdown
             && path.extension().is_some_and(|extension| extension == "md")
+            && !machine_data_path(&path)
         {
             result.push(path);
         }
@@ -125,12 +139,18 @@ fn recursive(
             break;
         }
         let canonical = fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone());
+        if machine_data_path(&canonical) {
+            continue;
+        }
         if !visited.insert(canonical) {
             continue;
         }
         directories += 1;
         let manifest = directory.join("SKILL.md");
-        if (depth > 0 || include_root_manifest) && manifest.is_file() {
+        if (depth > 0 || include_root_manifest)
+            && manifest.is_file()
+            && !machine_data_path(&manifest)
+        {
             result.push(manifest);
             continue;
         }
@@ -157,6 +177,7 @@ fn recursive(
                 && root.include_root_markdown
                 && path.is_file()
                 && path.extension().is_some_and(|extension| extension == "md")
+                && !machine_data_path(&path)
             {
                 result.push(path);
             } else if path.is_dir()
@@ -172,7 +193,7 @@ fn recursive(
 
 fn pi_ignored(root: &SkillRoot) -> Vec<PathBuf> {
     let root_manifest = root.path.join("SKILL.md");
-    if root_manifest.is_file() {
+    if root_manifest.is_file() && !machine_data_path(&root_manifest) {
         return vec![root_manifest];
     }
     let mut result = Vec::new();
@@ -184,7 +205,8 @@ fn pi_ignored(root: &SkillRoot) -> Vec<PathBuf> {
         .git_exclude(true)
         .ignore(true)
         .parents(true)
-        .follow_links(true);
+        .follow_links(true)
+        .filter_entry(|entry| !machine_data_path(entry.path()));
     for entry in builder.build().flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -201,6 +223,14 @@ fn pi_ignored(root: &SkillRoot) -> Vec<PathBuf> {
     result
 }
 
+fn machine_data_path(path: &Path) -> bool {
+    let reserved = |path: &Path| {
+        path.components()
+            .any(|part| part.as_os_str() == "local-data")
+    };
+    reserved(path) || fs::canonicalize(path).is_ok_and(|path| reserved(&path))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -209,6 +239,64 @@ mod tests {
 
     use super::*;
     use crate::effective_skills::{SkillRoot, SkillScope};
+
+    #[test]
+    fn every_profile_excludes_machine_data_and_aliases() {
+        let temp = tempdir().unwrap();
+        let private = temp.path().join("local-data/private");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(private.join("SKILL.md"), "fixture").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&private, temp.path().join("alias")).unwrap();
+        let root = SkillRoot::new(temp.path().to_path_buf(), SkillScope::User);
+        let profiles = [
+            ScanProfile::DirectChildren,
+            ScanProfile::ProviderChildren,
+            ScanProfile::DimRecursive,
+            ScanProfile::PiIgnored,
+            ScanProfile::Recursive {
+                max_depth: 4,
+                max_directories: 100,
+                max_entries: 100,
+            },
+        ];
+        for profile in profiles {
+            assert!(scan(&root, profile).is_empty());
+            let data_root = SkillRoot::new(private.clone(), SkillScope::User);
+            assert!(scan(&data_root, profile).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_aliases_to_machine_data_are_excluded_in_every_profile() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let private = temp.path().join("local-data/private/SKILL.md");
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        fs::write(&private, "private fixture").unwrap();
+        let public = temp.path().join("public");
+        fs::create_dir_all(public.join("demo")).unwrap();
+        symlink(&private, public.join("SKILL.md")).unwrap();
+        symlink(&private, public.join("demo/SKILL.md")).unwrap();
+        symlink(&private, public.join("extra.md")).unwrap();
+        let mut root = SkillRoot::new(public, SkillScope::User);
+        root.include_root_markdown = true;
+        let profiles = [
+            ScanProfile::DirectChildren,
+            ScanProfile::ProviderChildren,
+            ScanProfile::DimRecursive,
+            ScanProfile::PiIgnored,
+            ScanProfile::Recursive {
+                max_depth: 4,
+                max_directories: 100,
+                max_entries: 100,
+            },
+        ];
+        for profile in profiles {
+            assert!(scan(&root, profile).is_empty());
+        }
+    }
 
     #[test]
     fn direct_children_do_not_recurse() {
