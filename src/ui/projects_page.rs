@@ -40,12 +40,14 @@ impl KitterApp {
     ) -> AnyElement {
         let p = self.palette();
         let key = group.key().to_string();
+        let debug_key = key.clone();
         let collapsed = self.projects_view.collapsed_skill_sources.contains(&key);
         let label = match group {
             SkillSourceGroup::Origin(origin) => self.skill_origin_label(origin, self.projects_view.global_project_view),
             SkillSourceGroup::Multiple => self.tr("多种来源", "Multiple sources"),
         };
         div().id(ElementId::Name(format!("project-skill-source-{key}").into()))
+            .debug_selector(move || format!("project-skill-source-{debug_key}").into())
             .h(px(60.)).w_full().px(px(27.)).flex().items_center().gap(px(8.))
             .border_b_1().border_color(p.border).bg(p.raised).cursor_pointer()
             .hover(move |row| row.bg(p.hover))
@@ -661,6 +663,8 @@ impl KitterApp {
     }
 
     pub(super) fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        #[cfg(debug_assertions)]
+        let render_started = Instant::now();
         let p = self.palette();
         let query = self
             .projects_view
@@ -1042,28 +1046,36 @@ impl KitterApp {
             } else {
                 self.context_estimate_panel(open_project, &estimates, cx)
             };
-            let all_effective_rows = effective_skill_rows(
-                &estimates,
-                &project_skills,
-                self.projects_view.selected_project_agent,
-                open_project,
-            );
+            let all_effective_rows = if loading {
+                Arc::new(Vec::new())
+            } else {
+                let scanned_at = self.projects_view.context_estimates.borrow()[open_project].scanned_at;
+                self.projects_view.skill_rows_cache.borrow_mut().get_or_build(
+                    SkillRowsCacheKey {
+                        project: open_project.clone(),
+                        generation: self.projects_view.scan_generation,
+                        agent: self.projects_view.selected_project_agent,
+                        scanned_at,
+                    },
+                    &estimates,
+                    &project_skills,
+                )
+            };
             let skill_count = all_effective_rows.len();
             let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
             let can_batch = batch_mode
                 || all_effective_rows
                     .iter()
                     .any(|row| row.can_remove());
-            let visible_rows = if batch_mode {
-                all_effective_rows
+            let effective_rows = if batch_mode {
+                Arc::new(all_effective_rows
                     .iter()
                     .filter(|row| self.matches_project_skill_filter(row))
                     .cloned()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>())
             } else {
-                all_effective_rows.clone()
+                Arc::clone(&all_effective_rows)
             };
-            let effective_rows = Arc::new(visible_rows);
             let mut skills = div()
                 .id("project-skills-scroll")
                 .debug_selector(|| "project-skills-scroll".into())
@@ -1148,7 +1160,8 @@ impl KitterApp {
                     .map(|group| group.key().to_string()).collect::<Vec<_>>();
                 let all_collapsed = groups.iter().all(|key| self.projects_view.collapsed_skill_sources.contains(key));
                 tabs = tabs.child(
-                    div().id("project-skill-source-toggle-all").h(px(CONTROL_HEIGHT)).px(px(8.))
+                    div().id("project-skill-source-toggle-all")
+                        .debug_selector(|| "project-skill-source-toggle-all".into()).h(px(CONTROL_HEIGHT)).px(px(8.))
                         .rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
                         .text_size(px(11.)).text_color(p.secondary).hover(move |button| button.bg(p.hover))
                         .child(if all_collapsed { self.tr("展开分组", "Expand groups") } else { self.tr("收起分组", "Collapse groups") })
@@ -1334,12 +1347,20 @@ impl KitterApp {
                 )
                 .child(self.window_drag_strip("empty-project-detail-window-drag", 24., cx))
         };
-        layout::content(
+        let page = layout::content(
             &self.shell.content_layout,
             self.content_pane_width(window, cx),
             recent_panel,
             detail,
-        )
+        );
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("KITTER_PREVIEW_PROJECT_TIMINGS")
+            && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{:.6}", render_started.elapsed().as_secs_f64() * 1000.);
+        }
+        page
     }
 }
 

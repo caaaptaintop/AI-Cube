@@ -65,7 +65,7 @@ mod tags_groups_actions;
 mod theme;
 
 use crate::text::counted;
-use effective_view::{EffectivePluginGroup, EffectiveSkillRow, ProjectSkillListItem, SkillOrigin, SkillSourceGroup, grouped_skill_items, same_file};
+use effective_view::{EffectivePluginGroup, EffectiveSkillRow, ProjectSkillListItem, SkillOrigin, SkillSourceGroup, SkillRowsCache, SkillRowsCacheKey, grouped_skill_items, same_file};
 use gpui_component::resizable::ResizableState;
 use skill_selection::SkillSelection;
 use state::*;
@@ -133,15 +133,6 @@ fn effective_plugin_groups(
     selected_agent: Option<AgentKind>,
 ) -> Vec<EffectivePluginGroup> {
     effective_view::plugin_groups(estimates, selected_agent)
-}
-
-fn effective_skill_rows(
-    estimates: &[AgentContextEstimate],
-    project_skills: &[ProjectSkill],
-    selected_agent: Option<AgentKind>,
-    project_path: &Path,
-) -> Vec<EffectiveSkillRow> {
-    effective_view::skill_rows(estimates, project_skills, selected_agent, project_path)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -869,6 +860,7 @@ impl KitterApp {
                 project_search,
                 project_select,
                 project_snapshots: RefCell::new(BTreeMap::new()),
+                skill_rows_cache: RefCell::new(SkillRowsCache::default()),
                 project_snapshot_tasks: RefCell::new(BTreeMap::new()),
                 context_estimates: RefCell::new(BTreeMap::new()),
                 context_estimate_tasks: RefCell::new(BTreeMap::new()),
@@ -1635,7 +1627,7 @@ mod window_tests {
 
 #[cfg(all(test, feature = "ui-test"))]
 mod e2e_tests {
-    use super::{AddKind, KitterApp, Page};
+    use super::{AddKind, KitterApp, Page, effective_view};
     use gpui::{AppContext, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, point, px};
     use std::fs;
 
@@ -1981,6 +1973,7 @@ mod e2e_tests {
 
     #[test]
     fn large_project_renders_and_scrolls_with_virtual_rows() {
+        effective_view::reset_path_resolution_count();
         let mut cx = TestAppContext::single();
         init(&mut cx);
         let temp = tempfile::tempdir().unwrap();
@@ -2039,16 +2032,38 @@ mod e2e_tests {
             .debug_bounds("project-skills-virtual-list")
             .expect("virtual project list should be rendered");
         assert_eq!(first_row.size.width, scroll.size.width);
+        assert!(effective_view::path_resolution_count() > 0);
+        effective_view::reset_path_resolution_count();
         // Avoid saturating GPUI's synthetic pixel delta at the exact maximum
         // offset; that test-only edge drops the virtual rows for the frame.
+        let scroll_delta = first_row.size.height * 180. - scroll.size.height * 0.5;
         cx.simulate_event(ScrollWheelEvent {
             position: scroll.center(),
-            delta: ScrollDelta::Pixels(point(px(0.), px(-11_000.))),
+            delta: ScrollDelta::Pixels(point(px(0.), -scroll_delta)),
             ..Default::default()
         });
         cx.run_until_parked();
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_some());
+        assert_eq!(effective_view::path_resolution_count(), 0, "scrolling rebuilt filesystem paths");
+        cx.simulate_event(ScrollWheelEvent {
+            position: scroll.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), scroll_delta)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let header = cx.debug_bounds("project-skill-source-project").unwrap();
+        cx.simulate_click(header.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_none());
+        let header = cx.debug_bounds("project-skill-source-project").unwrap();
+        cx.simulate_click(header.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_some());
+        assert_eq!(effective_view::path_resolution_count(), 0, "group toggles rebuilt filesystem paths");
     }
 
     #[test]
