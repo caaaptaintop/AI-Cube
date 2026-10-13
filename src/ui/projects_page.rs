@@ -1280,8 +1280,8 @@ impl KitterApp {
                 .when(estimates.iter().any(|estimate| estimate.agent == AgentKind::Proma), |detail| {
                     detail.child(div().px(px(28.)).pb(px(8.)).text_size(px(12.))
                         .text_color(p.muted).child(self.tr(
-                            "Proma 仅静态扫描启用目录 skills；未验证运行时加载。",
-                            "Proma scans active skills statically; runtime loading is not verified.",
+                            "已扫描 Proma 工作区技能目录；当前会话的技能可用情况请在 Proma 中查看。",
+                            "Proma workspace skill folders have been scanned. Check Proma for skill availability in the current session.",
                         )))
                 })
                 .child(tabs)
