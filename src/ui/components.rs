@@ -190,9 +190,88 @@ impl KitterApp {
                 .position(|agent| agent.id == estimate.agent.id())
                 .unwrap_or(usize::MAX)
         });
-        let can_expand = ordered_estimates.len() > 8;
-        let mut cards = div().w_full().flex().flex_wrap();
+        let expanded = self.projects_view.project_agents_expanded;
+        let selected_agent = self.projects_view.selected_project_agent;
+        // Keep the compact view bounded, without clipping rows. A
+        // selected agent from More replaces the last summary item if needed.
+        let mut summary_agents = ordered_estimates
+            .iter()
+            .filter(|estimate| {
+                estimate.discovered_count > 0 || selected_agent == Some(estimate.agent)
+            })
+            .take(4)
+            .map(|estimate| estimate.agent)
+            .collect::<Vec<_>>();
+        if let Some(selected) = selected_agent {
+            if ordered_estimates
+                .iter()
+                .any(|estimate| estimate.agent == selected)
+                && !summary_agents.contains(&selected)
+            {
+                if summary_agents.len() == 4 {
+                    summary_agents.pop();
+                }
+                summary_agents.push(selected);
+            }
+        }
+        let hidden_count = ordered_estimates.len().saturating_sub(summary_agents.len());
+        let header = div()
+            .w_full()
+            .min_w(px(if expanded {
+                if self.uses_english() { 640. } else { 520. }
+            } else {
+                0.
+            }))
+            .h(px(24.))
+            .flex_none()
+            .pl(px(8.))
+            .pr(px(36.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(p.border)
+            .text_size(px(10.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(p.muted)
+            .child(div().size(px(18.)).flex_none())
+            .child(div().flex_1().min_w_0().child("Agent"))
+            .child(
+                div()
+                    .w(px(94.))
+                    .flex_none()
+                    .text_right()
+                    .child(self.tr("预计 Token", "Estimated tokens")),
+            )
+            .child(
+                div()
+                    .w(px(if self.uses_english() { 156. } else { 120. }))
+                    .flex_none()
+                    .text_right()
+                    .child(self.tr("自动／手动技能数", "Automatic / manual skills")),
+            )
+            .when(expanded, |row| {
+                row.child(
+                    div()
+                        .w(px(if self.uses_english() { 202. } else { 136. }))
+                        .flex_none()
+                        .text_right()
+                        .child(self.tr(
+                            "条件加载／仅名称",
+                            "Conditional / name-only",
+                        )),
+                )
+            });
+        let mut cards = div()
+            .id("project-agents-scroll")
+            .w_full()
+            .flex()
+            .flex_col()
+            .when(expanded, |cards| cards.max_h(px(168.)).overflow_y_scroll());
         for estimate in ordered_estimates {
+            if !expanded && !summary_agents.contains(&estimate.agent) {
+                continue;
+            }
             let agent = estimate.agent;
             let selected = self.projects_view.selected_project_agent == Some(agent);
             let automatic_count = estimate
@@ -221,36 +300,40 @@ impl KitterApp {
             } else {
                 format!("{} 自动", automatic_count)
             };
-            let detail = if self.uses_english() {
-                let mut value = format!(" · {} manual", estimate.manual_only_count);
-                if estimate.conditional_count > 0 {
-                    value.push_str(&format!(" · {} conditional", estimate.conditional_count));
-                }
-                if estimate.name_only_count > 0 {
-                    value.push_str(&format!(" · {} name-only", estimate.name_only_count));
-                }
-                value
+            let manual = if self.uses_english() {
+                format!(" · {} manual", estimate.manual_only_count)
             } else {
-                let mut value = format!(" · {} 手动", estimate.manual_only_count);
-                if estimate.conditional_count > 0 {
-                    value.push_str(&format!(" · {} 条件", estimate.conditional_count));
-                }
-                if estimate.name_only_count > 0 {
-                    value.push_str(&format!(" · {} 仅名称", estimate.name_only_count));
-                }
-                value
+                format!(" · {} 手动", estimate.manual_only_count)
+            };
+            let detail = if self.uses_english() {
+                format!(
+                    "{} conditional · {} name-only",
+                    estimate.conditional_count, estimate.name_only_count
+                )
+            } else {
+                format!(
+                    "{} 条件 · {} 仅名称",
+                    estimate.conditional_count, estimate.name_only_count
+                )
             };
             cards = cards.child(
                 div()
                     .id(ElementId::Name(
                         format!("project-agent-filter-{}", agent.id()).into(),
                     ))
-                    .w(px(176.))
-                    .h(px(90.))
+                    .debug_selector(move || format!("project-agent-filter-{}", agent.id()).into())
+                    .w_full()
+                    .min_w(px(if expanded {
+                        if self.uses_english() { 640. } else { 520. }
+                    } else {
+                        0.
+                    }))
+                    .min_h(px(24.))
                     .flex_none()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .rounded(px(12.))
+                    .pl(px(8.))
+                    .pr(px(36.))
+                    .py(px(2.))
+                    .rounded(px(6.))
                     .cursor_pointer()
                     .bg(if selected {
                         p.selected
@@ -260,44 +343,65 @@ impl KitterApp {
                     .hover(move |card| card.bg(p.hover))
                     .child(
                         div()
+                            .h(px(20.))
                             .flex()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(px(8.))
                             .text_size(px(11.))
                             .text_color(p.secondary)
                             .child(
                                 div()
-                                    .size(px(24.))
+                                    .size(px(18.))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .child(Self::brand_icon(
                                         icon,
-                                        Self::brand_icon_size(icon, 18.),
+                                        Self::brand_icon_size(icon, 15.),
                                         p.text,
                                         self.uses_dark_theme(),
                                     )),
                             )
-                            .child(estimate.agent.label()),
-                    )
-                    .child(
-                        div()
-                            .mt(px(7.))
-                            .font_family(MONO)
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(severity)
-                            .child(format!("≈ {} tokens", estimate.estimated_tokens)),
-                    )
-                    .child(
-                        div()
-                            .mt(px(2.))
-                            .flex()
-                            .items_center()
-                            .text_size(px(11.))
-                            .child(div().text_color(severity).child(automatic))
-                            .child(div().text_color(p.muted).child(detail)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(estimate.agent.label()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(94.))
+                                    .flex_none()
+                                    .text_right()
+                                    .font_family(MONO)
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(severity)
+                                    .child(format!("≈ {} tokens", estimate.estimated_tokens)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(if self.uses_english() { 156. } else { 120. }))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .child(div().text_color(severity).child(automatic))
+                                    .child(div().text_color(p.muted).child(manual)),
+                            )
+                            .when(expanded, |row| {
+                                row.child(
+                                    div()
+                                        .w(px(if self.uses_english() { 202. } else { 136. }))
+                                        .flex_none()
+                                        .text_right()
+                                        .text_size(px(10.))
+                                        .text_color(p.muted)
+                                        .child(detail),
+                                )
+                            }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.projects_view.selected_project_agent =
@@ -307,43 +411,69 @@ impl KitterApp {
                     })),
             );
         }
-        let cards = cards.pt(px(8.)).pl(px(8.)).pr(px(42.)).when(
-            can_expand && !self.projects_view.project_agents_expanded,
-            |cards| cards.max_h(px(188.)).overflow_hidden(),
-        );
-        let expand_control = can_expand.then(|| {
-            let expanded = self.projects_view.project_agents_expanded;
-            let arrow = div()
-                .id("toggle-project-agents")
-                .size(px(28.))
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(move |button| button.bg(p.hover).text_color(p.text))
-                .child(Self::icon(
-                    if expanded {
-                        "icons/chevron-up.svg"
+        let table = div()
+            .id("project-agents-table-scroll")
+            .w_full()
+            .overflow_x_scroll()
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(if expanded {
+                        if self.uses_english() { 652. } else { 532. }
                     } else {
-                        "icons/chevron-down.svg"
-                    },
-                    13.,
-                    p.muted,
-                ))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.projects_view.project_agents_expanded =
-                        !this.projects_view.project_agents_expanded;
-                    cx.notify();
-                }));
-            div()
-                .h(px(44.))
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(arrow.mt(px(5.)))
-        });
+                        0.
+                    }))
+                    .pt(px(4.))
+                    .px(px(6.))
+                    .child(header)
+                    .child(cards),
+            );
+        let expand_control = div()
+            .h(px(28.))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .id("toggle-project-agents")
+                    .debug_selector(|| "toggle-project-agents".into())
+                    .h(px(24.))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .text_size(px(11.))
+                    .text_color(p.muted)
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(p.hover).text_color(p.text))
+                    .child(if expanded {
+                        self.tr("收起详情", "Hide details").to_string()
+                    } else if hidden_count > 0 {
+                        if self.uses_english() {
+                            format!("More ({hidden_count}) · Details")
+                        } else {
+                            format!("更多（{hidden_count}）· 详情")
+                        }
+                    } else {
+                        self.tr("展开详情", "Show details").to_string()
+                    })
+                    .child(Self::icon(
+                        if expanded {
+                            "icons/chevron-up.svg"
+                        } else {
+                            "icons/chevron-down.svg"
+                        },
+                        12.,
+                        p.muted,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.projects_view.project_agents_expanded =
+                            !this.projects_view.project_agents_expanded;
+                        cx.notify();
+                    })),
+            );
         let panel = div()
             .relative()
             .w_full()
@@ -353,9 +483,9 @@ impl KitterApp {
             .border_color(p.border)
             .bg(p.surface)
             .overflow_hidden()
-            .child(cards)
-            .children(expand_control)
-            .child(refresh_button.absolute().top(px(7.)).right(px(7.)));
+            .child(table)
+            .child(expand_control)
+            .child(refresh_button.absolute().bottom(px(0.)).right(px(7.)));
         div().w_full().flex_none().child(panel)
     }
 
