@@ -24,17 +24,37 @@ impl KitterApp {
     }
 
     pub(super) fn browse_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let installing = self.install_flow.modal;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
-            multiple: false,
+            multiple: installing,
             prompt: Some(self.tr("选择", "Choose").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
-            {
+            if let Ok(Ok(Some(paths))) = receiver.await {
                 let _ = this.update(cx, |this, cx| {
+                    if installing {
+                        if !this.install_flow.modal { return; }
+                        for path in paths {
+                            let path = crate::project_discovery::project_identity(
+                                &path, &this.projects_view.discovered_projects,
+                            );
+                            if dirs::home_dir().as_ref() == Some(&path) { continue; }
+                            this.model.library.config.hidden_discovered_projects.retain(|hidden| {
+                                crate::project_discovery::project_identity(
+                                    hidden, &this.projects_view.discovered_projects,
+                                ) != path
+                            });
+                            this.model.library.config.remember_project(path.clone());
+                            this.install_flow.selected_projects.insert(path);
+                        }
+                        this.install_flow.global = false;
+                        let _ = this.model.library.save();
+                        this.notify_dialog(cx);
+                        return;
+                    }
+                    let Some(path) = paths.into_iter().next() else { return; };
                     let path = crate::project_discovery::project_identity(
                         &path, &this.projects_view.discovered_projects,
                     );

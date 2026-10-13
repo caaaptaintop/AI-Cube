@@ -471,14 +471,14 @@ impl SkillLibrary {
     }
 
     fn install_count(&self, name: &str, source: &Path) -> usize {
-        let mut projects = self.config.recent_projects.clone();
-        if let Some(root) = crate::proma::home() {
-            for workspace in crate::proma::workspaces(&root).unwrap_or_default() {
-                if !projects.contains(&workspace.path) { projects.push(workspace.path); }
-            }
-        }
+        let discovered = crate::proma::home()
+            .and_then(|root| crate::project_discovery::discover_proma_projects(&root).ok())
+            .unwrap_or_default();
+        let projects = crate::project_discovery::merge_projects(
+            &self.config.recent_projects, &discovered, &std::collections::BTreeSet::new(),
+        );
         projects.iter()
-            .filter(|project| crate::project::is_installed_any_from_path(project, name, source))
+            .filter(|project| crate::project::is_installed_any_from_path(&project.path, name, source))
             .count()
     }
 

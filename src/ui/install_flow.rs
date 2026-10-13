@@ -3,13 +3,13 @@ use super::*;
 impl KitterApp {
     pub(super) fn install_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let p = self.palette();
-        let has_target = self.install_flow.selected_targets.iter().any(|target| {
-            *target != InstallTarget::Proma || self.can_install_proma()
-        })
+        let has_target = !self.install_flow.selected_targets.is_empty()
+            && (!self.install_flow.selected_targets.contains(&InstallTarget::Proma)
+                || self.can_install_proma())
             && if self.install_flow.global {
                 dirs::home_dir().is_some()
             } else {
-                self.projects_view.open_project.is_some()
+                !self.install_flow.selected_projects.is_empty()
             };
         let selected_keys = self.selected_skill_keys();
         let selected_count = selected_keys.len();
@@ -24,109 +24,7 @@ impl KitterApp {
                 .map(|skill| skill.record.name.clone())
                 .unwrap_or_else(|| self.tr("技能", "Skill").to_string())
         };
-        let global_label = self.tr("全局", "Global").to_string();
-        let project_label = if self.install_flow.global {
-            global_label.clone()
-        } else {
-            self.projects_view.open_project.as_ref()
-                .map(|path| self.project_entries().into_iter()
-                    .find(|entry| entry.path == *path).map(|entry| entry.name)
-                    .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().into_owned()))
-                .unwrap_or_else(|| self.tr("选择一个项目", "Choose a project").to_string())
-        };
-        let selected_global = self.install_flow.global;
-        let selected_project = self.projects_view.open_project.clone();
-        let home = dirs::home_dir();
-        let project_choices = home
-            .iter()
-            .cloned()
-            .map(|path| (true, path, global_label.clone()))
-            .chain(
-                self.project_entries()
-                    .into_iter()
-                    .filter(|entry| Some(&entry.path) != home.as_ref())
-                    .map(|entry| (false, entry.path, entry.name)),
-            )
-            .collect::<Vec<_>>();
-        let app = cx.entity().downgrade();
-        let project_control = Popover::new("install-project-menu")
-            .appearance(false)
-            .anchor(Anchor::TopRight)
-            .trigger(
-                self.dropdown_button("install-project-select", project_label, 14.)
-                    .w_full(),
-            )
-            .content(move |_, _, popover_cx| {
-                let mut menu_background = p.elevated;
-                menu_background.a = 1.;
-                let mut menu = div()
-                    .w(px(518.))
-                    .p(px(4.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .rounded(px(RADIUS_MENU))
-                    .border_1()
-                    .border_color(p.border_strong)
-                    .bg(menu_background)
-                    .shadow_lg();
-                for (index, (global, path, name)) in project_choices.iter().cloned().enumerate() {
-                    let active = if global {
-                        selected_global
-                    } else {
-                        !selected_global && selected_project.as_ref() == Some(&path)
-                    };
-                    let path_label = display_path(&path);
-                    let app = app.clone();
-                    menu = menu.child(
-                        div()
-                            .id(ElementId::Name(
-                                format!("install-project-option-{index}").into(),
-                            ))
-                            .min_h(px(46.))
-                            .px(px(10.))
-                            .py(px(5.))
-                            .rounded(px(RADIUS_CONTROL))
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .cursor_pointer()
-                            .bg(if active { p.selected } else { rgba(0x00000000) })
-                            .hover(move |item| item.bg(p.hover))
-                            .child(
-                                div()
-                                    .font_family(FONT_UI)
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(2.))
-                                    .font_family(MONO)
-                                    .text_size(px(11.))
-                                    .text_color(p.muted)
-                                    .truncate()
-                                    .child(path_label),
-                            )
-                            .on_click(popover_cx.listener(move |_, _, _, cx| {
-                                let _ = app.update(cx, |this, cx| {
-                                    this.install_flow.global = global;
-                                    if !global {
-                                        this.projects_view.open_project = Some(path.clone());
-                                    }
-                                    if !this.can_install_proma() {
-                                        this.install_flow.selected_targets.remove(&InstallTarget::Proma);
-                                    }
-                                    this.notify_dialog(cx);
-                                });
-                                cx.emit(DismissEvent);
-                            })),
-                    );
-                }
-                menu
-            });
-        let project_picker = div().flex_1().child(project_control);
+        let project_picker = self.install_projects_picker(cx);
         let close_button = div()
             .id("close-install-modal")
             .size(px(CONTROL_HEIGHT))
@@ -147,7 +45,7 @@ impl KitterApp {
             .id("install-modal-content")
             .px(px(20.))
             .pb(px(20.))
-            .max_h(px(500.))
+            .max_h(px((f32::from(window.bounds().size.height) - 180.).clamp(300., 700.)))
             .overflow_y_scroll()
             .overflow_x_hidden()
             .bg(p.elevated)
@@ -158,20 +56,7 @@ impl KitterApp {
                     .text_color(p.muted)
                     .child(self.tr("安装到", "Install to")),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(project_picker)
-                    .child(
-                        self.bordered_icon_button("modal-browse", "icons/folder.svg", p.text, cx)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| this.browse_project(window, cx)),
-                            ),
-                    ),
-            )
+            .child(project_picker)
             .child(
                 div()
                     .mt(px(18.))
@@ -227,6 +112,14 @@ impl KitterApp {
                     .items_center()
                     .justify_end()
                     .gap(px(8.))
+                    .child(div().flex_1().text_size(px(12.)).text_color(p.muted)
+                        .child(if self.install_flow.global {
+                            self.tr("全局安装", "Global install").to_string()
+                        } else if self.uses_english() {
+                            format!("{selected_count} skills · {} projects · {} targets", self.install_flow.selected_projects.len(), self.install_flow.selected_targets.len())
+                        } else {
+                            format!("{selected_count} 个技能 · {} 个项目 · {} 个目标", self.install_flow.selected_projects.len(), self.install_flow.selected_targets.len())
+                        }))
                     .child(
                         div()
                             .id("cancel-install")
@@ -249,7 +142,7 @@ impl KitterApp {
                     )
                     .child(
                         div()
-                            .id("confirm-install")
+                            .id("confirm-install").debug_selector(|| "confirm-install".into())
                             .h(px(DIALOG_CONTROL_HEIGHT))
                             .px(px(16.))
                             .rounded(px(RADIUS_CONTROL))
@@ -274,16 +167,176 @@ impl KitterApp {
         panel
     }
 
+    fn install_projects_picker(&self, cx: &mut Context<Self>) -> Div {
+        let p = self.palette();
+        let global = self.install_flow.global;
+        let mut scope = div().flex().gap(px(8.));
+        for (id, is_global, label) in [
+            ("install-scope-projects", false, self.tr("项目安装 · 可多选", "Projects · select multiple")),
+            ("install-scope-global", true, self.tr("全局安装", "Global install")),
+        ] {
+            scope = scope.child(div().id(id).debug_selector(move || id.into()).h(px(36.)).px(px(12.))
+                .rounded(px(RADIUS_CONTROL)).border_1().border_color(p.border)
+                .bg(if global == is_global { p.selected } else { p.surface })
+                .flex().items_center().gap(px(8.)).cursor_pointer().text_size(px(13.))
+                .child(Checkbox::new(ElementId::Name(format!("{id}-checkbox").into()))
+                    .checked(global == is_global))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.install_flow.global = is_global;
+                    this.install_flow.project_picker_open = false;
+                    if is_global {
+                        this.install_flow.selected_targets.remove(&InstallTarget::Proma);
+                    }
+                    this.notify_dialog(cx);
+                })));
+        }
+        let mut body = div().child(scope);
+        if global {
+            return body.child(div().mt(px(9.)).text_size(px(12.)).text_color(p.muted)
+                .child(self.tr("安装到 Agent 的用户级技能目录", "Install to each Agent's user-level skills directory")));
+        }
+        let count = self.install_flow.selected_projects.len();
+        let label = if self.uses_english() {
+            format!("{count} projects selected")
+        } else {
+            format!("已选 {count} 个项目")
+        };
+        let app = cx.entity().downgrade();
+        let open_app = app.clone();
+        let focus = self.install_flow.project_search.read(cx).focus_handle(cx);
+        let picker = Popover::new("install-project-menu")
+            .appearance(false)
+            .anchor(Anchor::TopRight)
+            .open(self.install_flow.project_picker_open)
+            .track_focus(&focus)
+            .on_open_change(move |open, _, cx| {
+                let _ = open_app.update(cx, |this, cx| {
+                    this.install_flow.project_picker_open = *open;
+                    this.notify_dialog(cx);
+                });
+            })
+            .trigger(self.dropdown_button("install-project-select", label, 13.).w_full())
+            .content(move |_, _, popover_cx| {
+                app.update(popover_cx, |this, cx| this.install_projects_menu(cx))
+                    .unwrap_or_else(|_| div())
+            });
+        body = body.child(div().mt(px(12.)).flex().items_center().gap(px(8.))
+            .child(div().id("install-project-select-wrapper")
+                .debug_selector(|| "install-project-select".into()).flex_1().child(picker))
+            .child(self.bordered_icon_button("modal-browse", "icons/folder.svg", p.text, cx)
+                .on_mouse_down(MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.browse_project(window, cx)))));
+        if count > 0 && self.install_flow.selected_targets.contains(&InstallTarget::Proma) && !self.can_install_proma() {
+            body = body.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.danger)
+                .child(self.tr("所选项目需各自关联一个 Proma 工作区；请调整项目或取消 Proma。",
+                    "Each selected project needs one Proma workspace. Adjust projects or deselect Proma.")));
+        }
+        body
+    }
+
+    pub(super) fn matching_install_projects(&self, cx: &App) -> Vec<crate::project_discovery::ProjectEntry> {
+        let query = self.install_flow.project_search.read(cx).value().trim().to_lowercase();
+        let home = dirs::home_dir();
+        self.project_entries().into_iter()
+            .filter(|entry| Some(&entry.path) != home.as_ref())
+            .filter(|entry| entry.name.to_lowercase().contains(&query)
+                || entry.path.to_string_lossy().to_lowercase().contains(&query)
+                || display_path(&entry.path).to_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn install_projects_menu(&self, cx: &mut Context<Self>) -> Div {
+        let p = self.palette();
+        let choices = self.matching_install_projects(cx);
+        let has_query = !self.install_flow.project_search.read(cx).value().trim().is_empty();
+        let matching_paths = choices.iter().map(|entry| entry.path.clone()).collect::<BTreeSet<_>>();
+        let count = self.install_flow.selected_projects.len();
+        let mut menu_background = p.elevated;
+        menu_background.a = 1.;
+        let mut toolbar = div().py(px(8.)).flex().items_center()
+            .gap(px(8.)).text_size(px(12.)).text_color(p.muted)
+            .child(if self.uses_english() { format!("{count} selected · {} results", choices.len()) }
+                else { format!("已选 {count} 个 · {} 个结果", choices.len()) })
+            .child(div().flex_1());
+        for (id, label, select_all) in [
+            ("install-projects-select-all", if has_query { self.tr("全选结果", "Select results") } else { self.tr("全选", "Select all") }, true),
+            ("install-projects-clear", self.tr("清空全部", "Clear all"), false),
+        ] {
+            let paths = matching_paths.clone();
+            toolbar = toolbar.child(div().id(id).debug_selector(move || id.into()).h(px(28.)).px(px(7.))
+                .rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
+                .hover(move |button| button.bg(p.hover)).child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if select_all {
+                        this.install_flow.selected_projects.extend(paths.iter().cloned());
+                    } else {
+                        this.install_flow.selected_projects.clear();
+                    }
+                    this.notify_dialog(cx);
+                })));
+        }
+        let mut rows = div().id("install-project-list").h(px(240.)).overflow_y_scroll()
+            .track_scroll(&self.install_flow.project_scroll)
+            .rounded(px(RADIUS_CONTROL)).border_1().border_color(p.border).bg(p.surface);
+        if choices.is_empty() {
+            rows = rows.child(div().p(px(16.)).text_size(px(13.)).text_color(p.muted)
+                .child(self.tr("没有匹配的项目", "No matching projects")));
+        }
+        for (index, entry) in choices.into_iter().enumerate() {
+            let checked = self.install_flow.selected_projects.contains(&entry.path);
+            let path = entry.path;
+            rows = rows.child(div().id(ElementId::Name(format!("install-project-option-{index}").into()))
+                .debug_selector(move || format!("install-project-option-{index}"))
+                .min_h(px(52.)).px(px(11.)).py(px(6.)).flex().items_center().gap(px(9.))
+                .cursor_pointer().bg(if checked { p.selected } else { p.surface })
+                .hover(move |row| row.bg(p.hover))
+                .child(Checkbox::new(ElementId::Name(format!("install-project-check-{index}").into())).checked(checked))
+                .child(div().min_w_0().flex_1().flex().flex_col().gap(px(3.))
+                    .child(div().text_size(px(13.)).truncate().child(entry.name))
+                    .child(div().font_family(MONO).text_size(px(11.)).text_color(p.muted)
+                        .truncate().child(display_path(&path))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.install_flow.selected_projects.remove(&path) {
+                        this.install_flow.selected_projects.insert(path.clone());
+                    }
+                    this.notify_dialog(cx);
+                })));
+        }
+        div().w(px(512.)).p(px(10.)).rounded(px(RADIUS_MENU))
+            .border_1().border_color(p.border_strong).bg(menu_background).shadow_lg()
+            .child(div().debug_selector(|| "install-project-search".into())
+                .child(Input::new(&self.install_flow.project_search).w_full()
+                    .prefix(Self::icon("icons/search.svg", 15., p.muted))))
+            .child(toolbar).child(rows)
+            .child(div().mt(px(8.)).flex().justify_end()
+                .child(div().id("install-projects-done").debug_selector(|| "install-projects-done".into())
+                    .h(px(30.)).px(px(12.)).rounded(px(RADIUS_CONTROL))
+                    .flex().items_center().cursor_pointer().text_size(px(13.))
+                    .bg(p.selected).hover(move |button| button.bg(p.hover))
+                    .child(self.tr("完成选择", "Done"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.install_flow.project_picker_open = false;
+                        this.shell.focus_handle.focus(window, cx);
+                        this.notify_dialog(cx);
+                    }))))
+    }
+
     pub(super) fn can_install_proma(&self) -> bool {
-        !self.install_flow.global && self.projects_view.open_project.as_ref()
-            .is_some_and(|project| crate::proma::installation_workspace(project).is_ok())
+        if self.install_flow.global { return false; }
+        if self.install_flow.modal {
+            !self.install_flow.selected_projects.is_empty()
+                && self.install_flow.selected_projects.iter()
+                    .all(|project| crate::proma::installation_workspace(project).is_ok())
+        } else {
+            self.projects_view.open_project.as_ref()
+                .is_some_and(|project| crate::proma::installation_workspace(project).is_ok())
+        }
     }
 
     pub(super) fn toggle_install_target(&mut self, target: InstallTarget) {
-        if target == InstallTarget::Proma && !self.can_install_proma() {
-            return;
-        }
-        if !self.install_flow.selected_targets.remove(&target) {
+        if self.install_flow.selected_targets.remove(&target) { return; }
+        if target != InstallTarget::Proma || self.can_install_proma() {
             self.install_flow.selected_targets.insert(target);
         }
     }
@@ -398,13 +451,13 @@ impl KitterApp {
                         this.notify_dialog(cx);
                     })),
             )
-            .child(universal_rows);
-        let mut independent_rows = div().flex().flex_col();
+            .when(universal, |card| card.child(universal_rows));
+        let mut independent_rows = div().flex().flex_wrap();
         for info in crate::agents::INDEPENDENT_INSTALL_TARGETS {
-            if info.target == InstallTarget::Proma && !self.can_install_proma() {
+            if info.target == InstallTarget::Proma && self.install_flow.global {
                 continue;
             }
-            independent_rows = independent_rows.child(self.target_row(*info, cx));
+            independent_rows = independent_rows.child(self.target_row(*info, cx).min_w_0().flex_basis(relative(0.5)));
         }
         let independent_box = div()
             .mt(px(10.))
@@ -452,7 +505,7 @@ impl KitterApp {
             .last()
             .is_some_and(|last| last.target == info.target);
         div()
-            .id(id)
+            .id(id).debug_selector(move || id.into())
             .h(px(48.))
             .px(px(13.))
             .border_t_1()
@@ -486,19 +539,21 @@ impl KitterApp {
                         self.uses_dark_theme(),
                     )),
             )
-            .child(div().ml(px(9.)).text_size(px(13.)).child(info.name))
-            .child(div().flex_1())
+            .child(div().ml(px(9.)).min_w_0().flex_1().truncate().text_size(px(13.)).child(info.name))
             .child(
                 div()
                     .font_family(MONO)
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .text_color(p.muted)
+                    .ml(px(8.)).max_w(px(90.)).truncate()
                     .child(if self.install_flow.global {
                         dirs::home_dir()
                             .map(|home| {
                                 display_path(&crate::agents::global_target_root(&home, info.target))
                             })
                             .unwrap_or_default()
+                    } else if info.target == InstallTarget::Proma && !self.can_install_proma() {
+                        self.tr("所选项目需关联唯一工作区", "Selected projects need one workspace each").to_string()
                     } else {
                         crate::agents::target_directory(info.target).to_string()
                     }),

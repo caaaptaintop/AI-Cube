@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -68,6 +68,7 @@ pub(super) struct ProjectsState {
     pub selected_project_agent: Option<AgentKind>,
     pub project_agents_expanded: bool,
     pub expanded_project_plugins: HashSet<String>,
+    pub collapsed_skill_sources: HashSet<String>,
     pub project_search: Entity<InputState>,
     pub project_select: Entity<SelectState<Vec<ProjectChoice>>>,
     pub project_snapshots: RefCell<BTreeMap<PathBuf, Vec<ProjectSkill>>>,
@@ -98,6 +99,10 @@ pub(super) struct AddFlowState {
 pub(super) struct InstallFlowState {
     pub modal: bool,
     pub global: bool,
+    pub selected_projects: BTreeSet<PathBuf>,
+    pub project_picker_open: bool,
+    pub project_search: Entity<InputState>,
+    pub project_scroll: ScrollHandle,
     pub selected_targets: HashSet<InstallTarget>,
 }
 

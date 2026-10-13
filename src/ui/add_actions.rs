@@ -51,21 +51,26 @@ impl KitterApp {
     }
 
     pub(super) fn install_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(project) = (if self.install_flow.global {
-            dirs::home_dir()
+        let projects = if self.install_flow.global {
+            dirs::home_dir().into_iter().collect::<Vec<_>>()
         } else {
-            self.projects_view.open_project.clone()
-        }) else {
+            self.install_flow.selected_projects.iter().cloned().collect::<Vec<_>>()
+        };
+        if projects.is_empty() {
             self.show_notice(self.tr("请先选择项目", "Choose a project first"), cx);
             return;
-        };
-        let selected = self.selected_skill_keys();
-        if selected.is_empty() {
+        }
+        if self.install_flow.selected_targets.contains(&InstallTarget::Proma) && !self.can_install_proma() {
+            self.show_notice(self.tr("所选项目需各自关联一个 Proma 工作区", "Each selected project needs one Proma workspace"), cx);
             return;
         }
-        let targets = crate::agents::PROJECT_INSTALL_TARGETS
-            .iter()
-            .copied()
+        let selected = self.selected_skill_keys();
+        let skills = selected.iter().filter_map(|storage_name| {
+            self.model.skills.iter().find(|skill| skill_storage_name(skill) == *storage_name)
+                .map(|skill| (skill.record.name.clone(), skill.path.clone()))
+        }).collect::<Vec<_>>();
+        if skills.is_empty() { return; }
+        let targets = crate::agents::PROJECT_INSTALL_TARGETS.iter().copied()
             .chain(std::iter::once(InstallTarget::Proma).filter(|_| self.can_install_proma()))
             .filter(|target| self.install_flow.selected_targets.contains(target))
             .collect::<Vec<_>>();
@@ -73,55 +78,30 @@ impl KitterApp {
             self.show_notice(self.tr("请选择有效的安装目标", "Choose a valid install target"), cx);
             return;
         }
-        let mut installed = 0usize;
-        let mut failures = Vec::new();
-        for storage_name in selected {
-            let Some(skill) = self
-                .model
-                .skills
-                .iter()
-                .find(|skill| skill_storage_name(skill) == storage_name)
-            else {
-                continue;
-            };
-            match project::install_from_path(&project, &skill.path, &skill.record.name, &targets) {
-                Ok(()) => installed += 1,
-                Err(error) => failures.push(format!(
-                    "{}: {}",
-                    skill.record.name,
-                    self.error_message(error)
-                )),
+        let report = project::install_batch(&projects, &skills, &targets);
+        if report.installed > 0 && !self.install_flow.global {
+            for project in &report.installed_projects {
+                self.model.library.config.touch_project(project);
             }
-        }
-        if installed > 0 && !self.install_flow.global {
-            self.model.library.config.touch_project(&project);
             let _ = self.model.library.save();
         }
-        if installed > 0 {
-            // A global installation contributes to every project's effective
-            // Skills, so invalidate all derived scans before redrawing.
+        if report.installed > 0 {
             self.projects_view.context_estimates.borrow_mut().clear();
         }
         self.install_flow.modal = false;
         self.close_dialog(cx);
-        let summary = if failures.is_empty() {
-            if self.uses_english() {
-                format!("Installed {}", counted(installed, "skill", "skills"))
-            } else if installed == 1 {
-                "已安装".to_string()
-            } else {
-                format!("已安装 {} 个技能", installed)
-            }
-        } else if self.uses_english() {
-            format!("Installed {installed}; {} failed", failures.len())
+        let project_count = report.installed_projects.len();
+        let summary = if self.uses_english() {
+            format!("Completed {} installs across {project_count} locations; {} failed", report.installed, report.failures.len())
         } else {
-            format!("已安装 {} 个，{} 个失败", installed, failures.len())
+            format!("完成 {} 处安装，覆盖 {} 个{}；{} 处失败", report.installed, project_count,
+                if self.install_flow.global { "全局位置" } else { "项目" }, report.failures.len())
         };
         self.refresh(cx);
-        if failures.is_empty() {
+        if report.failures.is_empty() {
             self.show_notice(summary, cx);
         } else {
-            self.show_notice(format!("{}\n{}", summary, failures.join("\n")), cx);
+            self.show_sticky_notice(format!("{}\n{}", summary, report.failures.join("\n")), cx);
         }
     }
 

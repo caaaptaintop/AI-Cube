@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -23,6 +23,46 @@ pub enum RemovalKind {
 pub struct RemovalReport {
     pub removed: usize,
     pub failures: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct BatchInstallReport {
+    /// Completed project/skill/target operations, including unchanged installs.
+    pub installed: usize,
+    pub installed_projects: BTreeSet<PathBuf>,
+    pub failures: Vec<String>,
+}
+
+/// Use the existing per-target installer and report partial failures precisely.
+pub fn install_batch(
+    projects: &[PathBuf],
+    skills: &[(String, PathBuf)],
+    targets: &[InstallTarget],
+) -> BatchInstallReport {
+    let mut report = BatchInstallReport::default();
+    let projects = projects.iter().map(|path| crate::project_discovery::path_identity(path))
+        .collect::<BTreeSet<_>>();
+    let mut seen = HashSet::new();
+    for project in projects {
+        for (name, source) in skills {
+            for target in targets {
+                if !seen.insert((project.clone(), name.clone(),
+                    crate::project_discovery::path_identity(source), *target)) {
+                    continue;
+                }
+                match install_from_path(&project, source, name, &[*target]) {
+                    Ok(()) => {
+                        report.installed += 1;
+                        report.installed_projects.insert(project.clone());
+                    }
+                    Err(error) => report.failures.push(format!(
+                        "{} / {} / {target:?}: {error}", project.display(), name,
+                    )),
+                }
+            }
+        }
+    }
+    report
 }
 
 pub fn install(
@@ -349,6 +389,9 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                 target: InstallTarget::Proma,
                 path: installation.path,
                 managed: installation.managed,
+                removable: installation.removable,
+                bundled: installation.bundled,
+                integration: installation.integration,
                 state: Some(installation.state),
                 status: Some(installation.status),
             });
@@ -397,6 +440,9 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                     target,
                     path,
                     managed,
+                    removable: true,
+                    bundled: false,
+                    integration: None,
                     state: None,
                     status: None,
                 });
@@ -478,6 +524,58 @@ mod tests {
     }
 
     #[test]
+    fn batch_install_covers_selected_projects_and_supported_agents() {
+        let fixture = Fixture::new();
+        let second = fixture._temp.path().join("second");
+        let unselected = fixture._temp.path().join("unselected");
+        let extra = fixture.library.join("extra");
+        for path in [&second, &unselected, &extra] { fs::create_dir_all(path).unwrap(); }
+        fs::write(extra.join("SKILL.md"), "# Extra").unwrap();
+        let mut projects = vec![fixture.project.clone(), second.clone(), second.clone()];
+        #[cfg(unix)] {
+            let alias = fixture._temp.path().join("second-alias");
+            symlink(&second, &alias).unwrap();
+            projects.push(alias);
+        }
+        let skills = vec![("example".into(), fixture.source.clone()), ("extra".into(), extra.clone())];
+        for _ in 0..2 {
+            let report = install_batch(&projects, &skills, PROJECT_INSTALL_TARGETS);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.installed, 2 * 2 * PROJECT_INSTALL_TARGETS.len());
+            assert_eq!(report.installed_projects.len(), 2);
+        }
+        for project in [&fixture.project, &second] {
+            for (name, source) in &skills {
+                for target in PROJECT_INSTALL_TARGETS {
+                    let entry = project.join(target_directory(*target)).join(name);
+                    assert_eq!(entry.canonicalize().unwrap(), source.canonicalize().unwrap());
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(unselected).unwrap().count(), 0);
+        assert_eq!(fs::read_to_string(fixture.source.join("SKILL.md")).unwrap(), "# Example");
+    }
+
+    #[test]
+    fn batch_install_reports_conflict_without_overwriting_it() {
+        let fixture = Fixture::new();
+        let second = fixture._temp.path().join("second");
+        let conflict = second.join(target_directory(InstallTarget::Codex)).join("example");
+        fs::create_dir_all(&conflict).unwrap();
+        fs::write(conflict.join("SKILL.md"), "User-owned skill").unwrap();
+        let report = install_batch(&[fixture.project.clone(), second.clone()],
+            &[("example".into(), fixture.source.clone())],
+            &[InstallTarget::Codex, InstallTarget::ClaudeCode]);
+        assert_eq!(report.installed, 3);
+        assert_eq!(report.installed_projects.len(), 2);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains(second.to_str().unwrap()));
+        assert!(report.failures[0].contains("Codex"));
+        assert_eq!(fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "User-owned skill");
+        assert_eq!(fs::read_to_string(fixture.source.join("SKILL.md")).unwrap(), "# Example");
+    }
+
+    #[test]
     fn proma_rejects_business_repo_install_and_removal() {
         let fixture = Fixture::new();
         assert!(install_from_path(&fixture.project, &fixture.source, "example", &[InstallTarget::Proma]).is_err());
@@ -485,7 +583,7 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("SKILL.md"), "business fixture").unwrap();
         let installation = ProjectSkillInstallation {
-            target: InstallTarget::Proma, path: path.clone(), managed: true,
+            target: InstallTarget::Proma, path: path.clone(), managed: true, removable: false, bundled: false, integration: None,
             state: Some("active".into()), status: Some("current".into()),
         };
         assert!(remove_project_skill(&installation).is_err());
@@ -693,6 +791,9 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            removable: true,
+            bundled: false,
+            integration: None,
             state: None,
             status: None,
         };
@@ -714,6 +815,9 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            removable: false,
+            bundled: false,
+            integration: None,
             state: None,
             status: None,
         };

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -810,6 +810,68 @@ pub struct Installation {
     pub status: String,
     pub source: Option<PathBuf>,
     pub managed: bool,
+    pub removable: bool,
+    pub bundled: bool,
+    pub integration: Option<String>,
+}
+
+fn skill_entry_bytes(path: &Path) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= LIMIT).then_some(bytes)
+}
+
+fn skill_entry_fingerprint(path: &Path) -> Option<[u8; 32]> {
+    skill_entry_bytes(path).map(|bytes| Sha256::digest(&bytes).into())
+}
+
+fn integration_entry_fingerprints(root: &Path) -> BTreeMap<String, [u8; 32]> {
+    let defaults = root.join("default-skills");
+    let mut entries = BTreeMap::new();
+    if real_directory(&defaults).is_err() { return entries; }
+    for name in ["distill-memory", "read-working-memory", "save-thread", "search-memory", "status"] {
+        let template = defaults.join(name);
+        if real_directory(&template).is_err() { continue; }
+        let Some(bytes) = skill_entry_bytes(&template.join("SKILL.md")) else { continue; };
+        // Recognize the configured Proma integration templates, not arbitrary
+        // same-name project skills. The workspace entry must also match below.
+        if String::from_utf8_lossy(&bytes).contains("Nowledge Mem") {
+            entries.insert(name.into(), Sha256::digest(&bytes).into());
+        }
+    }
+    entries
+}
+
+fn bundled_entry_fingerprints(root: &Path) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
+    #[cfg(target_os = "macos")]
+    return bundled_entry_fingerprints_in(&root.join("default-skills"), Path::new("/Applications/Proma.app/Contents/Resources/default-skills"));
+    #[cfg(not(target_os = "macos"))]
+    { let _ = root; BTreeMap::new() }
+}
+
+fn bundled_entry_fingerprints_in(
+    defaults: &Path, app_templates: &Path,
+) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
+    let mut entries = BTreeMap::<String, BTreeSet<[u8; 32]>>::new();
+    if real_directory(app_templates).is_err() { return entries; }
+    // The user template directory may also contain later additions. Only
+    // names supplied by the installed application qualify as bundled.
+    for entry in fs::read_dir(app_templates).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if real_directory(&path).is_err() { continue; }
+        let Some(fingerprint) = skill_entry_fingerprint(&path.join("SKILL.md")) else { continue; };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let fingerprints = entries.entry(name.clone()).or_default();
+        fingerprints.insert(fingerprint);
+        let cached = defaults.join(name);
+        if real_directory(&cached).is_ok()
+            && let Some(fingerprint) = skill_entry_fingerprint(&cached.join("SKILL.md"))
+        {
+            fingerprints.insert(fingerprint);
+        }
+    }
+    entries
 }
 
 pub fn inspect(project: &Path) -> Result<Vec<Installation>> {
@@ -818,7 +880,15 @@ pub fn inspect(project: &Path) -> Result<Vec<Installation>> {
 }
 
 pub fn inspect_in(root: &Path, project: &Path) -> Result<Vec<Installation>> {
+    inspect_with_bundles(root, project, &bundled_entry_fingerprints(root))
+}
+
+fn inspect_with_bundles(
+    root: &Path, project: &Path, bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+) -> Result<Vec<Installation>> {
     let w = workspace_for_path(root, project)?;
+    let recovery_clear = no_pending(&w).is_ok();
+    let integration_entries = integration_entry_fingerprints(root);
     let mut out = vec![];
     for (directory, state) in [("skills", "active"), ("skills-inactive", "inactive")] {
         let parent = w.path.join(directory);
@@ -854,6 +924,17 @@ pub fn inspect_in(root: &Path, project: &Path) -> Result<Vec<Installation>> {
             } else {
                 "unmanaged"
             };
+            // Match template content, never just a well-known name. This is
+            // provenance metadata; it grants no removal or runtime capability.
+            let bundled = !linked && found.is_none()
+                && bundled_entries.get(&name).is_some_and(|fingerprints| {
+                    skill_entry_fingerprint(&path.join("SKILL.md"))
+                        .is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
+                });
+            let integration = (!linked && found.is_none() && !bundled
+                && integration_entries.get(&name).is_some_and(|expected| {
+                    skill_entry_fingerprint(&path.join("SKILL.md")).as_ref() == Some(expected)
+                })).then(|| "Nowledge Mem".to_string());
             out.push(Installation {
                 name,
                 path,
@@ -861,6 +942,9 @@ pub fn inspect_in(root: &Path, project: &Path) -> Result<Vec<Installation>> {
                 status: status.into(),
                 source: found.as_ref().map(|m| m.source.clone()),
                 managed: found.is_some(),
+                removable: recovery_clear && matches!(status, "current" | "update_pending"),
+                bundled,
+                integration,
             });
         }
     }
@@ -1060,6 +1144,130 @@ mod tests {
         .unwrap();
         fs::write(source.join("local-data/private.env"), "fixture-secret").unwrap();
         (temp, root, project, source)
+    }
+
+    #[test]
+    fn removal_availability_matches_mirror_and_recovery_guards() {
+        let (_temp, root, project, source) = fixture();
+        let plan = plan_install(&root, &project, &source, "example").unwrap();
+        apply_plan(&plan).unwrap();
+        let original = fs::read(plan.destination.join("SKILL.md")).unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].removable);
+
+        fs::write(source.join("SKILL.md"), "upstream changed").unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert_eq!(scan[0].status, "update_pending");
+        assert!(scan[0].removable);
+
+        fs::create_dir_all(project.join("skills-inactive")).unwrap();
+        let inactive = project.join("skills-inactive/example");
+        fs::rename(&plan.destination, &inactive).unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].removable);
+        fs::write(inactive.join("SKILL.md"), "local edit").unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert_eq!(scan[0].status, "modified");
+        assert!(!scan[0].removable);
+
+        let external = project.join("skills/external");
+        std::os::unix::fs::symlink(&source, &external).unwrap();
+        let unmanaged = project.join("skills/unmanaged");
+        fs::create_dir_all(&unmanaged).unwrap();
+        fs::write(unmanaged.join("SKILL.md"), "unmanaged").unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert!(scan.iter().all(|item| !item.removable));
+        assert!(scan.iter().any(|item| item.status == "external_link"));
+        assert!(scan.iter().any(|item| item.status == "unmanaged"));
+
+        fs::write(inactive.join("SKILL.md"), original).unwrap();
+        assert!(inspect_in(&root, &project).unwrap().iter().find(|item| item.name == "example").unwrap().removable);
+        let pending = project.join(RECOVERY).join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let transaction = Transaction {
+            workspace: plan.workspace.clone(), workspace_signature: plan.workspace_signature,
+            target: inactive, backup: None, before: String::new(), after: String::new(),
+            phase: "prepared".into(),
+        };
+        fs::write(pending.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
+        assert!(inspect_in(&root, &project).unwrap().iter().all(|item| !item.removable));
+    }
+
+    #[test]
+    fn integration_presets_require_template_and_provider_match_without_removal_rights() {
+        let (_temp, root, project, _source) = fixture();
+        let template = root.join("default-skills/status");
+        let entry = project.join("skills/status");
+        fs::create_dir_all(&template).unwrap();
+        fs::create_dir_all(&entry).unwrap();
+        let body = "---\nname: status\ndescription: Check Nowledge Mem from Proma\n---\nNowledge Mem integration.\n";
+        fs::write(template.join("SKILL.md"), body).unwrap();
+        fs::write(entry.join("SKILL.md"), body).unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert_eq!(scan[0].integration.as_deref(), Some("Nowledge Mem"));
+        assert!(!scan[0].bundled);
+        assert!(!scan[0].removable);
+        fs::write(entry.join("SKILL.md"), "custom status skill").unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].integration.is_none());
+        fs::write(template.join("SKILL.md"), "custom status skill").unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].integration.is_none());
+        fs::write(template.join("SKILL.md"), body).unwrap();
+        fs::write(entry.join("SKILL.md"), body).unwrap();
+        fs::create_dir_all(project.join("skills-inactive")).unwrap();
+        fs::rename(&entry, project.join("skills-inactive/status")).unwrap();
+        assert_eq!(inspect_in(&root, &project).unwrap()[0].integration.as_deref(), Some("Nowledge Mem"));
+        std::os::unix::fs::symlink(&template, &entry).unwrap();
+        assert!(inspect_in(&root, &project).unwrap().iter().find(|item| item.state == "active").unwrap().integration.is_none());
+    }
+
+    #[test]
+    fn bundled_copies_require_matching_template_content_and_no_managed_marker() {
+        let (_temp, root, project, source) = fixture();
+        let app_templates = root.join("fixture-app/default-skills");
+        let defaults = root.join("default-skills");
+        let template = app_templates.join("example");
+        let copy = project.join("skills/example");
+        fs::create_dir_all(&template).unwrap();
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(source.join("SKILL.md"), template.join("SKILL.md")).unwrap();
+        fs::copy(template.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
+        let inspect = || inspect_with_bundles(&root, &project, &bundled_entry_fingerprints_in(&defaults, &app_templates)).unwrap();
+        let scan = inspect();
+        assert!(scan[0].bundled);
+        assert!(!scan[0].removable);
+        let cached = defaults.join("example");
+        fs::create_dir_all(&cached).unwrap();
+        fs::write(cached.join("SKILL.md"), "previous app version").unwrap();
+        fs::copy(cached.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
+        assert!(inspect()[0].bundled);
+        let extra = defaults.join("user-added");
+        fs::create_dir_all(&extra).unwrap();
+        fs::write(extra.join("SKILL.md"), "added later").unwrap();
+        let extra_copy = project.join("skills/user-added");
+        fs::create_dir_all(&extra_copy).unwrap();
+        fs::copy(extra.join("SKILL.md"), extra_copy.join("SKILL.md")).unwrap();
+        assert!(!inspect().iter().find(|item| item.name == "user-added").unwrap().bundled);
+        assert!(bundled_entry_fingerprints_in(&defaults, &root.join("missing-app")).is_empty());
+        fs::create_dir_all(project.join("skills-inactive")).unwrap();
+        let inactive = project.join("skills-inactive/example");
+        fs::rename(&copy, &inactive).unwrap();
+        assert!(inspect()[0].bundled);
+        fs::write(inactive.join("SKILL.md"), "same name, custom content").unwrap();
+        assert!(!inspect()[0].bundled);
+
+        let linked_template = app_templates.join("linked");
+        fs::create_dir_all(&linked_template).unwrap();
+        fs::copy(template.join("SKILL.md"), linked_template.join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(&linked_template, project.join("skills/linked")).unwrap();
+        assert!(!inspect().iter().find(|item| item.name == "linked").unwrap().bundled);
+
+        let plan = plan_install(&root, &project, &source, "managed").unwrap();
+        apply_plan(&plan).unwrap();
+        let managed_template = app_templates.join("managed");
+        fs::create_dir_all(&managed_template).unwrap();
+        fs::copy(plan.destination.join("SKILL.md"), managed_template.join("SKILL.md")).unwrap();
+        let scan = inspect();
+        let managed = scan.iter().find(|item| item.name == "managed").unwrap();
+        assert!(managed.removable);
+        assert!(!managed.bundled);
     }
 
     #[test]

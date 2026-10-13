@@ -217,6 +217,13 @@ pub struct ProjectSkillInstallation {
     pub target: InstallTarget,
     pub path: PathBuf,
     pub managed: bool,
+    /// Read-only scan result for removal controls; mutations still revalidate.
+    #[serde(default)]
+    pub removable: bool,
+    #[serde(default)]
+    pub bundled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

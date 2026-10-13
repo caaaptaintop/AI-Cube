@@ -23,6 +23,7 @@ impl KitterApp {
             self.add_flow.task = None;
         }
         self.install_flow.modal = false;
+        self.install_flow.project_picker_open = false;
         self.delete_flow.confirmation = None;
         self.delete_flow.selected.clear();
         self.tags_flow.edit = None;
