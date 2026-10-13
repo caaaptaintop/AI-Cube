@@ -19,6 +19,7 @@ pub(super) enum ScanProfile {
         max_entries: usize,
     },
     PiIgnored,
+    PromaActive,
 }
 
 pub(super) fn scan(root: &SkillRoot, profile: ScanProfile) -> Vec<PathBuf> {
@@ -56,6 +57,7 @@ pub(super) fn scan(root: &SkillRoot, profile: ScanProfile) -> Vec<PathBuf> {
         } => recursive(root, max_depth, max_directories, max_entries, true, false),
         ScanProfile::DimRecursive => recursive(root, 11, 2_000, 20_000, false, true),
         ScanProfile::PiIgnored => pi_ignored(root),
+        ScanProfile::PromaActive => proma_active(root),
     };
     files.sort();
     files.dedup();
@@ -223,6 +225,34 @@ fn pi_ignored(root: &SkillRoot) -> Vec<PathBuf> {
     result
 }
 
+fn proma_active(root: &SkillRoot) -> Vec<PathBuf> {
+    let Ok(active) = root.path.canonicalize() else {
+        return Vec::new();
+    };
+    let mut builder = WalkBuilder::new(&active);
+    let boundary = active.clone();
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .follow_links(true)
+        .filter_entry(move |entry| {
+            !machine_data_path(entry.path())
+                && entry.path().canonicalize().is_ok_and(|path| path.starts_with(&boundary))
+        });
+    let mut files = builder.build().flatten()
+        .filter(|entry| entry.path().file_name().is_some_and(|name| name == "SKILL.md"))
+        .filter_map(|entry| entry.path().canonicalize().ok())
+        .filter(|path| path.is_file() && path.starts_with(&active) && !machine_data_path(path))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn machine_data_path(path: &Path) -> bool {
     let reserved = |path: &Path| {
         path.components()
@@ -321,5 +351,27 @@ mod tests {
         let root = SkillRoot::new(temp.path().to_path_buf(), SkillScope::User);
         let files = scan(&root, ScanProfile::PiIgnored);
         assert_eq!(files, vec![temp.path().join("kept/SKILL.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proma_active_scan_rejects_cross_root_links_and_private_data() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let active = temp.path().join("skills");
+        for directory in ["skills/kept", "skills/file-alias", "skills/local-data/private",
+            "skills/ignored", "skills-inactive/disabled", "external"] {
+            fs::create_dir_all(temp.path().join(directory)).unwrap();
+            fs::write(temp.path().join(directory).join("SKILL.md"), "fixture").unwrap();
+        }
+        fs::remove_file(active.join("file-alias/SKILL.md")).unwrap();
+        symlink(temp.path().join("external/SKILL.md"), active.join("file-alias/SKILL.md")).unwrap();
+        symlink(temp.path().join("external"), active.join("external-alias")).unwrap();
+        symlink(active.join("local-data/private"), active.join("private-alias")).unwrap();
+        symlink(active.join("kept"), active.join("internal-alias")).unwrap();
+        fs::write(active.join(".ignore"), "ignored/\n").unwrap();
+        fs::write(active.join("root.md"), "fixture").unwrap();
+        let root = SkillRoot::new(active.clone(), SkillScope::Repository);
+        assert_eq!(scan(&root, ScanProfile::PromaActive), vec![active.join("kept/SKILL.md").canonicalize().unwrap()]);
     }
 }

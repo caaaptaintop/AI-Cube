@@ -5,15 +5,63 @@ fn selected_project_skills(
     selected_names: &HashSet<String>,
 ) -> Vec<ProjectSkill> {
     rows.iter()
-        .filter(|row| !row.direct_installations.is_empty() && selected_names.contains(&row.name))
+        .filter(|row| row.can_remove() && selected_names.contains(&row.name))
         .map(|row| ProjectSkill {
             name: row.name.clone(),
-            installations: row.direct_installations.clone(),
+            installations: row.removable_installations(),
         })
         .collect()
 }
 
 impl KitterApp {
+    fn skill_origin_label(&self, origin: SkillOrigin, global: bool) -> &'static str {
+        match origin {
+            SkillOrigin::Project => self.tr("项目安装", "Project install"),
+            SkillOrigin::Parent => self.tr("父目录继承", "Inherited from parent"),
+            SkillOrigin::User if global => self.tr("全局安装", "Global install"),
+            SkillOrigin::User => self.tr("全局继承", "Inherited globally"),
+            SkillOrigin::System => self.tr("系统提供", "System-provided"),
+            SkillOrigin::Builtin => self.tr("内置", "Built-in"),
+            SkillOrigin::Integration => self.tr("集成预设", "Integration preset"),
+        }
+    }
+
+    fn skill_origin_badge(&self, origin: SkillOrigin, global: bool) -> Div {
+        let p = self.palette();
+        let label = self.skill_origin_label(origin, global);
+        div().ml(px(8.)).px(px(7.)).h(px(20.)).rounded(px(7.5))
+            .bg(p.raised).flex().flex_none().items_center().text_size(px(11.))
+            .text_color(if origin == SkillOrigin::Project { p.accent } else { p.muted })
+            .child(label)
+    }
+
+    fn project_skill_group_header(
+        &self, group: SkillSourceGroup, count: usize, cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.palette();
+        let key = group.key().to_string();
+        let debug_key = key.clone();
+        let collapsed = self.projects_view.collapsed_skill_sources.contains(&key);
+        let label = match group {
+            SkillSourceGroup::Origin(origin) => self.skill_origin_label(origin, self.projects_view.global_project_view),
+            SkillSourceGroup::Multiple => self.tr("多种来源", "Multiple sources"),
+        };
+        div().id(ElementId::Name(format!("project-skill-source-{key}").into()))
+            .debug_selector(move || format!("project-skill-source-{debug_key}").into())
+            .h(px(60.)).w_full().px(px(27.)).flex().items_center().gap(px(8.))
+            .border_b_1().border_color(p.border).bg(p.raised).cursor_pointer()
+            .hover(move |row| row.bg(p.hover))
+            .child(Self::icon(if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }, 14., p.muted))
+            .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.secondary).child(label))
+            .child(div().text_size(px(12.)).text_color(p.muted).child(count.to_string()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.projects_view.collapsed_skill_sources.remove(&key) {
+                    this.projects_view.collapsed_skill_sources.insert(key.clone());
+                }
+                cx.notify();
+            })).into_any_element()
+    }
+
     fn matches_project_skill_filter(&self, row: &EffectiveSkillRow) -> bool {
         let Some(filter) = self.projects_view.batch_filter.as_ref() else {
             return true;
@@ -25,6 +73,8 @@ impl KitterApp {
                         &installation.path.join("SKILL.md"),
                         &skill.path.join("SKILL.md"),
                     )
+                        || (installation.target == InstallTarget::Proma
+                            && crate::proma::is_managed(&installation.path, &skill.path))
                 })
                 && match filter {
                     ProjectSkillFilter::Group(group) => {
@@ -237,7 +287,7 @@ impl KitterApp {
         let selected_count = selected.len();
         let selectable_names = visible_rows
             .iter()
-            .filter(|row| !row.direct_installations.is_empty())
+            .filter(|row| row.can_remove())
             .map(|row| row.name.clone())
             .collect::<Vec<_>>();
         let all_selected = !selectable_names.is_empty()
@@ -439,11 +489,31 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
+        let proma_states = effective.direct_installations.iter()
+            .filter(|installation| installation.target == InstallTarget::Proma)
+            .map(|installation| {
+                let state = match installation.state.as_deref() {
+                    Some("active") => self.tr("已启用", "Active"),
+                    Some("inactive") => self.tr("已停用", "Inactive"),
+                    _ => self.tr("状态未知", "Unknown state"),
+                };
+                let status = match installation.status.as_deref() {
+                    _ if installation.bundled => self.tr("预设副本", "Bundled copy"),
+                    _ if installation.integration.is_some() => installation.integration.as_deref().unwrap_or_default(),
+                    Some("current") => self.tr("最新", "Current"),
+                    Some("update_pending") => self.tr("可同步", "Update pending"),
+                    Some("modified") => self.tr("副本已修改", "Modified"),
+                    Some("external_link") => self.tr("外部链接", "External link"),
+                    Some("unmanaged") => self.tr("未受管", "Unmanaged"),
+                    _ => self.tr("待核验", "Unverified"),
+                };
+                format!("Proma {state} · {status}")
+            }).collect::<Vec<_>>().join(" / ");
         let name = effective.name.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {
             name: effective.name.clone(),
-            installations: effective.direct_installations.clone(),
+            installations: effective.removable_installations(),
         };
         let can_delete = !installed_for_delete.installations.is_empty();
         let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
@@ -527,6 +597,13 @@ impl KitterApp {
                             })
                             .when(managed, |title| {
                                 title.child(self.managed_skill_badge().ml(px(8.)))
+                            })
+                            .children(effective.origins.iter().map(|origin| {
+                                self.skill_origin_badge(*origin, self.projects_view.global_project_view)
+                            }))
+                            .when(!proma_states.is_empty(), |title| {
+                                title.child(div().ml(px(8.)).text_size(px(11.))
+                                    .text_color(p.muted).child(proma_states.clone()))
                             }),
                     )
                     .child(
@@ -586,6 +663,8 @@ impl KitterApp {
     }
 
     pub(super) fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        #[cfg(debug_assertions)]
+        let render_started = Instant::now();
         let p = self.palette();
         let query = self
             .projects_view
@@ -967,27 +1046,36 @@ impl KitterApp {
             } else {
                 self.context_estimate_panel(open_project, &estimates, cx)
             };
-            let all_effective_rows = effective_skill_rows(
-                &estimates,
-                &project_skills,
-                self.projects_view.selected_project_agent,
-            );
+            let all_effective_rows = if loading {
+                Arc::new(Vec::new())
+            } else {
+                let scanned_at = self.projects_view.context_estimates.borrow()[open_project].scanned_at;
+                self.projects_view.skill_rows_cache.borrow_mut().get_or_build(
+                    SkillRowsCacheKey {
+                        project: open_project.clone(),
+                        generation: self.projects_view.scan_generation,
+                        agent: self.projects_view.selected_project_agent,
+                        scanned_at,
+                    },
+                    &estimates,
+                    &project_skills,
+                )
+            };
             let skill_count = all_effective_rows.len();
             let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
             let can_batch = batch_mode
                 || all_effective_rows
                     .iter()
-                    .any(|row| !row.direct_installations.is_empty());
-            let visible_rows = if batch_mode {
-                all_effective_rows
+                    .any(|row| row.can_remove());
+            let effective_rows = if batch_mode {
+                Arc::new(all_effective_rows
                     .iter()
                     .filter(|row| self.matches_project_skill_filter(row))
                     .cloned()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>())
             } else {
-                all_effective_rows.clone()
+                Arc::clone(&all_effective_rows)
             };
-            let effective_rows = Arc::new(visible_rows);
             let mut skills = div()
                 .id("project-skills-scroll")
                 .debug_selector(|| "project-skills-scroll".into())
@@ -1037,14 +1125,18 @@ impl KitterApp {
             }
             if !effective_rows.is_empty() {
                 let rows = Arc::clone(&effective_rows);
+                let items = Arc::new(grouped_skill_items(&rows, &self.projects_view.collapsed_skill_sources));
                 let project = open_project.clone();
                 skills = skills.child(
                     uniform_list(
                         "project-skills-virtual-list",
-                        rows.len(),
+                        items.len(),
                         cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                             range
-                                .map(|index| this.project_skill_row(&rows[index], &project, cx))
+                                .map(|index| match &items[index] {
+                                    ProjectSkillListItem::Header { group, count } => this.project_skill_group_header(*group, *count, cx),
+                                    ProjectSkillListItem::Skill(index) => this.project_skill_row(&rows[*index], &project, cx),
+                                })
                                 .collect()
                         }),
                     )
@@ -1062,6 +1154,26 @@ impl KitterApp {
             let mut tabs = self
                 .project_skills_tabs(skill_count, plugin_skill_count, cx)
                 .child(div().flex_1());
+            if !effective_rows.is_empty() && self.projects_view.project_skills_tab == ProjectSkillsTab::Skills {
+                let groups = SkillSourceGroup::ALL.into_iter()
+                    .filter(|group| effective_rows.iter().any(|row| row.source_group() == *group))
+                    .map(|group| group.key().to_string()).collect::<Vec<_>>();
+                let all_collapsed = groups.iter().all(|key| self.projects_view.collapsed_skill_sources.contains(key));
+                tabs = tabs.child(
+                    div().id("project-skill-source-toggle-all")
+                        .debug_selector(|| "project-skill-source-toggle-all".into()).h(px(CONTROL_HEIGHT)).px(px(8.))
+                        .rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
+                        .text_size(px(11.)).text_color(p.secondary).hover(move |button| button.bg(p.hover))
+                        .child(if all_collapsed { self.tr("展开分组", "Expand groups") } else { self.tr("收起分组", "Collapse groups") })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            for key in &groups {
+                                if all_collapsed { this.projects_view.collapsed_skill_sources.remove(key); }
+                                else { this.projects_view.collapsed_skill_sources.insert(key.clone()); }
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
             if can_batch && self.projects_view.project_skills_tab == ProjectSkillsTab::Skills {
                 if batch_mode {
                     tabs = tabs.child(self.project_batch_controls(
@@ -1128,11 +1240,11 @@ impl KitterApp {
                                     if is_global {
                                         self.tr("全局生效", "Global").to_string()
                                     } else {
-                                        open_project
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned()
+                                        self.project_entries().into_iter()
+                                            .find(|entry| entry.path == *open_project)
+                                            .map(|entry| entry.name)
+                                            .unwrap_or_else(|| open_project.file_name().unwrap_or_default()
+                                                .to_string_lossy().into_owned())
                                     },
                                     window,
                                     cx,
@@ -1165,6 +1277,13 @@ impl KitterApp {
                         .border_color(p.border)
                         .child(context_panel),
                 )
+                .when(estimates.iter().any(|estimate| estimate.agent == AgentKind::Proma), |detail| {
+                    detail.child(div().px(px(28.)).pb(px(8.)).text_size(px(12.))
+                        .text_color(p.muted).child(self.tr(
+                            "Proma 仅静态扫描启用目录 skills；未验证运行时加载。",
+                            "Proma scans active skills statically; runtime loading is not verified.",
+                        )))
+                })
                 .child(tabs)
                 .child(skills)
                 .child(self.window_drag_strip("project-detail-window-drag", 24., cx))
@@ -1228,12 +1347,20 @@ impl KitterApp {
                 )
                 .child(self.window_drag_strip("empty-project-detail-window-drag", 24., cx))
         };
-        layout::content(
+        let page = layout::content(
             &self.shell.content_layout,
             self.content_pane_width(window, cx),
             recent_panel,
             detail,
-        )
+        );
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("KITTER_PREVIEW_PROJECT_TIMINGS")
+            && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{:.6}", render_started.elapsed().as_secs_f64() * 1000.);
+        }
+        page
     }
 }
 
@@ -1253,12 +1380,18 @@ mod tests {
             built_in: false,
             agents: Vec::new(),
             manual_only: false,
+            origins: Vec::new(),
             direct_installations: paths
                 .iter()
                 .map(|path| ProjectSkillInstallation {
                     target: InstallTarget::Universal,
                     path: PathBuf::from(path),
                     managed: true,
+                    removable: true,
+                    bundled: false,
+                    integration: None,
+                    state: None,
+                    status: None,
                 })
                 .collect(),
         }
@@ -1282,5 +1415,22 @@ mod tests {
             targets[0].installations[0].path,
             PathBuf::from("/project/.agents/skills/selected")
         );
+    }
+
+    #[test]
+    fn batch_removal_excludes_protected_installations_in_mixed_rows() {
+        let mut mixed = row("mixed", &["/project/.agents/skills/mixed", "/pilot/skills/mixed"]);
+        mixed.direct_installations[1].target = InstallTarget::Proma;
+        mixed.direct_installations[1].managed = false;
+        mixed.direct_installations[1].removable = false;
+        let mut protected = row("protected", &["/pilot/skills/protected"]);
+        protected.direct_installations[0].removable = false;
+        assert!(mixed.can_remove());
+        assert!(!protected.can_remove());
+        let selected = HashSet::from(["mixed".into(), "protected".into()]);
+        let targets = selected_project_skills(&[mixed, protected], &selected);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].installations.len(), 1);
+        assert_eq!(targets[0].installations[0].target, InstallTarget::Universal);
     }
 }

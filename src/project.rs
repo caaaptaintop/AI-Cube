@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -23,6 +23,46 @@ pub enum RemovalKind {
 pub struct RemovalReport {
     pub removed: usize,
     pub failures: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct BatchInstallReport {
+    /// Completed project/skill/target operations, including unchanged installs.
+    pub installed: usize,
+    pub installed_projects: BTreeSet<PathBuf>,
+    pub failures: Vec<String>,
+}
+
+/// Use the existing per-target installer and report partial failures precisely.
+pub fn install_batch(
+    projects: &[PathBuf],
+    skills: &[(String, PathBuf)],
+    targets: &[InstallTarget],
+) -> BatchInstallReport {
+    let mut report = BatchInstallReport::default();
+    let projects = projects.iter().map(|path| crate::project_discovery::path_identity(path))
+        .collect::<BTreeSet<_>>();
+    let mut seen = HashSet::new();
+    for project in projects {
+        for (name, source) in skills {
+            for target in targets {
+                if !seen.insert((project.clone(), name.clone(),
+                    crate::project_discovery::path_identity(source), *target)) {
+                    continue;
+                }
+                match install_from_path(&project, source, name, &[*target]) {
+                    Ok(()) => {
+                        report.installed += 1;
+                        report.installed_projects.insert(project.clone());
+                    }
+                    Err(error) => report.failures.push(format!(
+                        "{} / {} / {target:?}: {error}", project.display(), name,
+                    )),
+                }
+            }
+        }
+    }
+    report
 }
 
 pub fn install(
@@ -52,11 +92,17 @@ pub fn install_from_path(
     if !project.is_dir() {
         bail!("项目文件夹不存在：{}", project.display());
     }
+    if targets.contains(&InstallTarget::Proma) {
+        // The mirror API validates the registered native workspace before writing.
+        let workspace = crate::proma::installation_workspace(project)?;
+        crate::proma::install(&workspace.path, source, name)?;
+    }
     install_to_roots(
         source,
         name,
         targets
             .iter()
+            .filter(|target| **target != InstallTarget::Proma)
             .map(|target| installation_root(project, *target)),
     )
 }
@@ -124,7 +170,25 @@ pub fn uninstall(
     let source = library_dir.join(name).canonicalize().ok();
     let mut removable = Vec::new();
     let mut removable_keys = HashSet::new();
+    if targets.contains(&InstallTarget::Proma) {
+        let workspace = crate::proma::installation_workspace(project)?;
+        for installation in crate::proma::inspect(&workspace.path)? {
+            if installation.name != name {
+                continue;
+            }
+            let Some(source) = &source else {
+                bail!("技能不存在，无法安全验证 Proma 镜像");
+            };
+            if !crate::proma::is_managed(&installation.path, source) {
+                bail!("不会删除来源不匹配的 Proma 安装");
+            }
+            crate::proma::uninstall_path(&installation.path)?;
+        }
+    }
     for target in targets {
+        if *target == InstallTarget::Proma {
+            continue;
+        }
         let link = installation_root(project, *target).join(name);
         match link.symlink_metadata() {
             Ok(_) => {}
@@ -164,7 +228,34 @@ pub fn uninstall_all_from_path(project: &Path, name: &str, source: &Path) -> Res
     uninstall_all_from_source(project, name, source.as_deref())
 }
 
+fn proma_removal_paths(project: &Path, name: &str, source: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let workspaces = crate::proma::project_workspaces(project).unwrap_or_default();
+    let mut proma_paths = Vec::new();
+    for workspace in &workspaces {
+        for installation in crate::proma::inspect(&workspace.path)? {
+            if installation.name == name
+                && source.is_some_and(|source| crate::proma::is_managed(&installation.path, source))
+            {
+                proma_paths.push(installation.path);
+            }
+        }
+    }
+    if workspaces.len() > 1 && !proma_paths.is_empty() {
+        bail!("项目关联多个 Proma 工作区，请指定一个原生工作区目录或精确安装位置");
+    }
+    Ok(proma_paths)
+}
+
+pub fn validate_uninstall_all_from_path(project: &Path, name: &str, source: &Path) -> Result<()> {
+    crate::library::validate_name(name)?;
+    let source = source.canonicalize().ok();
+    proma_removal_paths(project, name, source.as_deref()).map(|_| ())
+}
+
 fn uninstall_all_from_source(project: &Path, name: &str, source: Option<&Path>) -> Result<()> {
+    for path in proma_removal_paths(project, name, source)? {
+        crate::proma::uninstall_path(&path)?;
+    }
     for target in PROJECT_INSTALL_TARGETS.iter().copied() {
         let link = installation_root(project, target).join(name);
         let Some(directory_link) = directory_link::inspect(&link)? else {
@@ -206,6 +297,9 @@ fn is_supported_installation_path(installation: &ProjectSkillInstallation) -> bo
 }
 
 pub fn remove_project_skill(installation: &ProjectSkillInstallation) -> Result<()> {
+    if installation.target == InstallTarget::Proma {
+        return crate::proma::uninstall_path(&installation.path);
+    }
     if !is_supported_installation_path(installation) {
         bail!(
             "不会删除 skills 目标目录之外的技能：{}",
@@ -289,6 +383,20 @@ pub fn remove_project_skills<'a>(
 
 pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
     let mut grouped = BTreeMap::<String, Vec<ProjectSkillInstallation>>::new();
+    for workspace in crate::proma::project_workspaces(project).unwrap_or_default() {
+        for installation in crate::proma::inspect(&workspace.path)? {
+            grouped.entry(installation.name).or_default().push(ProjectSkillInstallation {
+                target: InstallTarget::Proma,
+                path: installation.path,
+                managed: installation.managed,
+                removable: installation.removable,
+                bundled: installation.bundled,
+                integration: installation.integration,
+                state: Some(installation.state),
+                status: Some(installation.status),
+            });
+        }
+    }
     let canonical_library = library_dir
         .canonicalize()
         .unwrap_or_else(|_| library_dir.to_path_buf());
@@ -332,6 +440,11 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                     target,
                     path,
                     managed,
+                    removable: true,
+                    bundled: false,
+                    integration: None,
+                    state: None,
+                    status: None,
                 });
         }
     }
@@ -353,6 +466,13 @@ pub fn is_installed_any_from_path(project: &Path, name: &str, source: &Path) -> 
     let Some(source) = source else {
         return false;
     };
+    if crate::proma::project_workspaces(project).unwrap_or_default().iter().any(|workspace| {
+        ["skills", "skills-inactive"].iter().any(|directory| {
+            crate::proma::is_managed(&workspace.path.join(directory).join(name), &source)
+        })
+    }) {
+        return true;
+    }
     PROJECT_INSTALL_TARGETS.iter().any(|target| {
         let parent = installation_root(project, *target);
         let path = parent.join(name);
@@ -401,6 +521,75 @@ mod tests {
         fn installation(&self, target: InstallTarget) -> PathBuf {
             self.project.join(target_directory(target)).join("example")
         }
+    }
+
+    #[test]
+    fn batch_install_covers_selected_projects_and_supported_agents() {
+        let fixture = Fixture::new();
+        let second = fixture._temp.path().join("second");
+        let unselected = fixture._temp.path().join("unselected");
+        let extra = fixture.library.join("extra");
+        for path in [&second, &unselected, &extra] { fs::create_dir_all(path).unwrap(); }
+        fs::write(extra.join("SKILL.md"), "# Extra").unwrap();
+        let mut projects = vec![fixture.project.clone(), second.clone(), second.clone()];
+        #[cfg(unix)] {
+            let alias = fixture._temp.path().join("second-alias");
+            symlink(&second, &alias).unwrap();
+            projects.push(alias);
+        }
+        let skills = vec![("example".into(), fixture.source.clone()), ("extra".into(), extra.clone())];
+        for _ in 0..2 {
+            let report = install_batch(&projects, &skills, PROJECT_INSTALL_TARGETS);
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.installed, 2 * 2 * PROJECT_INSTALL_TARGETS.len());
+            assert_eq!(report.installed_projects.len(), 2);
+        }
+        for project in [&fixture.project, &second] {
+            for (name, source) in &skills {
+                for target in PROJECT_INSTALL_TARGETS {
+                    let entry = project.join(target_directory(*target)).join(name);
+                    assert_eq!(entry.canonicalize().unwrap(), source.canonicalize().unwrap());
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(unselected).unwrap().count(), 0);
+        assert_eq!(fs::read_to_string(fixture.source.join("SKILL.md")).unwrap(), "# Example");
+    }
+
+    #[test]
+    fn batch_install_reports_conflict_without_overwriting_it() {
+        let fixture = Fixture::new();
+        let second = fixture._temp.path().join("second");
+        let conflict = second.join(target_directory(InstallTarget::Codex)).join("example");
+        fs::create_dir_all(&conflict).unwrap();
+        fs::write(conflict.join("SKILL.md"), "User-owned skill").unwrap();
+        let report = install_batch(&[fixture.project.clone(), second.clone()],
+            &[("example".into(), fixture.source.clone())],
+            &[InstallTarget::Codex, InstallTarget::ClaudeCode]);
+        assert_eq!(report.installed, 3);
+        assert_eq!(report.installed_projects.len(), 2);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].contains(second.to_str().unwrap()));
+        assert!(report.failures[0].contains("Codex"));
+        assert_eq!(fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "User-owned skill");
+        assert_eq!(fs::read_to_string(fixture.source.join("SKILL.md")).unwrap(), "# Example");
+    }
+
+    #[test]
+    fn proma_rejects_business_repo_install_and_removal() {
+        let fixture = Fixture::new();
+        assert!(install_from_path(&fixture.project, &fixture.source, "example", &[InstallTarget::Proma]).is_err());
+        let path = fixture.project.join("skills/example");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), "business fixture").unwrap();
+        let installation = ProjectSkillInstallation {
+            target: InstallTarget::Proma, path: path.clone(), managed: true, removable: false, bundled: false, integration: None,
+            state: Some("active".into()), status: Some("current".into()),
+        };
+        assert!(remove_project_skill(&installation).is_err());
+        assert!(path.join("SKILL.md").is_file());
+        assert!(list(&fixture.project, &fixture.library).unwrap().is_empty());
+        assert!(!is_installed_any_from_path(&fixture.project, "example", &fixture.source));
     }
 
     #[test]
@@ -602,6 +791,11 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            removable: true,
+            bundled: false,
+            integration: None,
+            state: None,
+            status: None,
         };
 
         let report = remove_project_skills(std::iter::once(&installation));
@@ -621,6 +815,11 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
+            removable: false,
+            bundled: false,
+            integration: None,
+            state: None,
+            status: None,
         };
 
         let report = remove_project_skills(std::iter::once(&installation));

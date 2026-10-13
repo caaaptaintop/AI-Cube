@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -65,7 +65,7 @@ mod tags_groups_actions;
 mod theme;
 
 use crate::text::counted;
-use effective_view::{EffectivePluginGroup, EffectiveSkillRow, same_file};
+use effective_view::{EffectivePluginGroup, EffectiveSkillRow, ProjectSkillListItem, SkillOrigin, SkillSourceGroup, SkillRowsCache, SkillRowsCacheKey, grouped_skill_items, same_file};
 use gpui_component::resizable::ResizableState;
 use skill_selection::SkillSelection;
 use state::*;
@@ -133,14 +133,6 @@ fn effective_plugin_groups(
     selected_agent: Option<AgentKind>,
 ) -> Vec<EffectivePluginGroup> {
     effective_view::plugin_groups(estimates, selected_agent)
-}
-
-fn effective_skill_rows(
-    estimates: &[AgentContextEstimate],
-    project_skills: &[ProjectSkill],
-    selected_agent: Option<AgentKind>,
-) -> Vec<EffectiveSkillRow> {
-    effective_view::skill_rows(estimates, project_skills, selected_agent)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -485,21 +477,27 @@ pub struct KitterApp {
 impl KitterApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut app = Self::new_in(crate::config::app_data_dir(), window, cx);
-        if let Some(home) = crate::project_discovery::codex_home() {
+        {
             app.projects_view.discovered_projects =
-                crate::project_discovery::discover_codex_projects(&home).unwrap_or_default();
+                crate::project_discovery::discover_agent_projects().unwrap_or_default();
+            app.normalize_open_project();
             app.sync_project_select(window, cx);
             app.projects_view.discovery_task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(15)).await;
-                    let home = home.clone();
                     let discovered = cx.background_executor().spawn(async move {
-                        crate::project_discovery::discover_codex_projects(&home)
+                        crate::project_discovery::discover_agent_projects()
                     }).await;
                     if this.update(cx, |this, cx| {
                         if let Ok(discovered) = discovered {
                             if this.projects_view.discovered_projects != discovered {
                                 this.projects_view.discovered_projects = discovered;
+                                this.normalize_open_project();
+                                this.projects_view.scan_generation = this.projects_view.scan_generation.wrapping_add(1);
+                                this.projects_view.project_snapshots.borrow_mut().clear();
+                                this.projects_view.project_snapshot_tasks.borrow_mut().clear();
+                                this.projects_view.context_estimates.borrow_mut().clear();
+                                this.projects_view.context_estimate_tasks.borrow_mut().clear();
                                 cx.notify();
                             }
                         }
@@ -550,6 +548,13 @@ impl KitterApp {
                 "Search projects"
             } else {
                 "搜索项目"
+            })
+        });
+        let install_project_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if english {
+                "Search project name or path"
+            } else {
+                "搜索项目名称或路径"
             })
         });
         let tag_name_input = cx.new(|cx| {
@@ -673,6 +678,16 @@ impl KitterApp {
         .detach();
         let project_page_body = page_body.clone();
         cx.subscribe_in(
+            &install_project_search,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.install_flow.project_scroll.set_offset(point(px(0.), px(0.)));
+                    this.notify_dialog(cx);
+                }
+            },
+        ).detach();
+        cx.subscribe_in(
             &project_search,
             window,
             move |_, _, event: &InputEvent, _, cx| {
@@ -716,6 +731,9 @@ impl KitterApp {
                     return;
                 };
                 this.projects_view.open_project = Some(path.clone());
+                if !this.can_install_proma() {
+                    this.install_flow.selected_targets.remove(&InstallTarget::Proma);
+                }
                 this.notify_dialog(cx);
             },
         )
@@ -785,7 +803,14 @@ impl KitterApp {
         } else {
             known_groups.clone()
         };
-        Self {
+        let initial_project = std::env::var_os("KITTER_OPEN_PROJECT")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir());
+        // Seed the prototype's initial view when desktop input is unavailable.
+        // Release builds always use the normal initial agent and group state.
+        let preview_proma = cfg!(debug_assertions)
+            && std::env::var("KITTER_PREVIEW_PROMA").as_deref() == Ok("1");
+        let mut app = Self {
             model: AppModel {
                 library,
                 skills,
@@ -793,7 +818,7 @@ impl KitterApp {
                 updating_skill: None,
             },
             shell: ShellState {
-                page: Page::Skills,
+                page: if initial_project.is_some() { Page::Projects } else { Page::Skills },
                 focus_handle: cx.focus_handle(),
                 header_drag_armed: false,
                 shell_layout,
@@ -820,20 +845,22 @@ impl KitterApp {
                 collapsed_content_directories: HashSet::new(),
             },
             projects_view: ProjectsState {
+                collapsed_skill_sources: if preview_proma { HashSet::from(["builtin".into()]) } else { HashSet::new() },
                 discovered_projects: Vec::new(),
                 discovery_task: None,
-                open_project: None,
-                global_project_view: true,
+                open_project: initial_project.clone(),
+                global_project_view: initial_project.is_none(),
                 batch_project: None,
                 batch_selected: HashSet::new(),
                 batch_filter: None,
                 project_skills_tab: ProjectSkillsTab::Skills,
-                selected_project_agent: None,
+                selected_project_agent: preview_proma.then_some(AgentKind::Proma),
                 project_agents_expanded: false,
                 expanded_project_plugins: HashSet::new(),
                 project_search,
                 project_select,
                 project_snapshots: RefCell::new(BTreeMap::new()),
+                skill_rows_cache: RefCell::new(SkillRowsCache::default()),
                 project_snapshot_tasks: RefCell::new(BTreeMap::new()),
                 context_estimates: RefCell::new(BTreeMap::new()),
                 context_estimate_tasks: RefCell::new(BTreeMap::new()),
@@ -859,6 +886,10 @@ impl KitterApp {
             install_flow: InstallFlowState {
                 modal: false,
                 global: true,
+                selected_projects: BTreeSet::new(),
+                project_picker_open: false,
+                project_search: install_project_search,
+                project_scroll: ScrollHandle::new(),
                 selected_targets: HashSet::new(),
             },
             delete_flow: DeleteFlowState {
@@ -889,15 +920,36 @@ impl KitterApp {
                 delete_skills: false,
                 move_skills: Vec::new(),
             },
+        };
+        if cfg!(debug_assertions)
+            && std::env::var("KITTER_PREVIEW_MULTI_INSTALL").as_deref() == Ok("1") {
+            app.shell.page = Page::Skills;
+            let keys = app.model.skills.iter().filter(|skill| !skill.record.origin.is_builtin()).take(2)
+                .map(|skill| skill_storage_name(skill).to_string()).collect::<Vec<_>>();
+            app.skills_view.selection.replace(&keys);
+            app.install_flow.global = false;
+            app.install_flow.modal = true;
+            app.install_flow.selected_projects = app.model.library.config.project_paths()
+                .into_iter().take(2).collect();
+            app.install_flow.selected_targets = HashSet::from([InstallTarget::Codex, InstallTarget::Proma]);
+            app.open_dialog(DialogKind::Install, cx);
+        }
+        app
+    }
+
+    fn uses_dark_theme(&self) -> bool {
+        match self.model.library.config.theme {
+            Theme::Light => false,
+            Theme::Dark => true,
+            Theme::System => self.shell.system_dark,
         }
     }
 
     fn palette(&self) -> Palette {
-        match self.model.library.config.theme {
-            Theme::Light => Palette::light(),
-            Theme::Dark => Palette::dark(),
-            Theme::System if !self.shell.system_dark => Palette::light(),
-            Theme::System => Palette::dark(),
+        if self.uses_dark_theme() {
+            Palette::dark()
+        } else {
+            Palette::light()
         }
     }
 
@@ -1274,6 +1326,12 @@ impl KitterApp {
                 cx,
             )
         });
+        self.install_flow.project_search.update(cx, |input, cx| {
+            input.set_placeholder(
+                if english { "Search project name or path" } else { "搜索项目名称或路径" },
+                window, cx,
+            )
+        });
         self.tags_flow.name_input.update(cx, |input, cx| {
             input.set_placeholder(if english { "Tag name" } else { "标签名称" }, window, cx)
         });
@@ -1395,7 +1453,7 @@ impl Render for PageBody {
 }
 
 impl Render for KitterApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette();
         let content = self.shell.page_body.clone();
         let mut root = div()
@@ -1523,7 +1581,9 @@ impl Render for KitterApp {
                     .child(
                         div()
                             .w(width)
-                            .max_h(px(680.))
+                            .max_h(if matches!(body.read(cx).kind, DialogKind::Install) {
+                                px((f32::from(window.bounds().size.height) - 40.).max(300.))
+                            } else { px(680.) })
                             .rounded(px(RADIUS_MODAL))
                             .border_1()
                             .border_color(p.border)
@@ -1567,12 +1627,189 @@ mod window_tests {
 
 #[cfg(all(test, feature = "ui-test"))]
 mod e2e_tests {
-    use super::{AddKind, KitterApp, Page};
+    use super::{AddKind, KitterApp, Page, effective_view};
     use gpui::{AppContext, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, point, px};
     use std::fs;
 
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+    }
+
+    #[test]
+    fn multi_project_dialog_installs_only_checked_projects() {
+        use super::InstallTarget;
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let projects = [root.join("000-project-a"), root.join("001-project-b"), root.join("002-project-c")];
+        for project in &projects { fs::create_dir_all(project).unwrap(); }
+        let source = root.join("source/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "---\nname: demo\ndescription: UI install fixture\n---\n").unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data_dir = root.join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            crate::source::scan_local(&source).unwrap()
+                .import_selected(&mut app.model.library, &std::collections::HashSet::from(["demo".into()]), None).unwrap();
+            for project in &projects { app.model.library.config.remember_project(project.clone()); }
+            app.refresh(cx);
+            app.skills_view.selection.replace(&["demo".into()]);
+            app.projects_view.open_project = Some(projects[2].clone());
+            app.projects_view.global_project_view = false;
+            app.open_install_dialog(window, cx);
+        });
+        cx.refresh().unwrap();
+        let picker = cx.debug_bounds("install-project-select").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let clear = cx.debug_bounds("install-projects-clear").unwrap();
+        cx.simulate_click(clear.center(), Modifiers::none());
+        for project in &projects[..2] {
+            let index = cx.read_entity(&app, |app, _| app.project_entries().iter().position(|entry| &entry.path == project).unwrap());
+            let id = Box::leak(format!("install-project-option-{index}").into_boxed_str());
+            let row = cx.debug_bounds(id).unwrap();
+            cx.simulate_click(row.center(), Modifiers::none());
+        }
+        cx.read_entity(&app, |app, _| {
+            assert_eq!(app.install_flow.selected_projects.len(), 2);
+            assert_eq!(app.projects_view.open_project.as_ref(), Some(&projects[2]));
+        });
+        let done = cx.debug_bounds("install-projects-done").unwrap();
+        cx.simulate_click(done.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let target = cx.debug_bounds("target-codex").unwrap();
+        cx.simulate_click(target.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| assert!(app.install_flow.selected_targets.contains(&InstallTarget::Codex)));
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let confirm = cx.debug_bounds("confirm-install").unwrap();
+        cx.simulate_click(confirm.center(), Modifiers::none());
+        cx.run_until_parked();
+        for project in &projects[..2] { assert!(project.join(".codex/skills/demo/SKILL.md").is_file()); }
+        assert!(!projects[2].join(".codex").exists());
+        cx.read_entity(&app, |app, _| assert!(!app.install_flow.modal));
+    }
+
+    #[test]
+    fn multi_project_dialog_search_keeps_selection_across_queries_and_reopen() {
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let alpha = root.join("alpha-search-fixture");
+        let beta = root.join("design-only/beta-search-fixture");
+        let other = root.join("unselected-search-fixture");
+        for project in [&alpha, &beta, &other] { fs::create_dir_all(project).unwrap(); }
+        let (app, cx) = cx.add_window_view({
+            let data_dir = root.join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            for project in [&alpha, &beta, &other] {
+                app.model.library.config.remember_project(project.clone());
+            }
+            app.projects_view.global_project_view = false;
+            app.open_install_dialog(window, cx);
+            app.install_flow.selected_projects.clear();
+        });
+        cx.refresh().unwrap();
+        let picker = cx.debug_bounds("install-project-select").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("install-project-search").is_some());
+        app.update_in(cx, |app, window, cx| {
+            app.install_flow.project_search.update(cx, |input, cx| input.set_value("ALPHA-SEARCH-FIXTURE", window, cx));
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        cx.read_entity(&app, |app, cx| {
+            let matches = app.matching_install_projects(cx);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].path, alpha);
+        });
+        let row = cx.debug_bounds("install-project-option-0").unwrap();
+        cx.simulate_click(row.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| {
+            assert!(app.install_flow.project_picker_open);
+            assert!(app.install_flow.selected_projects.contains(&alpha));
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.install_flow.project_search.update(cx, |input, cx| input.set_value("/design-only/", window, cx));
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        cx.read_entity(&app, |app, cx| assert_eq!(app.matching_install_projects(cx)[0].path, beta));
+        let select = cx.debug_bounds("install-projects-select-all").unwrap();
+        cx.simulate_click(select.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| {
+            assert_eq!(app.install_flow.selected_projects, [alpha.clone(), beta.clone()].into_iter().collect());
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.install_flow.project_search.update(cx, |input, cx| input.set_value("no-matches-search-fixture", window, cx));
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("install-project-option-0").is_none());
+        let done = cx.debug_bounds("install-projects-done").unwrap();
+        cx.simulate_click(done.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("install-project-search").is_none());
+        let picker = cx.debug_bounds("install-project-select").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::none());
+        cx.run_until_parked();
+        app.update_in(cx, |app, window, cx| {
+            app.install_flow.project_search.update(cx, |input, cx| input.set_value("", window, cx));
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        cx.read_entity(&app, |app, cx| {
+            assert_eq!(app.matching_install_projects(cx).len(), 3);
+            assert_eq!(app.install_flow.selected_projects.len(), 2);
+            assert!(!app.install_flow.selected_projects.contains(&other));
+        });
+    }
+
+    #[test]
+    fn multi_project_dialog_preserves_selection_when_switching_scope() {
+        use super::InstallTarget;
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let projects = [root.join("000-a"), root.join("001-b")];
+        for project in &projects { fs::create_dir_all(project).unwrap(); }
+        let (app, cx) = cx.add_window_view({
+            let data_dir = root.join("data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            for project in &projects { app.model.library.config.remember_project(project.clone()); }
+            app.projects_view.global_project_view = false;
+            app.open_install_dialog(window, cx);
+            app.install_flow.selected_projects = projects.iter().cloned().collect();
+            app.install_flow.selected_targets.insert(InstallTarget::Proma);
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        let global = cx.debug_bounds("install-scope-global").unwrap();
+        cx.simulate_click(global.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| {
+            assert!(app.install_flow.global);
+            assert!(!app.install_flow.selected_targets.contains(&InstallTarget::Proma));
+        });
+        let local = cx.debug_bounds("install-scope-projects").unwrap();
+        cx.simulate_click(local.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| {
+            assert!(!app.install_flow.global);
+            assert_eq!(app.install_flow.selected_projects, projects.iter().cloned().collect());
+        });
     }
 
     #[test]
@@ -1736,6 +1973,7 @@ mod e2e_tests {
 
     #[test]
     fn large_project_renders_and_scrolls_with_virtual_rows() {
+        effective_view::reset_path_resolution_count();
         let mut cx = TestAppContext::single();
         init(&mut cx);
         let temp = tempfile::tempdir().unwrap();
@@ -1794,16 +2032,38 @@ mod e2e_tests {
             .debug_bounds("project-skills-virtual-list")
             .expect("virtual project list should be rendered");
         assert_eq!(first_row.size.width, scroll.size.width);
+        assert!(effective_view::path_resolution_count() > 0);
+        effective_view::reset_path_resolution_count();
         // Avoid saturating GPUI's synthetic pixel delta at the exact maximum
         // offset; that test-only edge drops the virtual rows for the frame.
+        let scroll_delta = first_row.size.height * 180. - scroll.size.height * 0.5;
         cx.simulate_event(ScrollWheelEvent {
             position: scroll.center(),
-            delta: ScrollDelta::Pixels(point(px(0.), px(-11_000.))),
+            delta: ScrollDelta::Pixels(point(px(0.), -scroll_delta)),
             ..Default::default()
         });
         cx.run_until_parked();
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_some());
+        assert_eq!(effective_view::path_resolution_count(), 0, "scrolling rebuilt filesystem paths");
+        cx.simulate_event(ScrollWheelEvent {
+            position: scroll.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), scroll_delta)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let header = cx.debug_bounds("project-skill-source-project").unwrap();
+        cx.simulate_click(header.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_none());
+        let header = cx.debug_bounds("project-skill-source-project").unwrap();
+        cx.simulate_click(header.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_some());
+        assert_eq!(effective_view::path_resolution_count(), 0, "group toggles rebuilt filesystem paths");
     }
 
     #[test]

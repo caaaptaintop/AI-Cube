@@ -1975,7 +1975,9 @@ impl KitterApp {
             .flat_map(|snapshot| snapshot.iter())
             .filter(|installed| installed.name == skill.record.name)
             .flat_map(|installed| installed.installations.iter())
-            .filter(|installation| same_file(&installation.path, &skill.path))
+            .filter(|installation| same_file(&installation.path, &skill.path)
+                || (installation.target == InstallTarget::Proma
+                    && crate::proma::is_managed(&installation.path, &skill.path)))
             .cloned()
             .collect()
     }
@@ -2056,6 +2058,13 @@ impl KitterApp {
                 };
                 let project_path = display_path(&path);
                 let installations = self.skill_installations_at(skill, &path, cx);
+                let proma_states = installations.iter()
+                    .filter(|installation| installation.target == InstallTarget::Proma)
+                    .map(|installation| match installation.state.as_deref() {
+                        Some("active") => self.tr("Proma 已启用", "Proma active"),
+                        Some("inactive") => self.tr("Proma 已停用", "Proma inactive"),
+                        _ => self.tr("Proma 状态未知", "Proma unknown state"),
+                    }).collect::<Vec<_>>().join(" / ");
                 let targets = installations
                     .iter()
                     .map(|installation| installation.target)
@@ -2104,6 +2113,10 @@ impl KitterApp {
                                 ),
                         )
                         .child(self.agent_badges(popover_id, &targets, false, cx))
+                        .when(!proma_states.is_empty(), |row| {
+                            row.child(div().ml(px(8.)).text_size(px(12.))
+                                .text_color(p.muted).child(proma_states.clone()))
+                        })
                         .child(
                             self.danger_icon_button(
                                 ElementId::Name(format!("remove-install-project-{index}").into()),

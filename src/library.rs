@@ -70,6 +70,7 @@ pub struct SkillLibrary {
     registry: Registry,
     data_dir: PathBuf,
     disk_revisions: Mutex<[Option<String>; 2]>,
+    proma_sync_warnings: Vec<String>,
 }
 
 impl SkillLibrary {
@@ -229,6 +230,7 @@ impl SkillLibrary {
             registry,
             data_dir,
             disk_revisions,
+            proma_sync_warnings: Vec::new(),
         };
         if changed {
             library.save()?;
@@ -288,6 +290,10 @@ impl SkillLibrary {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn take_proma_sync_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.proma_sync_warnings)
     }
 
     pub fn trigger_mode_by_storage(&self, storage_name: &str) -> TriggerMode {
@@ -465,10 +471,14 @@ impl SkillLibrary {
     }
 
     fn install_count(&self, name: &str, source: &Path) -> usize {
-        self.config
-            .recent_projects
-            .iter()
-            .filter(|project| crate::project::is_installed_any_from_path(project, name, source))
+        let discovered = crate::proma::home()
+            .and_then(|root| crate::project_discovery::discover_proma_projects(&root).ok())
+            .unwrap_or_default();
+        let projects = crate::project_discovery::merge_projects(
+            &self.config.recent_projects, &discovered, &std::collections::BTreeSet::new(),
+        );
+        projects.iter()
+            .filter(|project| crate::project::is_installed_any_from_path(&project.path, name, source))
             .count()
     }
 
@@ -967,6 +977,7 @@ impl SkillLibrary {
         }
         archive_directory(&backup, &self.config.library_dir)?;
         archive_directory(&staging, &self.config.library_dir)?;
+        self.proma_sync_warnings.extend(crate::proma::sync_existing_source(&destination));
         Ok(())
     }
 
@@ -1000,11 +1011,13 @@ impl SkillLibrary {
             })
             .cloned()
             .collect::<Vec<_>>();
-        for project in &self.config.recent_projects {
-            crate::project::uninstall_all_from_path(project, &record.name, &path)?;
+        let home = dirs::home_dir();
+        // Resolve every ambiguous Finder association before removing any entry.
+        for project in self.config.recent_projects.iter().chain(home.iter()) {
+            crate::project::validate_uninstall_all_from_path(project, &record.name, &path)?;
         }
-        if let Some(home) = dirs::home_dir() {
-            crate::project::uninstall_all_from_path(&home, &record.name, &path)?;
+        for project in self.config.recent_projects.iter().chain(home.iter()) {
+            crate::project::uninstall_all_from_path(project, &record.name, &path)?;
         }
         if let Some(adopted) = self.registry.adopted_sources.get(storage_name) {
             for reference in &adopted.references {
@@ -1521,6 +1534,7 @@ mod tests {
             registry,
             data_dir,
             disk_revisions: Mutex::new([None, None]),
+            proma_sync_warnings: Vec::new(),
         };
         let skills = library.list().unwrap();
         assert_eq!(skills[0].record.name, KITTER_SKILL_NAME);
@@ -1576,6 +1590,7 @@ mod tests {
             registry: Registry::default(),
             data_dir: root.join("data"),
             disk_revisions: Mutex::new([None, None]),
+            proma_sync_warnings: Vec::new(),
         };
         (temp, library, home)
     }
@@ -2206,6 +2221,7 @@ mod tests {
             registry: Registry::default(),
             data_dir: temp.path().join("data"),
             disk_revisions: Mutex::new([None, None]),
+            proma_sync_warnings: Vec::new(),
         };
 
         assert_eq!(library.list().unwrap()[0].record.description, "first");

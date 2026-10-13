@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// User-level roots must not be derived from project-relative directories.
 pub fn global_target_root(home: &Path, target: InstallTarget) -> PathBuf {
+    assert_ne!(target, InstallTarget::Proma, "Proma has no global skill target");
     match target {
         InstallTarget::Codex => std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
@@ -62,7 +63,7 @@ pub(crate) fn omp_agent_dir(home: &Path) -> PathBuf {
 }
 
 pub fn installation_root(project: &Path, target: InstallTarget) -> PathBuf {
-    if dirs::home_dir().as_deref() == Some(project) {
+    if target != InstallTarget::Proma && dirs::home_dir().as_deref() == Some(project) {
         global_target_root(project, target)
     } else {
         project.join(target_directory(target))
@@ -79,6 +80,8 @@ pub struct InstallTargetInfo {
 /// Every project directory Kitter can create, in the order used by project
 /// snapshots and the install UI.  `Universal` is the shared compatibility
 /// directory; the remaining entries are provider-specific project roots.
+/// Proma is handled separately, only for registered native workspaces. In
+/// particular, a business repository's plain `skills` is not an Agent root.
 pub const PROJECT_INSTALL_TARGETS: &[InstallTarget] = &[
     InstallTarget::Universal,
     InstallTarget::Codex,
@@ -118,6 +121,11 @@ pub const INDEPENDENT_INSTALL_TARGETS: &[InstallTargetInfo] = &[
         target: InstallTarget::Pi,
         name: "Pi",
         icon_path: "icons/provider-pi.svg",
+    },
+    InstallTargetInfo {
+        target: InstallTarget::Proma,
+        name: "Proma",
+        icon_path: "icons/provider-proma-black.png",
     },
     InstallTargetInfo {
         target: InstallTarget::Omp,
@@ -222,6 +230,14 @@ pub const AGENT_ICON_ORDER: &[AgentIconInfo] = &[
         global_only: false,
     },
     AgentIconInfo {
+        id: "proma",
+        name: "Proma",
+        icon_path: "icons/provider-proma-black.png",
+        install_targets: &[InstallTarget::Proma],
+        shared_agents: false,
+        global_only: false,
+    },
+    AgentIconInfo {
         id: "omp",
         name: "omp",
         icon_path: "icons/provider-omp.svg",
@@ -322,6 +338,7 @@ pub fn target_directory(target: InstallTarget) -> &'static str {
         InstallTarget::Cursor => ".cursor/skills",
         InstallTarget::OpenCode => ".opencode/skills",
         InstallTarget::Pi => ".pi/skills",
+        InstallTarget::Proma => "skills",
         InstallTarget::Omp => ".omp/skills",
         InstallTarget::Grok => ".grok/skills",
         InstallTarget::Antigravity => ".agent/skills",
@@ -348,6 +365,7 @@ mod tests {
                 "cursor",
                 "opencode",
                 "pi",
+                "proma",
                 "omp",
                 "dimagent",
                 "grok",
