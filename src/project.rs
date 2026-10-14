@@ -385,11 +385,13 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
     let mut grouped = BTreeMap::<String, Vec<ProjectSkillInstallation>>::new();
     for workspace in crate::proma::project_workspaces(project).unwrap_or_default() {
         for installation in crate::proma::inspect(&workspace.path)? {
+            let toggleable = installation.can_toggle();
             grouped.entry(installation.name).or_default().push(ProjectSkillInstallation {
                 target: InstallTarget::Proma,
                 path: installation.path,
                 managed: installation.managed,
                 removable: installation.removable,
+                toggleable,
                 bundled: installation.bundled,
                 integration: installation.integration,
                 state: Some(installation.state),
@@ -440,7 +442,7 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                     target,
                     path,
                     managed,
-                    removable: true,
+                    removable: true, toggleable: false,
                     bundled: false,
                     integration: None,
                     state: None,
@@ -585,7 +587,7 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("SKILL.md"), "business fixture").unwrap();
         let installation = ProjectSkillInstallation {
-            target: InstallTarget::Proma, path: path.clone(), managed: true, removable: false, bundled: false, integration: None,
+            target: InstallTarget::Proma, path: path.clone(), managed: true, removable: false, toggleable: false, bundled: false, integration: None,
             state: Some("active".into()), status: Some("current".into()),
         };
         assert!(remove_project_skill(&installation).is_err());
@@ -793,7 +795,7 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
-            removable: true,
+            removable: true, toggleable: false,
             bundled: false,
             integration: None,
             state: None,
@@ -817,7 +819,7 @@ mod tests {
             target: InstallTarget::Universal,
             path: path.clone(),
             managed: false,
-            removable: false,
+            removable: false, toggleable: false,
             bundled: false,
             integration: None,
             state: None,

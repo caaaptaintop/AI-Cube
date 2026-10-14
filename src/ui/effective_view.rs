@@ -131,6 +131,7 @@ impl SkillSourceGroup {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum ProjectSkillListItem {
     Header { group: SkillSourceGroup, count: usize },
     Skill(usize),
@@ -167,6 +168,20 @@ impl EffectiveSkillRow {
 
     pub fn removable_installations(&self) -> Vec<ProjectSkillInstallation> {
         self.direct_installations.iter().filter(|item| item.removable).cloned().collect()
+    }
+
+    pub fn batch_installations(&self, action: super::ProjectBatchAction) -> Vec<ProjectSkillInstallation> {
+        match action {
+            super::ProjectBatchAction::Remove => self.removable_installations(),
+            super::ProjectBatchAction::DisableProma | super::ProjectBatchAction::EnableProma => {
+                let state = if action == super::ProjectBatchAction::EnableProma { "inactive" } else { "active" };
+                self.direct_installations.iter().filter(|item| {
+                    item.target == InstallTarget::Proma
+                        && item.state.as_deref() == Some(state)
+                        && item.toggleable
+                }).cloned().collect()
+            }
+        }
     }
 }
 
@@ -401,7 +416,7 @@ mod tests {
                 scope: SkillScope::Repository, visibility: SkillVisibility::Automatic, source: SkillSource::Filesystem,
             });
             direct.push(ProjectSkill { name, installations: vec![ProjectSkillInstallation {
-                target: InstallTarget::Proma, path: folder, managed: false, removable: false,
+                target: InstallTarget::Proma, path: folder, managed: false, removable: false, toggleable: false,
                 bundled: false, integration: None, state: Some("active".into()), status: Some("unmanaged".into()),
             }] });
         }
@@ -442,7 +457,7 @@ mod tests {
             skills: vec![effective(codex.join("SKILL.md"))],
         }];
         let installation = |target, path| ProjectSkillInstallation {
-            target, path, managed: false, removable: false, bundled: false, integration: None,
+            target, path, managed: false, removable: false, toggleable: false, bundled: false, integration: None,
             state: Some("active".into()), status: Some("external_link".into()),
         };
         let direct = [ProjectSkill { name: "alias".into(), installations: vec![
@@ -458,7 +473,7 @@ mod tests {
     fn row_cache_reuses_rows_and_invalidates_for_scans_refresh_project_and_agent() {
         let key = SkillRowsCacheKey { project: "/project".into(), generation: 1, agent: None, scanned_at: Instant::now() };
         let direct = [ProjectSkill { name: "preset".into(), installations: vec![ProjectSkillInstallation {
-            target: InstallTarget::Proma, path: "/native/skills/preset".into(), managed: false, removable: false,
+            target: InstallTarget::Proma, path: "/native/skills/preset".into(), managed: false, removable: false, toggleable: false,
             bundled: true, integration: None, state: Some("active".into()), status: Some("unmanaged".into()),
         }] }];
         let mut cache = SkillRowsCache::default();
@@ -516,7 +531,7 @@ mod tests {
     fn proma_presets_are_builtin_without_becoming_removable() {
         let direct = [ProjectSkill { name: "preset".into(), installations: vec![ProjectSkillInstallation {
             target: InstallTarget::Proma, path: "/native/skills-inactive/preset".into(),
-            managed: false, removable: false, bundled: true, integration: None,
+            managed: false, removable: false, toggleable: false, bundled: true, integration: None,
             state: Some("inactive".into()), status: Some("unmanaged".into()),
         }] }];
         let rows = skill_rows(&[], &direct, None, Path::new("/business"));
@@ -553,7 +568,7 @@ mod tests {
         let direct = [ProjectSkill {
             name: "mixed".into(), installations: vec![ProjectSkillInstallation {
                 target: InstallTarget::Proma, path: "/native/skills/mixed".into(),
-                managed: false, removable: false, bundled: false, integration: None,
+                managed: false, removable: false, toggleable: false, bundled: false, integration: None,
                 state: Some("active".into()), status: Some("unmanaged".into()),
             }],
         }];
@@ -591,7 +606,7 @@ mod tests {
             target: InstallTarget::Proma,
             path: PathBuf::from(if state == "active" { "/pilot/skills/alpha" } else { "/pilot/skills-inactive/alpha" }),
             managed: true,
-            removable: true,
+            removable: true, toggleable: false,
             bundled: false,
             integration: None,
             state: Some(state.into()),
