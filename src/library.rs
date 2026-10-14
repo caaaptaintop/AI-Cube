@@ -323,15 +323,17 @@ impl SkillLibrary {
         }
         let current = crate::update_protection::snapshot(&path)?;
         let baseline = self.registry.package_baselines.get(storage_name).cloned();
+        let openai_yaml_path = Path::new("agents").join("openai.yaml");
+        let trigger_files = ["SKILL.md", openai_yaml_path.to_str().context("触发文件路径不是 UTF-8")?];
         if !self.record_by_storage(storage_name)?.origin.is_builtin() {
             let base = baseline.as_ref().context("缺少文件基线，无法安全修改技能触发设置")?;
-            for name in ["SKILL.md", "agents/openai.yaml"] {
+            for name in trigger_files {
                 if current.get(name) != base.get(name) {
                     bail!("技能触发文件存在本机修改，未覆盖：{name}");
                 }
             }
         }
-        for name in ["SKILL.md", "agents/openai.yaml"] {
+        for name in trigger_files {
             if current.get(name).is_some_and(|node| !matches!(node, crate::update_protection::Node::File { .. })) {
                 bail!("技能触发文件类型已改变，未覆盖：{name}");
             }
@@ -365,7 +367,7 @@ impl SkillLibrary {
         let expected_trigger = tempfile::tempdir()?;
         rendered.write(expected_trigger.path())?;
         let mut expected_files = crate::update_protection::snapshot(expected_trigger.path())?;
-        for name in ["SKILL.md", "agents/openai.yaml"] {
+        for name in trigger_files {
             if let Some(crate::update_protection::Node::File { mode, .. }) = current.get(name) {
                 if let Some(crate::update_protection::Node::File { mode: expected, .. }) = expected_files.get_mut(name) {
                     *expected = *mode;
@@ -384,13 +386,13 @@ impl SkillLibrary {
                     .insert(storage_name.to_string(), TriggerOverride { mode, source });
             }
             let after = crate::update_protection::snapshot(&path)?;
-            for name in ["SKILL.md", "agents/openai.yaml"] {
+            for name in trigger_files {
                 if after.get(name) != expected_files.get(name) {
                     bail!("触发设置写入期间文件发生修改，已停止登记：{name}");
                 }
             }
             if let Some(base) = self.registry.package_baselines.get_mut(storage_name) {
-                for name in ["SKILL.md", "agents/openai.yaml"] {
+                for name in trigger_files {
                     if let Some(node) = expected_files.get(name) { base.insert(name.into(), node.clone()); }
                     else { base.remove(name); }
                 }
@@ -402,7 +404,7 @@ impl SkillLibrary {
         })();
         if let Err(error) = result {
             let after = crate::update_protection::snapshot(&path)?;
-            if ["SKILL.md", "agents/openai.yaml"].iter().any(|name| {
+            if trigger_files.iter().any(|name| {
                 after.get(*name) != expected_files.get(*name) && after.get(*name) != current.get(*name)
             }) {
                 // Preserve an external edit instead of overwriting it during rollback.

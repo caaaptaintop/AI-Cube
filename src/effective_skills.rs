@@ -3293,6 +3293,7 @@ struct OpenAiPolicy {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn linked_project_scans_proma_native_skills_and_codex_business_skills() {
         let temp = tempfile::tempdir().unwrap();

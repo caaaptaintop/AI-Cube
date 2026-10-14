@@ -569,7 +569,9 @@ mod tests {
         assert_eq!(report.installed, 3);
         assert_eq!(report.installed_projects.len(), 2);
         assert_eq!(report.failures.len(), 1);
-        assert!(report.failures[0].contains(second.to_str().unwrap()));
+        assert!(report.failures[0].contains(
+            &crate::project_discovery::path_identity(&second).display().to_string()
+        ));
         assert!(report.failures[0].contains("Codex"));
         assert_eq!(fs::read_to_string(conflict.join("SKILL.md")).unwrap(), "User-owned skill");
         assert_eq!(fs::read_to_string(fixture.source.join("SKILL.md")).unwrap(), "# Example");

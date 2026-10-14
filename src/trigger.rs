@@ -68,6 +68,7 @@ impl TriggerSource {
         let directory = crate::package_fs::Directory::open(root)?;
         directory.write(Path::new("SKILL.md"), self.skill_md.as_bytes())?;
         if let Some(content) = &self.openai_yaml {
+            directory.mkdir(Path::new("agents"))?;
             directory.write(Path::new("agents/openai.yaml"), content.as_bytes())?;
         } else {
             match directory.read(Path::new("agents/openai.yaml")) {
@@ -158,6 +159,19 @@ mod tests {
             openai["policy"]["allow_implicit_invocation"],
             Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn trigger_write_creates_nested_config_and_follow_removes_generated_yaml() {
+        let root = tempfile::tempdir().unwrap();
+        let original = TriggerSource { skill_md: "Body\n".into(), openai_yaml: None };
+        let manual = original.render(TriggerMode::Manual).unwrap();
+        manual.write(root.path()).unwrap();
+        assert_eq!(TriggerSource::read(root.path()).unwrap(), manual);
+        assert!(root.path().join("agents/openai.yaml").is_file());
+        original.write(root.path()).unwrap();
+        assert_eq!(TriggerSource::read(root.path()).unwrap(), original);
+        assert!(!root.path().join("agents/openai.yaml").exists());
     }
 
     #[test]
