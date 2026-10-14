@@ -223,6 +223,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn proma_discovery_groups_by_business_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -257,6 +258,7 @@ mod tests {
         assert_eq!(projects[0].agents, [AgentKind::Codex]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn linked_proma_and_codex_merge_manual_native_alias_and_hidden_identity() {
         let temp = tempfile::tempdir().unwrap();
@@ -284,6 +286,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn unlinked_or_invalid_business_roots_keep_distinct_native_workspaces() {
         let temp = tempfile::tempdir().unwrap();
@@ -302,6 +305,23 @@ mod tests {
         let merged = merge_projects(&[], &discovered, &BTreeSet::new());
         assert_eq!(merged.len(), 3);
         assert!(merged.iter().all(|entry| entry.path == entry.proma_workspaces[0]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proma_discovery_rejects_unsupported_platform_without_changing_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = temp.path().join("agent-workspaces/pilot");
+        std::fs::create_dir_all(&native).unwrap();
+        let catalog = temp.path().join("agent-workspaces.json");
+        let bytes = serde_json::to_vec(&json!({"version": 2, "workspaces": [
+            {"id": "pilot", "slug": "pilot", "name": "Pilot"}
+        ]})).unwrap();
+        std::fs::write(&catalog, &bytes).unwrap();
+        let error = discover_proma_projects(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("此平台尚未支持 Proma 受管写入"));
+        assert_eq!(std::fs::read(&catalog).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(native).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
