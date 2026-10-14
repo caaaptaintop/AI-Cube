@@ -54,7 +54,7 @@ impl KitterApp {
                     .mb(px(7.))
                     .text_size(px(14.))
                     .text_color(p.muted)
-                    .child(self.tr("安装到", "Install to")),
+                    .child(self.tr("生效范围", "Scope")),
             )
             .child(project_picker)
             .child(
@@ -63,9 +63,10 @@ impl KitterApp {
                     .mb(px(7.))
                     .text_size(px(13.))
                     .text_color(p.secondary)
-                    .child(self.tr("安装位置", "Install location")),
+                    .child(self.tr("技能目录", "Skill directories")),
             )
-            .child(self.target_group(cx));
+            .child(self.target_group(cx))
+            .child(self.install_destination_preview());
         let panel = div()
             .relative()
             .bg(p.elevated)
@@ -227,12 +228,126 @@ impl KitterApp {
             .child(self.bordered_icon_button("modal-browse", "icons/folder.svg", p.text, cx)
                 .on_mouse_down(MouseButton::Left,
                     cx.listener(|this, _, window, cx| this.browse_project(window, cx)))));
-        if count > 0 && self.install_flow.selected_targets.contains(&InstallTarget::Proma) && !self.can_install_proma() {
-            body = body.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.danger)
-                .child(self.tr("所选项目需各自关联一个 Proma 工作区；请调整项目或取消 Proma。",
-                    "Each selected project needs one Proma workspace. Adjust projects or deselect Proma.")));
+        body.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.muted)
+            .whitespace_normal()
+            .child(self.tr("可直接选择本地项目文件夹；Proma 需关联自己的工作区。",
+                "Choose local project folders directly; Proma needs a linked workspace.")))
+    }
+
+    fn install_destination_preview(&self) -> Div {
+        let p = self.palette();
+        let global = self.install_flow.global;
+        let projects = if global {
+            dirs::home_dir().into_iter().collect::<Vec<_>>()
+        } else {
+            self.install_flow.selected_projects.iter().cloned().collect::<Vec<_>>()
+        };
+        if projects.is_empty() {
+            return div();
         }
-        body
+        let project_count = projects.len();
+        let entries = self.project_entries();
+        let selected = self.selected_skill_keys();
+        let skill_name = (selected.len() == 1).then(|| {
+            self.model.skills.iter()
+                .find(|skill| selected.iter().any(|key| key == skill_storage_name(skill)))
+                .map(|skill| skill.record.name.clone())
+        }).flatten();
+        let targets = crate::agents::PROJECT_INSTALL_TARGETS.iter().copied()
+            .chain(std::iter::once(InstallTarget::Proma))
+            .filter(|target| self.install_flow.selected_targets.contains(target))
+            .collect::<Vec<_>>();
+        let mut rows = div().id("install-destination-list")
+            .max_h(px(180.)).overflow_y_scroll().flex().flex_col();
+        for (index, project) in projects.into_iter().enumerate() {
+            let name = if global {
+                self.tr("用户级 · 所有项目", "User-level · all projects").to_string()
+            } else {
+                entries.iter().find(|entry| entry.path == project)
+                    .map(|entry| entry.name.clone())
+                    .unwrap_or_else(|| project.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            };
+            let workspace = (!global).then(|| crate::proma::installation_workspace(&project));
+            let mut row = div().px(px(12.)).py(px(9.)).flex().flex_col().gap(px(5.))
+                .when(index > 0, |row| row.border_t_1().border_color(p.border))
+                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(name));
+            if targets.is_empty() {
+                row = row.child(div().font_family(MONO).text_size(px(11.))
+                    .text_color(p.muted).whitespace_normal().child(project.display().to_string()));
+            }
+            for target in &targets {
+                let directory = if *target == InstallTarget::Proma {
+                    workspace.as_ref().and_then(|result| result.as_ref().ok())
+                        .map(|workspace| workspace.path.join("skills"))
+                } else if global {
+                    Some(crate::agents::global_target_root(&project, *target))
+                } else {
+                    Some(crate::agents::installation_root(&project, *target))
+                };
+                let Some(mut path) = directory else { continue; };
+                if let Some(name) = &skill_name {
+                    path.push(name);
+                }
+                let label = if *target == InstallTarget::Universal {
+                    self.tr("共享目录", "Shared directory")
+                } else {
+                    crate::agents::INDEPENDENT_INSTALL_TARGETS.iter()
+                        .find(|info| info.target == *target).map(|info| info.name).unwrap_or_default()
+                };
+                row = row.child(div().flex().flex_col().gap(px(2.))
+                    .child(div().text_size(px(11.)).text_color(p.secondary).child(label))
+                    .child(div().font_family(MONO).text_size(px(11.))
+                        .text_color(p.muted).whitespace_normal().child(path.display().to_string())));
+            }
+            if let Some(Err(_)) = workspace {
+                let reason = match crate::proma::project_workspaces(&project) {
+                    Ok(workspaces) if workspaces.is_empty() => {
+                        self.tr("未关联工作区", "No workspace linked").to_string()
+                    }
+                    Ok(workspaces) if workspaces.len() > 1 => {
+                        if self.uses_english() {
+                            format!("{} workspaces linked; one installation workspace must be specified", workspaces.len())
+                        } else {
+                            format!("关联 {} 个工作区，需要明确安装工作区", workspaces.len())
+                        }
+                    }
+                    _ => self.tr("无法读取或确认工作区", "Cannot read or resolve the workspace").to_string(),
+                };
+                let message = if self.uses_english() {
+                    format!("Proma unavailable: {reason}")
+                } else {
+                    format!("Proma 暂不可选：{reason}")
+                };
+                row = row.child(div().text_size(px(11.)).whitespace_normal()
+                    .text_color(if self.install_flow.selected_targets.contains(&InstallTarget::Proma) {
+                        p.danger
+                    } else {
+                        p.muted
+                    }).child(message));
+            }
+            rows = rows.child(row);
+        }
+        div().mt(px(14.))
+            .child(div().mb(px(7.)).text_size(px(12.)).text_color(p.secondary)
+                .child(if global {
+                    self.tr("实际安装位置 · 用户级", "Actual destinations · user-level").to_string()
+                } else if self.uses_english() {
+                    format!("Actual destinations · {project_count} projects")
+                } else {
+                    format!("实际安装位置 · {project_count} 个项目")
+                }))
+            .child(div().rounded(px(RADIUS_CONTROL)).border_1().border_color(p.border)
+                .bg(p.surface).overflow_hidden().child(rows))
+            .child(div().mt(px(5.)).text_size(px(11.)).text_color(p.muted).whitespace_normal()
+                .child(if targets.is_empty() {
+                    self.tr("选择上方的技能目录后，这里会显示将写入的完整路径。",
+                        "Choose skill directories above to see the full destination paths.")
+                } else if selected.len() > 1 {
+                    self.tr("每个技能会在这些目录下各占一个子目录。",
+                        "Each skill gets its own subdirectory in these locations.")
+                } else {
+                    self.tr("仅安装到以上位置。", "Installs only to the locations above.")
+                }))
     }
 
     pub(super) fn matching_install_projects(&self, cx: &App) -> Vec<crate::project_discovery::ProjectEntry> {
@@ -347,66 +462,14 @@ impl KitterApp {
             .install_flow
             .selected_targets
             .contains(&InstallTarget::Universal);
-        let agent_cell = |name: &'static str, icon_path: &'static str, right_border: bool| {
-            div()
-                .h(px(48.))
-                // Keep the three-column grid stable when the final row has
-                // fewer than three Agents.
-                .flex_basis(relative(1. / 3.))
-                .flex_shrink_0()
-                .px(px(11.))
-                .border_t_1()
-                .border_color(p.border)
-                .when(right_border, |cell| {
-                    cell.border_r_1().border_color(p.border)
-                })
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .size(px(28.))
-                        .rounded(px(RADIUS_CONTROL))
-                        .bg(if icon_path == "icons/provider-codex.svg" {
-                            rgba(0x00000000)
-                        } else {
-                            p.raised
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Self::brand_icon(
-                            icon_path,
-                            18.,
-                            p.text,
-                            self.uses_dark_theme(),
-                        )),
-                )
-                .child(div().text_size(px(12.)).text_color(p.secondary).child(name))
-        };
-        let universal_agents = crate::agents::AGENT_ICON_ORDER
-            .iter()
+        let compatible_agents = crate::agents::AGENT_ICON_ORDER.iter()
             .filter(|agent| !agent.global_only && agent.supports_target(InstallTarget::Universal))
-            .collect::<Vec<_>>();
-        let mut universal_rows = div().flex().flex_col();
-        for chunk in universal_agents.chunks(3) {
-            let mut row = div().flex();
-            for (index, agent) in chunk.iter().enumerate() {
-                row = row.child(agent_cell(agent.name, agent.icon_path, index % 3 < 2));
-            }
-            for index in chunk.len()..3 {
-                row = row.child(
-                    div()
-                        .h(px(48.))
-                        .flex_basis(relative(1. / 3.))
-                        .flex_shrink_0()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .when(index < 2, |cell| cell.border_r_1().border_color(p.border)),
-                );
-            }
-            universal_rows = universal_rows.child(row);
-        }
+            .map(|agent| agent.name).collect::<Vec<_>>().join(" · ");
+        let compatible_label = if self.uses_english() {
+            format!("Compatible: {compatible_agents}")
+        } else {
+            format!("兼容：{compatible_agents}")
+        };
         let universal_box = div()
             .rounded(px(RADIUS_CARD))
             .border_1()
@@ -432,7 +495,7 @@ impl KitterApp {
                             .ml(px(9.))
                             .text_size(px(14.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(self.tr("通用", "Universal")),
+                            .child(self.tr("共享目录", "Shared directory")),
                     )
                     .child(div().flex_1())
                     .child(
@@ -443,7 +506,7 @@ impl KitterApp {
                             .child(if self.install_flow.global {
                                 "~/.agents/skills"
                             } else {
-                                ".agents/skills"
+                                self.tr("项目目录/.agents/skills", "project/.agents/skills")
                             }),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -451,7 +514,8 @@ impl KitterApp {
                         this.notify_dialog(cx);
                     })),
             )
-            .when(universal, |card| card.child(universal_rows));
+            .child(div().px(px(13.)).pb(px(10.)).text_size(px(11.))
+                .text_color(p.muted).whitespace_normal().child(compatible_label));
         let mut independent_rows = div().flex().flex_wrap();
         for info in crate::agents::INDEPENDENT_INSTALL_TARGETS {
             if info.target == InstallTarget::Proma && self.install_flow.global {
@@ -474,9 +538,13 @@ impl KitterApp {
                     .items_center()
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(self.tr("独立安装", "Agent-specific")),
+                    .child(self.tr("Agent 专用目录", "Agent directories")),
             )
-            .child(independent_rows);
+            .child(independent_rows)
+            .child(div().px(px(13.)).py(px(9.)).border_t_1().border_color(p.border)
+                .text_size(px(11.)).text_color(p.muted).whitespace_normal()
+                .child(self.tr("已使用共享目录时，兼容的 Agent 通常无需重复选择。",
+                    "With a shared directory, compatible Agents usually need no extra selection.")));
         div().child(universal_box).child(independent_box)
     }
 
@@ -501,6 +569,7 @@ impl KitterApp {
             InstallTarget::Universal => "target-universal",
         };
         let active = self.install_flow.selected_targets.contains(&info.target);
+        let available = info.target != InstallTarget::Proma || self.can_install_proma();
         let is_last = crate::agents::INDEPENDENT_INSTALL_TARGETS
             .last()
             .is_some_and(|last| last.target == info.target);
@@ -511,6 +580,7 @@ impl KitterApp {
             .border_t_1()
             .border_color(p.border)
             .bg(if active { p.selected } else { p.surface })
+            .when(!available, |row| row.opacity(0.55))
             .when(is_last, |row| {
                 row.rounded_bl(px(RADIUS_CARD - 1.))
                     .rounded_br(px(RADIUS_CARD - 1.))
@@ -553,7 +623,11 @@ impl KitterApp {
                             })
                             .unwrap_or_default()
                     } else if info.target == InstallTarget::Proma && !self.can_install_proma() {
-                        self.tr("所选项目需关联唯一工作区", "Selected projects need one workspace each").to_string()
+                        if self.install_flow.selected_projects.is_empty() {
+                            self.tr("先选择项目", "Choose projects").to_string()
+                        } else {
+                            self.tr("见下方说明", "See details below").to_string()
+                        }
                     } else {
                         crate::agents::target_directory(info.target).to_string()
                     }),
