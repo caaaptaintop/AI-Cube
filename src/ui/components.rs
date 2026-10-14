@@ -43,9 +43,9 @@ impl KitterApp {
         let color = color.into();
         if path == "icons/provider-proma-black.png" {
             img(if dark {
-                "icons/provider-proma-black.png"
-            } else {
                 "icons/provider-proma-white.png"
+            } else {
+                "icons/provider-proma-black.png"
             })
             .size(px(size))
             .flex_none()
