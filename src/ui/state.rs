@@ -25,6 +25,8 @@ pub(super) struct AppModel {
     pub skills: Vec<SkillSummary>,
     pub update_check: Option<source::UpdateCheckProgress>,
     pub updating_skill: Option<String>,
+    pub proma_sync_task: Option<gpui::Task<()>>,
+    pub proma_sync_warnings: Vec<String>,
 }
 
 pub(super) struct ShellState {
@@ -56,10 +58,58 @@ pub(super) struct SkillsState {
     pub collapsed_content_directories: HashSet<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ProjectAgentFilterOption {
+    All,
+    Agent(AgentKind),
+    Unmarked,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ProjectAgentFilter {
+    pub agents: Vec<AgentKind>,
+    pub unmarked: bool,
+}
+
+impl ProjectAgentFilter {
+    pub(super) fn is_all(&self) -> bool {
+        self.agents.is_empty() && !self.unmarked
+    }
+
+    pub(super) fn selected(&self, option: ProjectAgentFilterOption) -> bool {
+        match option {
+            ProjectAgentFilterOption::All => self.is_all(),
+            ProjectAgentFilterOption::Agent(agent) => self.agents.contains(&agent),
+            ProjectAgentFilterOption::Unmarked => self.unmarked,
+        }
+    }
+
+    pub(super) fn toggle(&mut self, option: ProjectAgentFilterOption) {
+        match option {
+            ProjectAgentFilterOption::All => *self = Self::default(),
+            ProjectAgentFilterOption::Agent(agent) => {
+                if self.agents.contains(&agent) {
+                    self.agents.retain(|selected| *selected != agent);
+                } else {
+                    self.agents.push(agent);
+                }
+            }
+            ProjectAgentFilterOption::Unmarked => self.unmarked = !self.unmarked,
+        }
+    }
+
+    pub(super) fn matches(&self, entry: &crate::project_discovery::ProjectEntry) -> bool {
+        self.is_all()
+            || (self.unmarked && entry.agents.is_empty())
+            || self.agents.iter().any(|agent| entry.agents.contains(agent))
+    }
+}
+
 pub(super) struct ProjectsState {
     pub discovered_projects: Vec<crate::project_discovery::ProjectEntry>,
     pub discovery_task: Option<gpui::Task<()>>,
     pub open_project: Option<PathBuf>,
+    pub proma_directory_menu: Option<(gpui::Point<gpui::Pixels>, Entity<gpui_component::menu::PopupMenu>)>,
     pub global_project_view: bool,
     pub batch_project: Option<PathBuf>,
     pub batch_selected: HashSet<String>,
@@ -71,6 +121,7 @@ pub(super) struct ProjectsState {
     pub expanded_project_plugins: HashSet<String>,
     pub collapsed_skill_sources: HashSet<String>,
     pub project_search: Entity<InputState>,
+    pub project_agent_filter: ProjectAgentFilter,
     pub project_select: Entity<SelectState<Vec<ProjectChoice>>>,
     pub project_snapshots: RefCell<BTreeMap<PathBuf, Vec<ProjectSkill>>>,
     pub skill_rows_cache: RefCell<super::SkillRowsCache>,

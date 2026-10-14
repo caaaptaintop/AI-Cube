@@ -53,6 +53,7 @@ mod motion;
 mod organize_flows;
 mod overlay_actions;
 mod project_actions;
+mod proma_sync;
 mod projects_page;
 mod selectable_text;
 mod selection_actions;
@@ -512,6 +513,7 @@ impl KitterApp {
                 }
             }));
         }
+        app.start_local_proma_sync(cx);
         app
     }
 
@@ -823,6 +825,8 @@ impl KitterApp {
                 skills,
                 update_check: None,
                 updating_skill: None,
+                proma_sync_task: None,
+                proma_sync_warnings: Vec::new(),
             },
             shell: ShellState {
                 page: if initial_project.is_some() { Page::Projects } else { Page::Skills },
@@ -852,6 +856,7 @@ impl KitterApp {
                 collapsed_content_directories: HashSet::new(),
             },
             projects_view: ProjectsState {
+                proma_directory_menu: None,
                 collapsed_skill_sources: if preview_proma { HashSet::from(["builtin".into()]) } else { HashSet::new() },
                 discovered_projects: Vec::new(),
                 discovery_task: None,
@@ -866,6 +871,7 @@ impl KitterApp {
                 project_agents_expanded: false,
                 expanded_project_plugins: HashSet::new(),
                 project_search,
+                project_agent_filter: ProjectAgentFilter::default(),
                 project_select,
                 project_snapshots: RefCell::new(BTreeMap::new()),
                 skill_rows_cache: RefCell::new(SkillRowsCache::default()),
@@ -1564,6 +1570,13 @@ impl Render for KitterApp {
                 }
             }
             root = root.child(card);
+        }
+        if let Some((position, menu)) = &self.projects_view.proma_directory_menu {
+            root = root.child(deferred(anchored()
+                .position(*position)
+                .snap_to_window_with_margin(px(8.))
+                .child(menu.clone()))
+                .with_priority(gpui_base::POPUP_PRIORITY));
         }
         if let Some(body) = self.shell.dialog_body.clone() {
             let width = match body.read(cx).kind {

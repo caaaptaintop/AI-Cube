@@ -153,15 +153,6 @@ impl KitterApp {
         }
     }
 
-    fn skill_origin_badge(&self, origin: SkillOrigin, global: bool) -> Div {
-        let p = self.palette();
-        let label = self.skill_origin_label(origin, global);
-        div().ml(px(8.)).px(px(7.)).h(px(20.)).rounded(px(7.5))
-            .bg(p.raised).flex().flex_none().items_center().text_size(px(11.))
-            .text_color(if origin == SkillOrigin::Project { p.accent } else { p.muted })
-            .child(label)
-    }
-
     fn project_skill_group_header(
         &self, group: SkillSourceGroup, count: usize, cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -592,6 +583,160 @@ impl KitterApp {
             )
     }
 
+    fn proma_installation_status(
+        &self,
+        name: &str,
+        installations: &[ProjectSkillInstallation],
+    ) -> Option<Popover> {
+        let p = self.palette();
+        let mut seen = HashSet::new();
+        let mut copies = installations
+            .iter()
+            .filter(|copy| copy.target == InstallTarget::Proma)
+            .filter(|copy| seen.insert(project::installation_key(&copy.path)))
+            .collect::<Vec<_>>();
+        if copies.is_empty() {
+            return None;
+        }
+        let workspace_count = copies.iter()
+            .filter_map(|copy| copy.path.parent().and_then(Path::parent))
+            .collect::<HashSet<_>>()
+            .len();
+        copies.sort_by_key(|copy| match copy.status.as_deref() {
+            Some("modified") => 0,
+            Some("update_pending") => 1,
+            _ => 2,
+        });
+        let state_label = |copy: &ProjectSkillInstallation| match copy.state.as_deref() {
+            Some("active") => self.tr("已启用", "Active"),
+            Some("inactive") => self.tr("已停用", "Inactive"),
+            _ => self.tr("状态未知", "Unknown state"),
+        };
+        let status_label = |copy: &ProjectSkillInstallation| match copy.status.as_deref() {
+            _ if copy.bundled => self.tr("预设副本", "Bundled copy").to_string(),
+            _ if copy.integration.is_some() => copy.integration.clone().unwrap_or_default(),
+            Some("current") => self.tr("最新", "Current").to_string(),
+            Some("update_pending") => self.tr("待同步", "Update pending").to_string(),
+            Some("modified") => self.tr("副本已修改", "Modified").to_string(),
+            Some("external_link") => self.tr("外部链接", "External link").to_string(),
+            Some("unmanaged") => self.tr("未托管", "Unmanaged").to_string(),
+            _ => self.tr("待核验", "Unverified").to_string(),
+        };
+        let mut issues = Vec::new();
+        for (status, label) in [
+            ("modified", self.tr("副本已修改", "modified")),
+            ("update_pending", self.tr("待同步", "pending update")),
+        ] {
+            let count = copies
+                .iter()
+                .filter(|copy| copy.status.as_deref() == Some(status))
+                .count();
+            if count > 0 {
+                issues.push(if copies.len() == 1 { label.to_string() } else { format!("{label} {count}") });
+            }
+        }
+        let unverified = copies
+            .iter()
+            .filter(|copy| {
+                !copy.bundled && copy.integration.is_none() && !matches!(
+                    copy.status.as_deref(),
+                    Some("current" | "modified" | "update_pending" | "external_link" | "unmanaged")
+                )
+            })
+            .count();
+        if unverified > 0 {
+            issues.push(format!("{} {unverified}", self.tr("待核验", "unverified")));
+        }
+        let has_issues = !issues.is_empty();
+        let activation = if copies.len() == 1 {
+            state_label(copies[0]).to_string()
+        } else if workspace_count > 1 {
+            if self.uses_english() { format!("{workspace_count} workspaces") }
+            else { format!("{workspace_count} 个工作区") }
+        } else if self.uses_english() {
+            format!("{} copies", copies.len())
+        } else {
+            format!("{} 份副本", copies.len())
+        };
+        let label = if has_issues {
+            format!("Proma {}", issues.join(" · "))
+        } else if copies.len() == 1 {
+            format!("Proma {activation} · {}", status_label(copies[0]))
+        } else {
+            format!("Proma · {activation}")
+        };
+        let details = copies.iter().map(|copy| {
+            let reason = match copy.status.as_deref() {
+                _ if copy.bundled => self.tr("Proma 内置预设，可在批量管理中启用或停用。", "Proma preset; enable or disable it in batch management."),
+                _ if copy.integration.is_some() => self.tr("此副本由集成维护，不参与本地技能自动同步。", "Managed by an integration; excluded from local skill auto-sync."),
+                Some("modified") => self.tr("副本已自行修改，现有内容已保留；自动同步不会覆盖。", "This copy has local changes. Its contents are preserved and auto-sync will not overwrite them."),
+                Some("update_pending") => self.tr("副本与来源不同。已登记的本地技能会在内容稳定后自动同步；同步遇到冲突时保留现有副本。", "This copy differs from its source. Registered local skills sync after edits settle; conflicts preserve the existing copy."),
+                Some("external_link") => self.tr("此目录是外部链接，不参与实体镜像自动同步。", "This directory is an external link; excluded from mirror auto-sync."),
+                Some("unmanaged") => self.tr("此副本未由 Kitter 托管，不参与本地技能自动同步。", "This copy is not managed by Kitter; excluded from local skill auto-sync."),
+                Some("current") if copy.state.as_deref() == Some("inactive") => self.tr("副本与来源一致，文件保留在停用目录。", "Matches its source and remains in the inactive directory."),
+                Some("current") => self.tr("副本与来源一致。", "This copy matches its source."),
+                _ => self.tr("尚未核验副本状态，现有内容已保留。", "Copy status is unverified; its existing contents are preserved."),
+            };
+            (copy.path.clone(), format!("{} · {}", state_label(copy), status_label(copy)), reason.to_string(), matches!(copy.status.as_deref(), Some("modified" | "update_pending")))
+        }).collect::<Vec<_>>();
+        let title = format!("Proma · {name}");
+        let multiple = workspace_count > 1;
+        let scope = if copies.len() == 1 {
+            self.tr("当前工作区的技能副本", "Skill copy in this workspace").to_string()
+        } else if !multiple {
+            if self.uses_english() { format!("{} copies in this workspace", copies.len()) }
+            else { format!("当前工作区的 {} 份同名副本", copies.len()) }
+        } else if self.uses_english() {
+            format!("Copies in {workspace_count} Proma workspaces linked to this project")
+        } else {
+            format!("此项目关联的 {workspace_count} 个 Proma 工作区")
+        };
+        let separate_states = self.tr("启停状态分别作用于各工作区。", "Activation applies separately in each workspace.").to_string();
+        let workspace_label = self.tr("工作区", "Workspace").to_string();
+        let close = self.tr("关闭详情", "Close details").to_string();
+        Some(Popover::new(ElementId::Name(format!("proma-status-{name}").into()))
+            .appearance(false).anchor(Anchor::TopLeft)
+            .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{name}").into()))
+                .accessibility_label(format!("{name} · {label} · {}", self.tr("查看详情", "View details")))
+                .h(px(20.)).ml(px(8.)).px(px(6.)).rounded(px(7.5)).flex().items_center().gap(px(5.))
+                .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(11.))
+                .text_color(if has_issues { p.warning } else { p.muted })
+                .bg(if has_issues { p.raised } else { rgba(0x00000000) })
+                .hover(move |button| button.bg(p.hover))
+                .styles(|styles| styles.selected(|style| style.bg(p.selected)))
+                .child(label)
+                .when(has_issues, |button| button.child(div().text_color(p.muted).child(format!("· {activation}"))))
+                .child(Self::icon("icons/chevron-down.svg", 10., p.muted)))
+            .content(move |_, _, popover_cx| {
+                let workspaces = crate::proma::home().and_then(|root| crate::proma::workspaces(&root).ok()).unwrap_or_default();
+                let mut list = div().id("proma-status-workspaces").max_h(px(300.)).overflow_y_scroll();
+                for (path, status, reason, warning) in &details {
+                    let workspace_path = path.parent().and_then(Path::parent);
+                    let workspace = workspaces.iter().find(|workspace| Some(workspace.path.as_path()) == workspace_path)
+                        .map(|workspace| workspace.name.clone())
+                        .unwrap_or_else(|| workspace_path.and_then(Path::file_name).unwrap_or_default().to_string_lossy().into_owned());
+                    let directory = path.parent().and_then(Path::file_name).unwrap_or_default().to_string_lossy();
+                    list = list.child(div().py(px(10.)).border_b_1().border_color(p.border)
+                        .child(div().flex().items_center().gap(px(8.))
+                            .child(div().min_w_0().flex_1().truncate().text_size(px(12.)).text_color(p.text).child(format!("{workspace_label} · {workspace}")))
+                            .child(div().text_size(px(11.)).text_color(if *warning { p.warning } else { p.muted }).child(status.clone())))
+                        .child(div().mt(px(5.)).text_size(px(12.)).line_height(relative(1.5)).text_color(p.secondary).child(reason.clone()))
+                        .child(div().mt(px(5.)).font_family(MONO).text_size(px(11.)).text_color(p.muted).child(format!("{workspace}/{directory}/{name}", workspace = workspace_path.and_then(Path::file_name).unwrap_or_default().to_string_lossy(), name = path.file_name().unwrap_or_default().to_string_lossy()))));
+                }
+                div().w(px(420.)).p(px(14.)).rounded(px(RADIUS_MENU)).border_1().border_color(p.border)
+                    .bg(p.elevated).shadow_lg().flex().flex_col().gap(px(8.))
+                    .child(div().flex().items_center()
+                        .child(div().min_w_0().flex_1().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(title.clone()))
+                        .child(gpui_base::Button::new("close-proma-status").accessibility_label(close.clone())
+                            .size(px(24.)).rounded(px(RADIUS_CONTROL)).flex().items_center().justify_center()
+                            .hover(move |button| button.bg(p.hover)).child(Self::icon("icons/x.svg", 13., p.muted))
+                            .on_click(popover_cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))))
+                    .child(div().text_size(px(11.)).text_color(p.muted).child(scope.clone()))
+                    .when(multiple, |panel| panel.child(div().text_size(px(11.)).text_color(p.secondary).child(separate_states.clone())))
+                    .child(list)
+            }))
+    }
+
     fn project_skill_row(
         &self,
         effective: &EffectiveSkillRow,
@@ -612,26 +757,7 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
-        let proma_states = effective.direct_installations.iter()
-            .filter(|installation| installation.target == InstallTarget::Proma)
-            .map(|installation| {
-                let state = match installation.state.as_deref() {
-                    Some("active") => self.tr("已启用", "Active"),
-                    Some("inactive") => self.tr("已停用", "Inactive"),
-                    _ => self.tr("状态未知", "Unknown state"),
-                };
-                let status = match installation.status.as_deref() {
-                    _ if installation.bundled => self.tr("预设副本", "Bundled copy"),
-                    _ if installation.integration.is_some() => installation.integration.as_deref().unwrap_or_default(),
-                    Some("current") => self.tr("最新", "Current"),
-                    Some("update_pending") => self.tr("可同步", "Update pending"),
-                    Some("modified") => self.tr("副本已修改", "Modified"),
-                    Some("external_link") => self.tr("外部链接", "External link"),
-                    Some("unmanaged") => self.tr("未受管", "Unmanaged"),
-                    _ => self.tr("待核验", "Unverified"),
-                };
-                format!("Proma {state} · {status}")
-            }).collect::<Vec<_>>().join(" / ");
+        let proma_status = self.proma_installation_status(&effective.name, &effective.direct_installations);
         let name = effective.name.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {
@@ -731,13 +857,7 @@ impl KitterApp {
                             .when(managed, |title| {
                                 title.child(self.managed_skill_badge().ml(px(8.)))
                             })
-                            .children(effective.origins.iter().map(|origin| {
-                                self.skill_origin_badge(*origin, self.projects_view.global_project_view)
-                            }))
-                            .when(!proma_states.is_empty(), |title| {
-                                title.child(div().ml(px(8.)).text_size(px(11.))
-                                    .text_color(p.muted).child(proma_states.clone()))
-                            }),
+                            .when_some(proma_status, |title, status| title.child(status)),
                     )
                     .child(
                         div()
@@ -795,6 +915,164 @@ impl KitterApp {
         row.into_any_element()
     }
 
+    fn project_agent_filter_control(
+        &self,
+        entries: &[crate::project_discovery::ProjectEntry],
+        matching: &[crate::project_discovery::ProjectEntry],
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let p = self.palette();
+        let dark = self.uses_dark_theme();
+        let selected = &self.projects_view.project_agent_filter;
+        let all_label = self.tr("全部 Agent", "All agents").to_string();
+        let unmarked_label = self.tr("未标注 Agent", "Unmarked agent").to_string();
+        let selected_count = selected.agents.len() + usize::from(selected.unmarked);
+        let label = if selected.is_all() {
+            all_label.clone()
+        } else if selected_count == 1 {
+            selected
+                .agents
+                .first()
+                .map(|agent| agent.label().to_string())
+                .unwrap_or_else(|| unmarked_label.clone())
+        } else if self.uses_english() {
+            format!("{selected_count} selected")
+        } else {
+            format!("已选 {selected_count} 项")
+        };
+        let mut kinds = entries
+            .iter()
+            .flat_map(|entry| entry.agents.iter().copied())
+            .collect::<Vec<_>>();
+        kinds.extend(selected.agents.iter().copied());
+        let mut options = vec![(
+            ProjectAgentFilterOption::All,
+            all_label,
+            matching.len(),
+            None,
+        )];
+        for info in crate::agents::AGENT_ICON_ORDER {
+            let Some(kind) = kinds.iter().copied().find(|kind| kind.id() == info.id) else {
+                continue;
+            };
+            options.push((
+                ProjectAgentFilterOption::Agent(kind),
+                info.name.to_string(),
+                matching
+                    .iter()
+                    .filter(|entry| entry.agents.contains(&kind))
+                    .count(),
+                Some(info.icon_path),
+            ));
+        }
+        if entries.iter().any(|entry| entry.agents.is_empty()) || selected.unmarked {
+            options.push((
+                ProjectAgentFilterOption::Unmarked,
+                unmarked_label,
+                matching
+                    .iter()
+                    .filter(|entry| entry.agents.is_empty())
+                    .count(),
+                None,
+            ));
+        }
+        let app = cx.entity().downgrade();
+        Popover::new("project-agent-filter-menu")
+            .appearance(false)
+            .anchor(Anchor::TopRight)
+            .trigger(
+                self.dropdown_button("project-agent-filter-trigger", label, 12.)
+                    .h(px(26.))
+                    .max_w(px(138.))
+                    .border_0()
+                    .bg(rgba(0x00000000))
+                    .text_color(if selected.is_all() { p.muted } else { p.accent }),
+            )
+            .content(move |_, _, popover_cx| {
+                let selected = app
+                    .upgrade()
+                    .map(|app| {
+                        app.read(popover_cx)
+                            .projects_view
+                            .project_agent_filter
+                            .clone()
+                    })
+                    .unwrap_or_default();
+                let mut menu = div()
+                    .id("project-agent-filter-options")
+                    .w(px(224.))
+                    .max_h(px(316.))
+                    .p(px(4.))
+                    .rounded(px(RADIUS_MENU))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.elevated)
+                    .shadow_lg()
+                    .overflow_y_scroll();
+                for (index, (filter, label, count, icon)) in options.iter().enumerate() {
+                    let filter = *filter;
+                    let checked = selected.selected(filter);
+                    let app = app.clone();
+                    let popover = popover_cx.entity();
+                    menu = menu.child(
+                        gpui_base::Button::new(ElementId::Name(
+                            format!("project-agent-filter-option-{index}").into(),
+                        ))
+                        .accessibility_label(format!("{label} · {count}"))
+                        .h(px(30.))
+                        .w_full()
+                        .px(px(8.))
+                        .rounded(px(RADIUS_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .font_family(FONT_UI)
+                        .text_size(px(13.))
+                        .text_color(p.text)
+                        .bg(if checked {
+                            p.selected
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .hover(move |row| row.bg(p.hover))
+                        .child(div().w(px(14.)).when(checked, |slot| {
+                            slot.child(Self::icon("icons/check.svg", 12., p.secondary))
+                        }))
+                        .child(
+                            div()
+                                .w(px(18.))
+                                .flex_none()
+                                .flex()
+                                .justify_center()
+                                .when_some(*icon, |slot, icon| {
+                                    slot.child(Self::brand_icon(
+                                        icon,
+                                        Self::brand_icon_size(icon, 16.),
+                                        p.text,
+                                        dark,
+                                    ))
+                                }),
+                        )
+                        .child(div().min_w_0().flex_1().truncate().child(label.clone()))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(p.muted)
+                                .child(count.to_string()),
+                        )
+                        .on_click(move |_, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.projects_view.project_agent_filter.toggle(filter);
+                                cx.notify();
+                            });
+                            popover.update(cx, |_, cx| cx.notify());
+                        }),
+                    );
+                }
+                menu
+            })
+    }
+
     pub(super) fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         #[cfg(debug_assertions)]
         let render_started = Instant::now();
@@ -811,8 +1089,10 @@ impl KitterApp {
             .as_ref()
             .and_then(|path| self.project_snapshot(path, cx));
         let global_skill_count = global_skills.as_ref().map(Vec::len);
-        let projects = self.project_entries()
-            .into_iter()
+        let all_projects = self.project_entries();
+        let total_project_count = all_projects.len();
+        let matching_projects = all_projects
+            .iter()
             .filter(|entry| {
                 let path = &entry.path;
                 let matches_query = query.is_empty()
@@ -831,6 +1111,13 @@ impl KitterApp {
                 });
                 matches_query && matches_tag
             })
+            .cloned()
+            .collect::<Vec<_>>();
+        let agent_filter_control =
+            self.project_agent_filter_control(&all_projects, &matching_projects, cx);
+        let projects = matching_projects
+            .into_iter()
+            .filter(|entry| self.projects_view.project_agent_filter.matches(entry))
             .collect::<Vec<_>>();
         let visible_project_count = projects.len();
         let project_context_app = cx.entity().downgrade();
@@ -848,7 +1135,7 @@ impl KitterApp {
                     .text_size(px(13.))
                     .text_color(p.muted)
                     .text_center()
-                    .child(if self.project_entries().is_empty() {
+                    .child(if all_projects.is_empty() {
                         self.tr("还没有项目", "No projects yet")
                     } else {
                         self.tr("没有匹配的项目", "No matching projects")
@@ -856,6 +1143,8 @@ impl KitterApp {
             );
         }
         for entry in projects {
+            let agent_shortcuts = self.project_agent_shortcuts(&entry, cx);
+            let proma_workspace_count = entry.proma_workspaces.len();
             let path = entry.path;
             let project_label = entry.name;
             let selected_path = path.clone();
@@ -905,10 +1194,11 @@ impl KitterApp {
                     ))
                     .min_h(px(48.))
                     .px(px(8.))
+                    .py(px(6.))
                     .my(px(2.))
                     .rounded(px(RADIUS_CONTROL))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .cursor_pointer()
                     .bg(if selected {
                         p.selected
@@ -918,7 +1208,8 @@ impl KitterApp {
                     .hover(move |row| row.bg(p.hover))
                     .child(
                         div()
-                            .size(px(28.))
+                            .w(px(28.))
+                            .h(px(18.))
                             .flex_none()
                             .rounded(px(RADIUS_CONTROL))
                             .flex()
@@ -935,6 +1226,7 @@ impl KitterApp {
                                 div()
                                     .font_family(MONO)
                                     .text_size(px(13.))
+                                    .line_height(px(18.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .truncate()
                                     .child(project_label),
@@ -944,17 +1236,24 @@ impl KitterApp {
                                     .mt(px(3.))
                                     .font_family(MONO)
                                     .text_size(px(11.))
+                                    .line_height(px(14.))
                                     .text_color(p.muted)
                                     .truncate()
                                     .child(display_path(&path)),
                             )
+                            .when(!entry.agents.is_empty(), |content| content.child(
+                                div().flex().items_center().gap(px(6.)).child(agent_shortcuts)
+                                    .when(proma_workspace_count > 1, |line| line.child(
+                                        div().mt(px(4.)).text_size(px(11.)).text_color(p.muted).child(
+                                            if self.uses_english() { format!("Proma · {proma_workspace_count} workspaces") }
+                                            else { format!("Proma · {proma_workspace_count} 个工作区") }
+                                        )
+                                    ))
+                            ))
                             .when(!assigned_project_tags.is_empty(), |content| {
                                 content.child(project_tag_chips)
                             }),
                     )
-                    .child(self.effective_agent_badges(
-                        format!("project-sources-{}", path.display()), &entry.agents, cx,
-                    ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.projects_view.open_project.as_ref() != Some(&selected_path) {
                             this.projects_view.batch_project = None;
@@ -1094,7 +1393,7 @@ impl KitterApp {
                 self.panel_header(
                     "projects-panel-window-drag",
                     self.tr("项目", "Projects"),
-                    self.project_entries().len(),
+                    total_project_count,
                     cx,
                 )
                 .child(
@@ -1134,15 +1433,15 @@ impl KitterApp {
                     .text_size(px(12.))
                     .text_color(p.muted)
                     .child(
-                        self.tags_flow
+                        div().min_w_0().flex_1().truncate().child(self.tags_flow
                             .selected_project_filter
                             .and_then(|tag| self.tags_flow.projects.path(tag))
                             .map(|path| format!("#{path}  {visible_project_count}"))
                             .unwrap_or_else(|| {
                                 format!("{}  {visible_project_count}", self.tr("项目", "Projects"))
-                            }),
+                            })),
                     )
-                    .child(div().flex_1())
+                    .child(agent_filter_control)
                     .child(self.tag_filter_control(TagScope::Projects, cx)),
             )
             .child(recent_rows);
@@ -1418,13 +1717,6 @@ impl KitterApp {
                         .border_color(p.border)
                         .child(context_panel),
                 )
-                .when(estimates.iter().any(|estimate| estimate.agent == AgentKind::Proma), |detail| {
-                    detail.child(div().px(px(28.)).pb(px(8.)).text_size(px(12.))
-                        .text_color(p.muted).child(self.tr(
-                            "已扫描 Proma 工作区技能目录；当前会话的技能可用情况请在 Proma 中查看。",
-                            "Proma workspace skill folders have been scanned. Check Proma for skill availability in the current session.",
-                        )))
-                })
                 .child(tabs)
                 .child(skills)
                 .child(self.window_drag_strip("project-detail-window-drag", 24., cx))

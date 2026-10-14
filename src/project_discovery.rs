@@ -1,6 +1,6 @@
 //! Read project catalogs without scanning conversations or changing Agent data.
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -23,6 +23,34 @@ pub struct ProjectEntry {
     pub proma_workspaces: Vec<PathBuf>,
 }
 
+impl ProjectEntry {
+    /// Project-local directories this Agent can read. Proma uses its native
+    /// workspaces rather than the business directory shown in the project list.
+    pub fn skill_directories(&self, agent: crate::agents::AgentIconInfo) -> Vec<PathBuf> {
+        use crate::{InstallTarget, agents::installation_root};
+
+        if agent.global_only {
+            return Vec::new();
+        }
+        let mut roots = Vec::new();
+        for target in agent.install_targets {
+            if *target == InstallTarget::Proma {
+                for workspace in &self.proma_workspaces {
+                    roots.push(workspace.join("skills"));
+                }
+            } else {
+                roots.push(installation_root(&self.path, *target));
+            }
+        }
+        if agent.shared_agents {
+            roots.push(installation_root(&self.path, InstallTarget::Universal));
+        }
+        let mut seen = BTreeSet::new();
+        roots.retain(|root| seen.insert(path_identity(root)));
+        roots
+    }
+}
+
 pub fn path_identity(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -36,7 +64,7 @@ pub fn codex_home() -> Option<PathBuf> {
 }
 
 pub fn discover_proma_projects(root: &Path) -> Result<Vec<ProjectEntry>> {
-    Ok(crate::proma::workspaces(root)?
+    let mut projects = crate::proma::workspaces(root)?
         .into_iter()
         .map(|workspace| ProjectEntry {
             path: workspace.project_root_path.unwrap_or_else(|| workspace.path.clone()),
@@ -44,7 +72,17 @@ pub fn discover_proma_projects(root: &Path) -> Result<Vec<ProjectEntry>> {
             agents: vec![AgentKind::Proma],
             proma_workspaces: vec![workspace.path],
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::new();
+    for project in &projects {
+        *counts.entry(project.path.clone()).or_insert(0) += 1;
+    }
+    for project in &mut projects {
+        if counts[&project.path] > 1 {
+            project.name = project_name(&project.path);
+        }
+    }
+    Ok(projects)
 }
 
 pub fn discover_agent_projects() -> Result<Vec<ProjectEntry>> {
@@ -215,6 +253,50 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn project_shortcuts_use_shared_and_native_roots_without_creating_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("business repo");
+        let first = temp.path().join("proma/first");
+        let second = temp.path().join("proma/second");
+        let entry = ProjectEntry {
+            path: project.clone(),
+            name: "Project".into(),
+            agents: vec![AgentKind::Codex, AgentKind::Proma],
+            proma_workspaces: vec![first.clone(), second.clone(), first.clone()],
+        };
+        let agent = |id| *crate::agents::AGENT_ICON_ORDER.iter()
+            .find(|agent| agent.id == id).unwrap();
+        assert_eq!(entry.skill_directories(agent("codex")), [
+            project.join(".codex/skills"), project.join(".agents/skills"),
+        ]);
+        assert_eq!(entry.skill_directories(agent("proma")), [
+            first.join("skills"), second.join("skills"),
+        ]);
+        assert!(entry.skill_directories(agent("openclaw")).is_empty());
+        assert!(!project.exists());
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_shortcuts_deduplicate_aliases_without_changing_the_display_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let shared = project.join(".agents/skills");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&shared, project.join(".codex/skills")).unwrap();
+        let entry = ProjectEntry {
+            path: project.clone(), name: "Project".into(),
+            agents: vec![AgentKind::Codex], proma_workspaces: Vec::new(),
+        };
+        let codex = *crate::agents::AGENT_ICON_ORDER.iter()
+            .find(|agent| agent.id == "codex").unwrap();
+        assert_eq!(entry.skill_directories(codex), [project.join(".codex/skills")]);
+    }
+
     fn write_state(home: &Path, value: Value) {
         std::fs::write(
             home.join(".codex-global-state.json"),
@@ -242,6 +324,33 @@ mod tests {
         assert_eq!(projects[0].agents, [AgentKind::Proma]);
         assert_eq!(projects[0].proma_workspaces, [path_identity(&native)]);
         assert_ne!(projects[0].path, path_identity(&native));
+    }
+
+    #[test]
+    fn multi_workspace_projects_use_business_name_and_keep_native_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let business = temp.path().join("shared-project");
+        std::fs::create_dir(&business).unwrap();
+        for slug in ["first", "second"] {
+            std::fs::create_dir_all(temp.path().join("agent-workspaces").join(slug)).unwrap();
+        }
+        let first = json!({"id": "first", "slug": "first", "name": "演示工作区 A", "projectRootPath": business});
+        let second = json!({"id": "second", "slug": "second", "name": "演示工作区 B", "projectRootPath": business});
+        for workspaces in [vec![first.clone(), second.clone()], vec![second.clone(), first.clone()]] {
+            std::fs::write(temp.path().join("agent-workspaces.json"),
+                serde_json::to_vec(&json!({"version": 2, "workspaces": workspaces})).unwrap()).unwrap();
+            let discovered = discover_proma_projects(temp.path()).unwrap();
+            let projects = merge_projects(&[], &discovered, &BTreeSet::new());
+            assert_eq!(projects.len(), 1);
+            assert_eq!(projects[0].path, path_identity(&business));
+            assert_eq!(projects[0].name, "shared-project");
+            assert_eq!(projects[0].proma_workspaces.len(), 2);
+            assert!(projects[0].proma_workspaces.contains(&path_identity(&temp.path().join("agent-workspaces/first"))));
+            assert!(projects[0].proma_workspaces.contains(&path_identity(&temp.path().join("agent-workspaces/second"))));
+        }
+        std::fs::write(temp.path().join("agent-workspaces.json"),
+            serde_json::to_vec(&json!({"version": 2, "workspaces": [first]})).unwrap()).unwrap();
+        assert_eq!(discover_proma_projects(temp.path()).unwrap()[0].name, "演示工作区 A");
     }
 
     #[test]

@@ -359,20 +359,35 @@ fn no_pending(w: &Workspace) -> Result<()> {
 }
 
 pub fn plan_install(root: &Path, project: &Path, source: &Path, name: &str) -> Result<InstallPlan> {
+    plan_install_at(root, project, source, name, "skills", false)
+}
+
+fn plan_install_at(
+    root: &Path, project: &Path, source: &Path, name: &str,
+    directory: &str, existing_only: bool,
+) -> Result<InstallPlan> {
     crate::library::validate_name(name)?;
+    if !matches!(directory, "skills" | "skills-inactive")
+        || (directory == "skills-inactive" && !existing_only)
+    {
+        bail!("自动同步只允许更新原安装目录");
+    }
     let workspace = workspace_for_path(root, project)?;
     no_pending(&workspace)?;
     let source = source.canonicalize().context("技能不存在")?;
     let source_hash = hash(&public_manifest(&source)?)?;
-    let destination = workspace.path.join("skills").join(name);
-    let inactive = workspace.path.join("skills-inactive").join(name);
-    if fs::symlink_metadata(&inactive).is_ok() {
-        bail!("该技能已停用，请先启用；未改变工作区选择");
+    let destination = workspace.path.join(directory).join(name);
+    let other = if directory == "skills" { "skills-inactive" } else { "skills" };
+    if fs::symlink_metadata(workspace.path.join(other).join(name)).is_ok() {
+        bail!("技能启停位置已变化或重复；未改变工作区选择");
     }
     let action = match fs::symlink_metadata(&destination) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "create",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !existing_only => "create",
         Err(e) => return Err(e.into()),
         Ok(m) if m.file_type().is_symlink() => {
+            if existing_only {
+                bail!("已有安装变成外部链接，未迁移或覆盖");
+            }
             if destination.canonicalize().ok().as_ref() != Some(&source) {
                 bail!("同名链接指向其他来源，未覆盖");
             }
@@ -398,10 +413,18 @@ pub fn plan_install(root: &Path, project: &Path, source: &Path, name: &str) -> R
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
+    #[cfg(test)]
+    BEFORE_PLAN_OBSERVATION.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() { callback(); }
+    });
+    let expected = observed(&destination)?;
+    if existing_only && expected == "absent" {
+        bail!("已有安装已被移除，未重新创建");
+    }
     Ok(InstallPlan {
         root: root.canonicalize()?,
         workspace_signature: signature(&workspace.path)?,
-        expected: observed(&destination)?,
+        expected,
         workspace,
         name: name.into(),
         source,
@@ -512,7 +535,11 @@ struct Transaction {
 
 fn recheck(plan: &InstallPlan) -> Result<()> {
     crate::library::validate_name(&plan.name)?;
-    if plan.destination != plan.workspace.path.join("skills").join(&plan.name)
+    let inactive = plan.destination == plan.workspace.path.join("skills-inactive").join(&plan.name);
+    if (matches!(plan.action.as_str(), "update" | "unchanged") && plan.expected == "absent")
+        || (plan.destination != plan.workspace.path.join("skills").join(&plan.name)
+        && !(inactive && plan.expected != "absent"
+            && matches!(plan.action.as_str(), "update" | "unchanged")))
         || plan.source.canonicalize()? != plan.source
         || !matches!(
             plan.action.as_str(),
@@ -528,8 +555,9 @@ fn recheck(plan: &InstallPlan) -> Result<()> {
     if let Some(path) = &plan.local_data {
         real_directory(path)?;
     }
-    if fs::symlink_metadata(plan.workspace.path.join("skills-inactive").join(&plan.name)).is_ok() {
-        bail!("技能已停用，请重新预览");
+    let other = if inactive { "skills" } else { "skills-inactive" };
+    if fs::symlink_metadata(plan.workspace.path.join(other).join(&plan.name)).is_ok() {
+        bail!("技能启停位置已变化，请重新预览");
     }
     if workspace_for_path(&plan.root, &plan.workspace.path)? != plan.workspace
         || signature(&plan.workspace.path)? != plan.workspace_signature
@@ -560,6 +588,7 @@ thread_local! {
     static BEFORE_ROLLBACK_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_RECOVERY_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_FOLLOWER_REFRESH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_PLAN_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static AFTER_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
@@ -601,8 +630,12 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
         return Ok(());
     }
     no_pending(&plan.workspace)?;
-    workspace.mkdir(Path::new("skills"))?;
-    let parent = workspace.child(Path::new("skills"))?;
+    let directory = plan.destination.parent().and_then(Path::file_name)
+        .context("安装目录缺少名称")?;
+    if directory == "skills" {
+        workspace.mkdir(Path::new(directory))?;
+    }
+    let parent = workspace.child(Path::new(directory))?;
     let (operation, output) = new_operation(&workspace, &plan.workspace.path, "install")?;
     let mut t = Transaction {
         workspace: plan.workspace.clone(),
@@ -635,7 +668,7 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
     )?;
     recheck(plan)?;
     workspace.verify_location(&plan.workspace.path)?;
-    parent.verify_location(&plan.workspace.path.join("skills"))?;
+    parent.verify_location(&plan.workspace.path.join(directory))?;
     output.verify_location(&operation)?;
     #[cfg(test)]
     BEFORE_PUBLISH.with(|hook| {
@@ -795,6 +828,93 @@ fn sync_existing_source_in(root: &Path, source: &Path) -> Vec<String> {
         Ok(warnings)
     })();
     result.unwrap_or_else(|error| vec![format!("Proma 已有安装待核验：{error}")])
+}
+
+#[derive(Default)]
+pub(crate) struct LocalMirrorSync {
+    observed: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct LocalSyncReport {
+    pub updated: usize,
+    pub inactive_updated: usize,
+    pub warnings: Vec<String>,
+}
+
+impl LocalMirrorSync {
+    /// Two identical observations debounce edits. Only existing marked copies
+    /// of registered local sources are eligible, in their current directory.
+    pub(crate) fn poll(&mut self, root: &Path, sources: &BTreeSet<PathBuf>) -> Result<LocalSyncReport> {
+        let sources = sources.iter().filter_map(|path| path.canonicalize().ok())
+            .collect::<BTreeSet<_>>();
+        self.observed.retain(|source, _| sources.contains(source));
+        let mut followers: BTreeMap<PathBuf, Vec<(Workspace, String, Marker)>> = BTreeMap::new();
+        let mut report = LocalSyncReport::default();
+        if sources.is_empty() {
+            return Ok(report);
+        }
+        for workspace in workspaces(root)? {
+            for directory in ["skills", "skills-inactive"] {
+                let parent = workspace.path.join(directory);
+                if fs::symlink_metadata(&parent).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                    continue;
+                }
+                real_directory(&parent)?;
+                for entry in fs::read_dir(parent)? {
+                    let path = entry?.path();
+                    // Unmanaged packages, built-ins and external links are never adopted.
+                    if let Ok(m) = marker(&path, &workspace)
+                        && sources.contains(&m.source)
+                    {
+                        followers.entry(m.source.clone()).or_default()
+                            .push((workspace.clone(), directory.into(), m));
+                    }
+                }
+            }
+        }
+        for (source, copies) in followers {
+            let source_hash = match public_manifest(&source).and_then(|m| hash(&m)) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.observed.remove(&source);
+                    report.warnings.push(format!("{}：{error}", source.display()));
+                    continue;
+                }
+            };
+            let stable = self.observed.insert(source.clone(), source_hash.clone())
+                .as_ref() == Some(&source_hash);
+            if !stable {
+                continue;
+            }
+            for (workspace, directory, m) in copies {
+                if m.source_hash == source_hash {
+                    continue;
+                }
+                #[cfg(test)]
+                BEFORE_FOLLOWER_REFRESH.with(|hook| {
+                    if let Some(callback) = hook.borrow_mut().take() { callback(); }
+                });
+                let result = plan_install_at(root, &workspace.path, &source, &m.name, &directory, true)
+                    .and_then(|plan| {
+                        if plan.source_hash != source_hash {
+                            bail!("技能源仍在修改，等待下一次稳定检查");
+                        }
+                        apply_plan(&plan)
+                    });
+                match result {
+                    Ok(()) => {
+                        report.updated += 1;
+                        report.inactive_updated += usize::from(directory == "skills-inactive");
+                    }
+                    Err(error) => report.warnings.push(format!("{} / {}：{error}", workspace.name, m.name)),
+                }
+            }
+        }
+        report.warnings.sort();
+        report.warnings.dedup();
+        Ok(report)
+    }
 }
 
 pub fn is_managed(path: &Path, source: &Path) -> bool {
@@ -1891,6 +2011,159 @@ mod tests {
         fs::rename(&target, project.join("skills-inactive/example")).unwrap();
         assert!(sync_existing_source_in(&root, &source).is_empty());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn local_auto_sync_debounces_edits_and_updates_inactive_without_enabling() {
+        let (_t, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        let second = root.join("agent-workspaces/second");
+        let empty = root.join("agent-workspaces/empty");
+        fs::create_dir_all(second.join("skills")).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(root.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({
+            "version":1,"workspaces":[
+                {"id":"workspace-1","slug":"pilot","name":"Pilot"},
+                {"id":"workspace-2","slug":"second","name":"Second"},
+                {"id":"workspace-3","slug":"empty","name":"Empty"}
+            ]
+        })).unwrap()).unwrap();
+        apply_plan(&plan_install(&root, &second, &source, "example").unwrap()).unwrap();
+        fs::create_dir(second.join("skills-inactive")).unwrap();
+        fs::rename(second.join("skills/example"), second.join("skills-inactive/example")).unwrap();
+        let sources = BTreeSet::from([source.clone()]);
+        let mut sync = LocalMirrorSync::default();
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 0);
+        fs::write(source.join("version.txt"), "v2").unwrap();
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 0);
+        fs::write(source.join("version.txt"), "v3").unwrap();
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 0);
+        let report = sync.poll(&root, &sources).unwrap();
+        assert!(report.warnings.is_empty());
+        assert_eq!((report.updated, report.inactive_updated), (2, 1));
+        for path in [project.join("skills/example"), second.join("skills-inactive/example")] {
+            assert_eq!(fs::read_to_string(path.join("version.txt")).unwrap(), "v3");
+        }
+        assert!(!second.join("skills/example").exists());
+        assert!(!empty.join("skills").exists());
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 0);
+    }
+
+    #[test]
+    fn local_auto_sync_preserves_modified_unmanaged_and_unregistered_copies() {
+        let (_t, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        apply_plan(&plan_install(&root, &project, &source, "disabled").unwrap()).unwrap();
+        fs::create_dir(project.join("skills-inactive")).unwrap();
+        fs::rename(project.join("skills/disabled"), project.join("skills-inactive/disabled")).unwrap();
+        for path in [project.join("skills/example"), project.join("skills-inactive/disabled")] {
+            fs::write(path.join("version.txt"), "workspace edit").unwrap();
+        }
+        let unmanaged = project.join("skills/unmanaged");
+        fs::create_dir(&unmanaged).unwrap();
+        fs::write(unmanaged.join("SKILL.md"), "unmanaged content").unwrap();
+        let other = source.parent().unwrap().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("SKILL.md"), "other content").unwrap();
+        apply_plan(&plan_install(&root, &project, &other, "other").unwrap()).unwrap();
+        let sources = BTreeSet::from([source.clone()]);
+        let mut sync = LocalMirrorSync::default();
+        sync.poll(&root, &sources).unwrap();
+        fs::write(source.join("version.txt"), "source edit").unwrap();
+        fs::write(other.join("SKILL.md"), "other edit").unwrap();
+        sync.poll(&root, &sources).unwrap();
+        let report = sync.poll(&root, &sources).unwrap();
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.warnings.len(), 2);
+        for path in [project.join("skills/example"), project.join("skills-inactive/disabled")] {
+            assert_eq!(fs::read_to_string(path.join("version.txt")).unwrap(), "workspace edit");
+        }
+        assert_eq!(fs::read_to_string(unmanaged.join("SKILL.md")).unwrap(), "unmanaged content");
+        assert_eq!(fs::read_to_string(project.join("skills/other/SKILL.md")).unwrap(), "other content");
+        assert!(!project.join("skills/disabled").exists());
+    }
+
+    #[test]
+    fn local_auto_sync_does_not_recreate_removed_or_replaced_copies() {
+        for inactive in [false, true] {
+            for replace_with_link in [false, true] {
+                let (_t, root, project, source) = fixture();
+                apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+                let target = if inactive {
+                    fs::create_dir(project.join("skills-inactive")).unwrap();
+                    let path = project.join("skills-inactive/example");
+                    fs::rename(project.join("skills/example"), &path).unwrap();
+                    path
+                } else { project.join("skills/example") };
+                let sources = BTreeSet::from([source.clone()]);
+                let mut sync = LocalMirrorSync::default();
+                fs::write(source.join("version.txt"), "v2").unwrap();
+                sync.poll(&root, &sources).unwrap();
+                let saved = project.join("removed");
+                let changed_target = target.clone();
+                let origin = source.clone();
+                BEFORE_FOLLOWER_REFRESH.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        fs::rename(&changed_target, saved).unwrap();
+                        if replace_with_link { std::os::unix::fs::symlink(origin, changed_target).unwrap(); }
+                    }));
+                });
+                let report = sync.poll(&root, &sources).unwrap();
+                assert_eq!((report.updated, report.warnings.len()), (0, 1));
+                if replace_with_link {
+                    assert!(fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+                } else { assert!(!target.exists()); }
+            }
+        }
+    }
+
+    #[test]
+    fn local_auto_sync_rechecks_source_stability_before_publish() {
+        let (_t, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        fs::write(source.join("version.txt"), "v2").unwrap();
+        let sources = BTreeSet::from([source.clone()]);
+        let mut sync = LocalMirrorSync::default();
+        sync.poll(&root, &sources).unwrap();
+        let changed_source = source.clone();
+        BEFORE_FOLLOWER_REFRESH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || { fs::write(changed_source.join("version.txt"), "v3").unwrap(); }));
+        });
+        let report = sync.poll(&root, &sources).unwrap();
+        assert_eq!((report.updated, report.warnings.len()), (0, 1));
+        assert!(!project.join("skills/example/version.txt").exists());
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 0);
+        assert_eq!(sync.poll(&root, &sources).unwrap().updated, 1);
+        assert_eq!(fs::read_to_string(project.join("skills/example/version.txt")).unwrap(), "v3");
+    }
+
+    #[test]
+    fn local_auto_sync_respects_removal_during_plan_observation() {
+        for inactive in [false, true] {
+            let (_t, root, project, source) = fixture();
+            apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+            let directory = if inactive { "skills-inactive" } else { "skills" };
+            if inactive {
+                fs::create_dir(project.join(directory)).unwrap();
+                fs::rename(project.join("skills/example"), project.join(directory).join("example")).unwrap();
+            }
+            fs::write(source.join("version.txt"), "v2").unwrap();
+            let mut invalid = plan_install_at(&root, &project, &source, "example", directory, true).unwrap();
+            invalid.expected = "absent".into();
+            assert!(apply_plan(&invalid).is_err());
+            let sources = BTreeSet::from([source.clone()]);
+            let mut sync = LocalMirrorSync::default();
+            sync.poll(&root, &sources).unwrap();
+            let target = project.join(directory).join("example");
+            let removed = project.join("removed-during-plan");
+            let moved = target.clone();
+            BEFORE_PLAN_OBSERVATION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || { fs::rename(moved, removed).unwrap(); }));
+            });
+            let report = sync.poll(&root, &sources).unwrap();
+            assert_eq!((report.updated, report.warnings.len()), (0, 1));
+            assert!(!target.exists());
+        }
     }
     #[test]
     fn source_refresh_does_not_recreate_a_removed_or_replaced_follower() {

@@ -1,6 +1,6 @@
 use std::{
     sync::Mutex,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -470,6 +470,13 @@ impl SkillLibrary {
                 .then_with(|| a.record.name.cmp(&b.record.name))
         });
         Ok(result)
+    }
+
+    pub(crate) fn local_source_paths(&self) -> BTreeSet<PathBuf> {
+        self.registry.skills.iter().filter_map(|(storage, record)| {
+            (matches!(record.origin, SkillOrigin::Local { .. }) || self.is_linked_source(storage))
+                .then(|| self.config.library_dir.join(storage))
+        }).collect()
     }
 
     fn install_count(&self, name: &str, source: &Path) -> usize {
