@@ -501,8 +501,8 @@ impl KitterApp {
             .px(px(28.))
             .flex_none()
             .flex()
-            .items_end()
-            .gap(px(20.))
+            .items_center()
+            .gap(px(16.))
             .border_b_1()
             .border_color(p.border);
         for (tab, label, count) in [
@@ -531,7 +531,7 @@ impl KitterApp {
                         )
                         .into(),
                     ))
-                    .h(px(37.))
+                    .h(px(43.))
                     .px(px(2.))
                     .border_b_1()
                     .border_color(if selected { p.accent } else { rgba(0x00000000) })

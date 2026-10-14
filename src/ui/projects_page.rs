@@ -3,17 +3,144 @@ use super::*;
 fn selected_project_skills(
     rows: &[EffectiveSkillRow],
     selected_names: &HashSet<String>,
+    action: ProjectBatchAction,
 ) -> Vec<ProjectSkill> {
     rows.iter()
-        .filter(|row| row.can_remove() && selected_names.contains(&row.name))
+        .filter(|row| selected_names.contains(&row.name))
         .map(|row| ProjectSkill {
             name: row.name.clone(),
-            installations: row.removable_installations(),
+            installations: row.batch_installations(action),
         })
+        .filter(|skill| !skill.installations.is_empty())
         .collect()
 }
 
 impl KitterApp {
+    fn project_batch_action_label(&self, action: ProjectBatchAction) -> &'static str {
+        match action {
+            ProjectBatchAction::Remove => self.tr("移除安装", "Remove installs"),
+            ProjectBatchAction::DisableProma => self.tr("停用 Proma", "Disable Proma"),
+            ProjectBatchAction::EnableProma => self.tr("启用 Proma", "Enable Proma"),
+        }
+    }
+
+    fn project_batch_unavailable_reason(&self, row: &EffectiveSkillRow) -> String {
+        match self.projects_view.batch_action {
+            ProjectBatchAction::Remove => {
+                if row.direct_installations.iter().any(|item| item.bundled) {
+                    self.tr("Proma 内置预设可停用，请切换到“停用 Proma”", "Switch to Disable Proma to deactivate built-in presets")
+                } else if row.direct_installations.is_empty() {
+                    self.tr("此项来自全局、父目录或系统；此项目没有可移除的安装", "Inherited or system skill; no removable installation in this project")
+                } else {
+                    self.tr("此安装受保护，不能从这里删除", "This installation is protected from removal")
+                }
+            }
+            action => {
+                let proma = row.direct_installations.iter().filter(|item| item.target == InstallTarget::Proma).collect::<Vec<_>>();
+                if !cfg!(unix) {
+                    self.tr("此平台尚未支持 Proma 技能启停", "Proma skill state changes are not supported on this platform")
+                } else if proma.is_empty() {
+                    self.tr("此项目没有该技能的 Proma 副本；全局和系统来源不受此操作影响", "No Proma copy in this project; inherited and system sources are unaffected")
+                } else if proma.iter().any(|item| item.toggleable) {
+                    if action == ProjectBatchAction::DisableProma {
+                        self.tr("Proma 副本已停用；切换到“启用 Proma”可恢复", "Already inactive; switch to Enable Proma to restore")
+                    } else {
+                        self.tr("Proma 副本已启用；切换到“停用 Proma”可停用", "Already active; switch to Disable Proma to deactivate")
+                    }
+                } else {
+                    self.tr("只支持已核验的内置预设和完好的 Kitter 受管副本；此副本受保护", "Only verified built-in presets and intact Kitter-managed copies can be changed")
+                }
+            }
+        }.to_string()
+    }
+
+    fn project_batch_action_control(&self, has_proma: bool, cx: &mut Context<Self>) -> Popover {
+        let p = self.palette();
+        let app = cx.entity().downgrade();
+        let selected = self.projects_view.batch_action;
+        let actions = [ProjectBatchAction::Remove, ProjectBatchAction::DisableProma, ProjectBatchAction::EnableProma]
+            .into_iter().filter(|action| has_proma || *action == ProjectBatchAction::Remove)
+            .map(|action| (action, self.project_batch_action_label(action).to_string())).collect::<Vec<_>>();
+        Popover::new("project-batch-action").appearance(false).anchor(Anchor::TopRight)
+            .trigger(self.dropdown_button("project-batch-action-trigger", self.project_batch_action_label(selected), 12.)
+                .min_w(px(102.)).border_0().bg(rgba(0x00000000)).font_weight(FontWeight::NORMAL))
+            .content(move |_, _, popover_cx| {
+                let mut menu = div().w(px(180.)).p(px(4.)).rounded(px(RADIUS_MENU))
+                    .border_1().border_color(p.border).bg(p.elevated).shadow_lg();
+                for (action, label) in &actions {
+                    let action = *action;
+                    let app = app.clone();
+                    menu = menu.child(div().id(ElementId::Name(format!("project-batch-action-{}", action as u8).into()))
+                        .h(px(30.)).px(px(9.)).rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
+                        .font_family(FONT_UI).text_size(px(13.)).text_color(p.text)
+                        .bg(if action == selected { p.selected } else { rgba(0x00000000) })
+                        .hover(move |row| row.bg(p.hover)).child(label.clone())
+                        .on_click(popover_cx.listener(move |_, _, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.projects_view.batch_action = action;
+                                this.projects_view.batch_selected.clear();
+                                this.projects_view.batch_filter = None;
+                                cx.notify();
+                            });
+                            cx.emit(DismissEvent);
+                        })));
+                }
+                menu
+            })
+    }
+
+    fn project_proma_state_control(&self, selected: Vec<ProjectSkill>, project: PathBuf, cx: &mut Context<Self>) -> Popover {
+        let p = self.palette();
+        let app = cx.entity().downgrade();
+        let enabled = self.projects_view.batch_action == ProjectBatchAction::EnableProma;
+        let action = self.tr(if enabled { "启用" } else { "停用" }, if enabled { "Enable" } else { "Disable" }).to_string();
+        let has_selection = !selected.is_empty();
+        let title = if self.uses_english() { format!("{action} {} skills in Proma", selected.len()) }
+            else { format!("在 Proma 中{action} {} 个技能", selected.len()) };
+        let description = self.tr(
+            if enabled { "将以下工作区副本移回 skills。全局及系统来源保持不变。" }
+            else { "将以下工作区副本移到 skills-inactive，保留文件，可随时重新启用。全局及系统来源保持不变。" },
+            if enabled { "Move these workspace copies back to skills. Global and system sources remain unchanged." }
+            else { "Move these workspace copies to skills-inactive. Files are retained and can be enabled again. Global and system sources remain unchanged." }
+        ).to_string();
+        let cancel = self.tr("取消", "Cancel").to_string();
+        Popover::new("project-proma-state-confirmation").appearance(false).anchor(Anchor::TopRight)
+            .trigger(gpui_base::Button::new("project-proma-state-trigger")
+                .accessibility_label(action.clone()).disabled(!has_selection)
+                .h(px(CONTROL_HEIGHT)).min_w(px(42.)).px(px(8.)).rounded(px(RADIUS_CONTROL))
+                .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(12.))
+                .text_color(p.text).bg(rgba(0x00000000)).flex().items_center().justify_center()
+                .hover(move |button| button.bg(p.hover)).active(move |button| button.bg(p.selected))
+                .styles(|styles| styles.disabled(|style| style.bg(rgba(0x00000000)).text_color(p.muted)))
+                .child(div().line_height(relative(1.5)).child(action.clone())))
+            .content(move |_, _, popover_cx| {
+                let confirm_app = app.clone();
+                let selected = selected.clone();
+                let project = project.clone();
+                let mut locations = div().id("project-proma-state-locations").max_h(px(240.)).overflow_y_scroll();
+                for skill in &selected {
+                    for installation in &skill.installations {
+                        locations = locations.child(div().py(px(5.)).text_size(px(11.)).font_family(MONO)
+                            .child(div().text_color(p.text).child(skill.name.clone()))
+                            .child(div().text_color(p.muted).child(display_path(&installation.path))));
+                    }
+                }
+                div().w(px(400.)).p(px(16.)).rounded(px(RADIUS_MENU)).border_1().border_color(p.border)
+                    .bg(p.elevated).shadow_lg().flex().flex_col().gap(px(12.))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title.clone()))
+                    .child(div().text_size(px(12.)).text_color(p.secondary).child(description.clone()))
+                    .child(locations)
+                    .child(div().flex().justify_end().gap(px(8.))
+                        .child(Button::new("cancel-proma-state").small().label(cancel.clone())
+                            .on_click(popover_cx.listener(|_, _, _, cx| cx.emit(DismissEvent))))
+                        .child(Button::new("confirm-proma-state").small().primary().label(action.clone())
+                            .on_click(popover_cx.listener(move |_, _, _, cx| {
+                                let _ = confirm_app.update(cx, |this, cx| this.apply_project_proma_state(&selected, &project, enabled, cx));
+                                cx.emit(DismissEvent);
+                            }))))
+            })
+    }
+
     fn skill_origin_label(&self, origin: SkillOrigin, global: bool) -> &'static str {
         match origin {
             SkillOrigin::Project => self.tr("项目安装", "Project install"),
@@ -48,12 +175,13 @@ impl KitterApp {
         };
         div().id(ElementId::Name(format!("project-skill-source-{key}").into()))
             .debug_selector(move || format!("project-skill-source-{debug_key}").into())
-            .h(px(60.)).w_full().px(px(27.)).flex().items_center().gap(px(8.))
-            .border_b_1().border_color(p.border).bg(p.raised).cursor_pointer()
+            .h(px(28.)).w_full().px(px(32.)).flex().items_center().gap(px(6.))
+            .bg(p.surface).cursor_pointer()
             .hover(move |row| row.bg(p.hover))
-            .child(Self::icon(if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }, 14., p.muted))
-            .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).text_color(p.secondary).child(label))
-            .child(div().text_size(px(12.)).text_color(p.muted).child(count.to_string()))
+            .child(Self::icon(if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }, 12., p.muted))
+            .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.secondary).child(label))
+            .child(div().text_size(px(10.)).text_color(p.muted).child(count.to_string()))
+            .child(div().ml(px(4.)).flex_1().h(px(1.)).bg(p.border))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.projects_view.collapsed_skill_sources.remove(&key) {
                     this.projects_view.collapsed_skill_sources.insert(key.clone());
@@ -130,7 +258,7 @@ impl KitterApp {
                                 if selected.is_some() {
                                     p.accent
                                 } else {
-                                    p.secondary
+                                    p.muted
                                 }
                                 .into(),
                             )
@@ -145,7 +273,7 @@ impl KitterApp {
                         if selected.is_some() {
                             p.accent
                         } else {
-                            p.secondary
+                            p.muted
                         },
                     ))
                     .tooltip(filter_tooltip),
@@ -283,11 +411,12 @@ impl KitterApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let p = self.palette();
-        let selected = selected_project_skills(all_rows, &self.projects_view.batch_selected);
+        let action = self.projects_view.batch_action;
+        let selected = selected_project_skills(all_rows, &self.projects_view.batch_selected, action);
         let selected_count = selected.len();
         let selectable_names = visible_rows
             .iter()
-            .filter(|row| row.can_remove())
+            .filter(|row| !row.batch_installations(action).is_empty())
             .map(|row| row.name.clone())
             .collect::<Vec<_>>();
         let all_selected = !selectable_names.is_empty()
@@ -318,23 +447,9 @@ impl KitterApp {
         let select_first_label = self.tr("请先选择技能", "Select skills first").to_string();
         let exit_label = self.tr("退出选择", "Exit selection").to_string();
         let select_names = selectable_names.clone();
-        let mut controls = div().h(px(37.)).flex().items_center().gap(px(4.)).child(
-            div()
-                .h(px(CONTROL_HEIGHT))
-                .min_w(px(22.))
-                .px(px(4.))
-                .font_family(MONO)
-                .text_size(px(11.))
-                .text_color(if selected_count > 0 {
-                    p.secondary
-                } else {
-                    p.muted
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(selected_count.to_string()),
-        );
+        let has_proma = all_rows.iter().any(|row| row.direct_installations.iter().any(|item| item.target == InstallTarget::Proma));
+        let mut controls = div().h(px(CONTROL_HEIGHT)).font_family(FONT_UI).font_weight(FontWeight::NORMAL)
+            .flex().items_center().gap(px(6.));
         if !select_names.is_empty() {
             controls = controls.child(
                 div()
@@ -388,9 +503,14 @@ impl KitterApp {
                     })),
             );
         }
-        controls
-            .child(self.project_skill_filter_control(cx))
-            .child(
+        let selected_label = if self.uses_english() { format!("{selected_count} selected") }
+            else { format!("已选 {selected_count}") };
+        controls = controls.child(div().h(px(CONTROL_HEIGHT)).min_w(px(42.))
+            .text_size(px(12.)).text_color(p.muted).flex().items_center().child(selected_label))
+            .child(self.project_batch_action_control(has_proma, cx));
+        controls = controls.child(self.project_skill_filter_control(cx));
+        if action == ProjectBatchAction::Remove {
+            controls = controls.child(
                 div()
                     .id("project-batch-remove")
                     .size(px(CONTROL_HEIGHT))
@@ -447,8 +567,11 @@ impl KitterApp {
                                 }),
                             )
                     }),
-            )
-            .child(
+            );
+        } else {
+            controls = controls.child(self.project_proma_state_control(selected, project, cx));
+        }
+        controls.child(
                 div()
                     .id("project-batch-cancel")
                     .size(px(CONTROL_HEIGHT))
@@ -517,6 +640,7 @@ impl KitterApp {
         };
         let can_delete = !installed_for_delete.installations.is_empty();
         let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
+        let can_select = !effective.batch_installations(self.projects_view.batch_action).is_empty();
         let batch_checked = self.projects_view.batch_selected.contains(&name);
         let row_selector = format!("project-skill-{name}");
         let mut row = div()
@@ -531,7 +655,7 @@ impl KitterApp {
             .flex()
             .items_center()
             .hover(move |row| row.bg(p.hover))
-            .when(batch_mode && can_delete, |row| {
+            .when(batch_mode && can_select, |row| {
                 row.child(
                     div()
                         .absolute()
@@ -548,6 +672,15 @@ impl KitterApp {
                             .checked(batch_checked),
                         ),
                 )
+            })
+            .when(batch_mode && !can_select, |row| {
+                let reason = self.project_batch_unavailable_reason(effective);
+                row.child(div().id(ElementId::Name(format!("batch-project-unavailable-{name}").into()))
+                    .absolute().left(px(8.)).top(px(0.)).bottom(px(0.))
+                    .flex().items_center().justify_center().w(px(16.))
+                    .child(div().size(px(16.)).rounded(px(4.)).border_1().border_color(p.border)
+                        .flex().items_center().justify_center().text_size(px(11.)).text_color(p.muted).child("−"))
+                    .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx)))
             })
             .child(div().size(px(15.)).flex_none().child(Self::icon(
                 "icons/package.svg",
@@ -621,7 +754,7 @@ impl KitterApp {
                 self.effective_agent_badges(format!("project-{name}"), &effective.agents, cx)
                     .ml(px(12.)),
             );
-        if batch_mode && can_delete {
+        if batch_mode && can_select {
             let selected_name = name.clone();
             row = row
                 .cursor_pointer()
@@ -633,7 +766,7 @@ impl KitterApp {
                     }
                     cx.notify();
                 }));
-        } else if can_delete {
+        } else if !batch_mode && can_delete {
             let project_for_delete = open_project.to_path_buf();
             row = row.child(
                 self.danger_icon_button(
@@ -1066,7 +1199,8 @@ impl KitterApp {
             let can_batch = batch_mode
                 || all_effective_rows
                     .iter()
-                    .any(|row| row.can_remove());
+                    .any(|row| row.can_remove() || !row.batch_installations(ProjectBatchAction::DisableProma).is_empty()
+                        || !row.batch_installations(ProjectBatchAction::EnableProma).is_empty());
             let effective_rows = if batch_mode {
                 Arc::new(all_effective_rows
                     .iter()
@@ -1126,23 +1260,25 @@ impl KitterApp {
             if !effective_rows.is_empty() {
                 let rows = Arc::clone(&effective_rows);
                 let items = Arc::new(grouped_skill_items(&rows, &self.projects_view.collapsed_skill_sources));
+                let list_key = (Some(open_project.clone()), self.projects_view.selected_project_agent, items.as_ref().clone());
+                if *self.projects_view.skill_list_items.borrow() != list_key {
+                    self.projects_view.skill_list.reset(items.len());
+                    *self.projects_view.skill_list_items.borrow_mut() = list_key;
+                }
                 let project = open_project.clone();
                 skills = skills.child(
-                    uniform_list(
-                        "project-skills-virtual-list",
-                        items.len(),
-                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|index| match &items[index] {
+                    div().id("project-skills-virtual-list")
+                        .debug_selector(|| "project-skills-virtual-list".into()).flex_1().min_h_0()
+                        .child(list(
+                        self.projects_view.skill_list.clone(),
+                        cx.processor(move |this, index, _, cx| {
+                            match &items[index] {
                                     ProjectSkillListItem::Header { group, count } => this.project_skill_group_header(*group, *count, cx),
                                     ProjectSkillListItem::Skill(index) => this.project_skill_row(&rows[*index], &project, cx),
-                                })
-                                .collect()
+                            }
                         }),
                     )
-                    .debug_selector(|| "project-skills-virtual-list".into())
-                    .flex_1()
-                    .min_h_0(),
+                    .size_full()),
                 );
             }
             let plugin_groups =
@@ -1163,7 +1299,7 @@ impl KitterApp {
                     div().id("project-skill-source-toggle-all")
                         .debug_selector(|| "project-skill-source-toggle-all".into()).h(px(CONTROL_HEIGHT)).px(px(8.))
                         .rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
-                        .text_size(px(11.)).text_color(p.secondary).hover(move |button| button.bg(p.hover))
+                        .font_family(FONT_UI).text_size(px(12.)).text_color(p.secondary).hover(move |button| button.bg(p.hover))
                         .child(if all_collapsed { self.tr("展开分组", "Expand groups") } else { self.tr("收起分组", "Collapse groups") })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             for key in &groups {
@@ -1184,12 +1320,12 @@ impl KitterApp {
                     ));
                 } else {
                     let batch_project_path = open_project.clone();
-                    let batch_label = self.tr("批量选择", "Select multiple").to_string();
+                    let batch_label = self.tr("批量管理", "Batch manage").to_string();
                     tabs = tabs.child(
-                        div().h(px(37.)).flex().items_center().child(
+                        div().h(px(CONTROL_HEIGHT)).flex().items_center().child(
                             div()
                                 .id("project-batch-toggle")
-                                .size(px(CONTROL_HEIGHT))
+                                .h(px(CONTROL_HEIGHT)).px(px(7.))
                                 .rounded(px(RADIUS_CONTROL))
                                 .flex()
                                 .items_center()
@@ -1197,12 +1333,17 @@ impl KitterApp {
                                 .cursor_pointer()
                                 .hover(move |button| button.bg(p.hover))
                                 .child(Self::icon("icons/check.svg", 15., p.secondary))
+                                .child(div().ml(px(4.)).text_size(px(12.)).text_color(p.secondary).child(batch_label.clone()))
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(batch_label.clone()).build(window, cx)
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.projects_view.batch_project =
                                         Some(batch_project_path.clone());
+                                    this.projects_view.batch_selected.clear();
+                                    this.projects_view.batch_action = if this.projects_view.selected_project_agent == Some(AgentKind::Proma) {
+                                        ProjectBatchAction::DisableProma
+                                    } else { ProjectBatchAction::Remove };
                                     cx.notify();
                                 })),
                         ),
@@ -1387,7 +1528,7 @@ mod tests {
                     target: InstallTarget::Universal,
                     path: PathBuf::from(path),
                     managed: true,
-                    removable: true,
+                    removable: true, toggleable: false,
                     bundled: false,
                     integration: None,
                     state: None,
@@ -1406,7 +1547,7 @@ mod tests {
         ];
         let selected = HashSet::from(["selected".to_string(), "external-only".to_string()]);
 
-        let targets = selected_project_skills(&rows, &selected);
+        let targets = selected_project_skills(&rows, &selected, super::ProjectBatchAction::Remove);
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name, "selected");
@@ -1428,9 +1569,41 @@ mod tests {
         assert!(mixed.can_remove());
         assert!(!protected.can_remove());
         let selected = HashSet::from(["mixed".into(), "protected".into()]);
-        let targets = selected_project_skills(&[mixed, protected], &selected);
+        let targets = selected_project_skills(&[mixed, protected], &selected, super::ProjectBatchAction::Remove);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].installations.len(), 1);
         assert_eq!(targets[0].installations[0].target, InstallTarget::Universal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preset_state_selection_targets_only_matching_proma_copies() {
+        use super::ProjectBatchAction;
+        let mut mixed = row("pdf", &["/project/.agents/skills/pdf", "/pilot/skills/pdf", "/pilot/skills-inactive/pdf"]);
+        for (index, state) in [(1, "active"), (2, "inactive")] {
+            let installation = &mut mixed.direct_installations[index];
+            installation.target = InstallTarget::Proma;
+            installation.managed = false;
+            installation.removable = false;
+            installation.bundled = true;
+            installation.toggleable = true;
+            installation.state = Some(state.into());
+        }
+        let mut external = mixed.clone();
+        external.name = "protected".into();
+        for installation in &mut external.direct_installations { installation.bundled = false; installation.toggleable = false; }
+        let inherited = row("inherited", &[]);
+        let rows = [mixed, external, inherited];
+        let selected = HashSet::from(["pdf".into(), "protected".into(), "inherited".into()]);
+        for (action, path) in [(ProjectBatchAction::DisableProma, "/pilot/skills/pdf"),
+                               (ProjectBatchAction::EnableProma, "/pilot/skills-inactive/pdf")] {
+            let targets = selected_project_skills(&rows, &selected, action);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].name, "pdf");
+            assert_eq!(targets[0].installations.len(), 1);
+            assert_eq!(targets[0].installations[0].path, PathBuf::from(path));
+        }
+        let removal = selected_project_skills(&rows, &selected, ProjectBatchAction::Remove);
+        assert_eq!(removal[0].installations[0].target, InstallTarget::Universal);
     }
 }

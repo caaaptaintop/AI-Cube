@@ -1,6 +1,39 @@
 use super::*;
 
 impl KitterApp {
+    pub(super) fn apply_project_proma_state(&mut self, skills: &[ProjectSkill], project: &Path, enabled: bool, cx: &mut Context<Self>) {
+        let action = if enabled { ProjectBatchAction::EnableProma } else { ProjectBatchAction::DisableProma };
+        if self.projects_view.batch_project.as_deref() != Some(project) || self.projects_view.batch_action != action {
+            self.show_notice(self.tr("当前项目或操作已变化，请重新选择", "The project or action changed; select again"), cx);
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut changed = 0;
+        let mut failures = Vec::new();
+        for skill in skills {
+            let mut succeeded = true;
+            for installation in &skill.installations {
+                if installation.target != InstallTarget::Proma || !seen.insert(installation.path.clone()) { continue; }
+                match crate::proma::set_enabled_path(&installation.path, enabled) {
+                    Ok(()) => changed += 1,
+                    Err(error) => {
+                        succeeded = false;
+                        failures.push(format!("{}：{error:#}", skill.name));
+                    }
+                }
+            }
+            if succeeded { self.projects_view.batch_selected.remove(&skill.name); }
+        }
+        if changed > 0 { self.refresh(cx); }
+        let verb = self.tr(if enabled { "启用" } else { "停用" }, if enabled { "enabled" } else { "disabled" });
+        let mut message = if self.uses_english() { format!("{changed} Proma copies {verb}") }
+            else { format!("已{verb} {changed} 个 Proma 副本") };
+        if !failures.is_empty() {
+            message.push_str(&format!("\n{}", failures.join("\n")));
+            self.show_sticky_notice(message, cx);
+        } else { self.show_notice(message, cx); }
+    }
+
     pub(super) fn normalize_open_project(&mut self) {
         if let Some(path) = &self.projects_view.open_project {
             let identity = crate::project_discovery::project_identity(

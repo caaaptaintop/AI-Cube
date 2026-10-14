@@ -560,6 +560,8 @@ thread_local! {
     static BEFORE_ROLLBACK_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_RECOVERY_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_FOLLOWER_REFRESH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static AFTER_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
 fn new_operation(
@@ -813,10 +815,19 @@ pub struct Installation {
     pub removable: bool,
     pub bundled: bool,
     pub integration: Option<String>,
+    toggleable: bool,
+}
+
+impl Installation {
+    /// Snapshot capability only; set_enabled_path rechecks the live package.
+    pub fn can_toggle(&self) -> bool {
+        self.toggleable
+    }
 }
 
 fn skill_entry_bytes(path: &Path) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
+    let file = Directory::open_anchored(path.parent()?).ok()?
+        .read(Path::new(path.file_name()?)).ok()?;
     let mut bytes = Vec::new();
     file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= LIMIT).then_some(bytes)
@@ -924,17 +935,21 @@ fn inspect_with_bundles(
             } else {
                 "unmanaged"
             };
-            // Match template content, never just a well-known name. This is
-            // provenance metadata; it grants no removal or runtime capability.
-            let bundled = !linked && found.is_none()
+            // An invalid managed marker must not fall back to preset rights.
+            let unmarked = fs::symlink_metadata(path.join(MARKER))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            let preset = unmarked && real_directory(&path).is_ok();
+            let integration = (preset
+                && integration_entries.get(&name).is_some_and(|expected| {
+                    skill_entry_fingerprint(&path.join("SKILL.md")).as_ref() == Some(expected)
+                })).then(|| "Nowledge Mem".to_string());
+            // Match template content, never just a well-known name. Bundled
+            // packages can move intact, but do not gain removal rights.
+            let bundled = preset && integration.is_none()
                 && bundled_entries.get(&name).is_some_and(|fingerprints| {
                     skill_entry_fingerprint(&path.join("SKILL.md"))
                         .is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
                 });
-            let integration = (!linked && found.is_none() && !bundled
-                && integration_entries.get(&name).is_some_and(|expected| {
-                    skill_entry_fingerprint(&path.join("SKILL.md")).as_ref() == Some(expected)
-                })).then(|| "Nowledge Mem".to_string());
             out.push(Installation {
                 name,
                 path,
@@ -945,6 +960,8 @@ fn inspect_with_bundles(
                 removable: recovery_clear && matches!(status, "current" | "update_pending"),
                 bundled,
                 integration,
+                toggleable: cfg!(unix) && recovery_clear
+                    && (matches!(status, "current" | "update_pending") || bundled),
             });
         }
     }
@@ -954,31 +971,88 @@ fn inspect_with_bundles(
 
 pub fn set_enabled(project: &Path, name: &str, enabled: bool) -> Result<()> {
     crate::library::validate_name(name)?;
-    let (root, w) = configured_workspace(project)?;
-    let workspace = Directory::open_anchored(&w.path)?;
-    let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
-    no_pending(&w)?;
+    let (_, w) = configured_workspace(project)?;
+    let from = if enabled { "skills-inactive" } else { "skills" };
+    set_enabled_path(&w.path.join(from).join(name), enabled)
+}
+
+/// Move one installation in its registered native workspace. A Finder project
+/// association is never used to select or fan out this operation.
+pub fn set_enabled_path(path: &Path, enabled: bool) -> Result<()> {
+    let root = home().context("无法定位 Proma 配置根")?;
+    set_enabled_path_with_bundles(&root, path, enabled, &bundled_entry_fingerprints(&root))
+}
+
+fn set_enabled_path_with_bundles(
+    root: &Path, path: &Path, enabled: bool,
+    bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("Proma 安装位置必须是绝对路径");
+    }
+    let name = path.file_name().and_then(|p| p.to_str()).context("缺少技能名称")?;
+    crate::library::validate_name(name)?;
     let (from, to) = if enabled {
         ("skills-inactive", "skills")
     } else {
         ("skills", "skills-inactive")
     };
+    let parent = path.parent().context("安装位置缺少父目录")?;
+    if parent.file_name().and_then(|p| p.to_str()) != Some(from) {
+        bail!("启停源目录应为 {from}，请刷新安装状态");
+    }
+    let w = workspace_for_path(root, parent.parent().context("安装位置缺少工作区")?)?;
+    let workspace = Directory::open_anchored(&w.path)?;
+    let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
+    no_pending(&w)?;
     let source = w.path.join(from).join(name);
-    clean_marker(&source, &w)?;
-    let expected = observed(&source)?;
-    let input = workspace.child(Path::new(from))?;
+    // Open the supplied path as well, rejecting linked or traversing aliases.
+    let input = Directory::open_anchored(parent)?;
+    input.verify_location(source.parent().context("缺少源目录")?)?;
+    real_directory(&source)?;
+    let expected = input.observation(Path::new(name))?;
+    let installation = inspect_with_bundles(root, &w.path, bundled_entries)?
+        .into_iter().find(|item| item.path == source)
+        .context("未找到可启停的 Proma 安装")?;
+    if !installation.can_toggle() {
+        bail!("只允许启停未修改的受管安装或经核验的内置预设");
+    }
+    if installation.managed {
+        clean_marker(&source, &w)?;
+    }
     workspace.mkdir(Path::new(to))?;
     let output = workspace.child(Path::new(to))?;
-    if workspace_for_path(&root, &w.path)? != w {
-        bail!("Proma 工作区身份已变化");
+    if workspace_for_path(root, &w.path)? != w
+        || input.observation(Path::new(name))? != expected
+    {
+        bail!("Proma 工作区或安装内容已变化");
     }
+    no_pending(&w)?;
     workspace.verify_location(&w.path)?;
+    input.verify_location(&w.path.join(from))?;
+    output.verify_location(&w.path.join(to))?;
+    #[cfg(test)]
+    BEFORE_TOGGLE_MOVE.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() {
+            callback();
+        }
+    });
     input.rename_to(Path::new(name), &output, Path::new(name))?;
+    #[cfg(test)]
+    AFTER_TOGGLE_MOVE.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() {
+            callback();
+        }
+    });
     if !output
         .observation(Path::new(name))
         .is_ok_and(|value| value == expected)
+        || workspace.verify_location(&w.path).is_err()
+        || input.verify_location(&w.path.join(from)).is_err()
+        || output.verify_location(&w.path.join(to)).is_err()
     {
-        output.rename_to(Path::new(name), &input, Path::new(name))?;
+        output.rename_to(Path::new(name), &input, Path::new(name))
+            .context("启停校验失败，无法恢复原位置；保留两个目录中的现场")?;
         bail!("技能在启停期间变化，已恢复原位置");
     }
     Ok(())
@@ -1144,6 +1218,240 @@ mod tests {
         .unwrap();
         fs::write(source.join("local-data/private.env"), "fixture-secret").unwrap();
         (temp, root, project, source)
+    }
+
+    fn builtin_fixture() -> (
+        tempfile::TempDir, PathBuf, PathBuf, BTreeMap<String, BTreeSet<[u8; 32]>>,
+    ) {
+        let (temp, root, project, source) = fixture();
+        let templates = root.join("fixture-app/default-skills");
+        let template = templates.join("example");
+        let copy = project.join("skills/example");
+        fs::create_dir_all(&template).unwrap();
+        fs::create_dir_all(copy.join("scripts")).unwrap();
+        fs::create_dir_all(copy.join("local-data/empty")).unwrap();
+        fs::copy(source.join("SKILL.md"), template.join("SKILL.md")).unwrap();
+        fs::copy(template.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
+        fs::write(copy.join("scripts/run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(copy.join(".extra.bin"), [0, 1, 255]).unwrap();
+        fs::write(copy.join("local-data/notes.txt"), "keep local notes").unwrap();
+        let bundles = bundled_entry_fingerprints_in(&root.join("default-skills"), &templates);
+        (temp, root, project, bundles)
+    }
+
+    #[test]
+    fn builtin_toggle_round_trip_preserves_the_entire_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, root, project, bundles) = builtin_fixture();
+        let active = project.join("skills/example");
+        let inactive = project.join("skills-inactive/example");
+        fs::set_permissions(active.join("scripts/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let body = fs::read(active.join("SKILL.md")).unwrap();
+        let before = observed(&active).unwrap();
+        let scan = inspect_with_bundles(&root, &project, &bundles).unwrap();
+        assert!(scan[0].bundled && scan[0].can_toggle());
+        assert!(!scan[0].managed && !scan[0].removable);
+        for (path, enabled, destination) in [(&active, false, &inactive), (&inactive, true, &active)] {
+            set_enabled_path_with_bundles(&root, path, enabled, &bundles).unwrap();
+            assert!(!path.exists());
+            assert_eq!(observed(destination).unwrap(), before);
+            assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), body);
+            assert_eq!(fs::read(destination.join(".extra.bin")).unwrap(), [0, 1, 255]);
+            assert_eq!(fs::read_to_string(destination.join("local-data/notes.txt")).unwrap(), "keep local notes");
+            assert!(destination.join("local-data/empty").is_dir());
+            assert!(!destination.join(MARKER).exists());
+            assert!(inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+        }
+    }
+
+    #[test]
+    fn toggle_never_replaces_same_name_targets_in_either_direction() {
+        for enabled in [false, true] {
+            for dangling in [false, true] {
+                let (_temp, root, project, bundles) = builtin_fixture();
+                let active = project.join("skills/example");
+                let inactive = project.join("skills-inactive/example");
+                fs::create_dir_all(inactive.parent().unwrap()).unwrap();
+                let (source, destination) = if enabled {
+                    fs::rename(&active, &inactive).unwrap();
+                    (&inactive, &active)
+                } else { (&active, &inactive) };
+                if dangling {
+                    std::os::unix::fs::symlink(project.join("absent"), destination).unwrap();
+                } else {
+                    fs::create_dir(destination).unwrap();
+                }
+                let before = observed(source).unwrap();
+                let target_before = observed(destination).unwrap();
+                assert!(set_enabled_path_with_bundles(&root, source, enabled, &bundles).is_err());
+                assert_eq!(observed(source).unwrap(), before);
+                assert_eq!(observed(destination).unwrap(), target_before);
+            }
+        }
+    }
+
+    #[test]
+    fn managed_toggle_keeps_clean_marker_guards_and_allows_pending_updates() {
+        let (_temp, root, project, source) = fixture();
+        let plan = plan_install(&root, &project, &source, "example").unwrap();
+        apply_plan(&plan).unwrap();
+        fs::write(source.join("SKILL.md"), "new upstream version").unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert_eq!(scan[0].status, "update_pending");
+        assert!(scan[0].can_toggle());
+        let before = observed(&plan.destination).unwrap();
+        let inactive = project.join("skills-inactive/example");
+        set_enabled_path_with_bundles(&root, &plan.destination, false, &BTreeMap::new()).unwrap();
+        assert_eq!(observed(&inactive).unwrap(), before);
+        set_enabled_path_with_bundles(&root, &inactive, true, &BTreeMap::new()).unwrap();
+        assert_eq!(observed(&plan.destination).unwrap(), before);
+        let original = fs::read(plan.destination.join("SKILL.md")).unwrap();
+        for edit_entry in [true, false] {
+            if edit_entry {
+                fs::write(plan.destination.join("SKILL.md"), "local edit").unwrap();
+            } else {
+                fs::write(plan.destination.join("SKILL.md"), &original).unwrap();
+                fs::write(plan.destination.join("new.txt"), "local addition").unwrap();
+            }
+            // Even an exact application template cannot override a dirty marker.
+            let fingerprint = skill_entry_fingerprint(&plan.destination.join("SKILL.md")).unwrap();
+            let bundles = BTreeMap::from([("example".into(), BTreeSet::from([fingerprint]))]);
+            assert!(!inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+            let before = observed(&plan.destination).unwrap();
+            assert!(set_enabled_path_with_bundles(&root, &plan.destination, false, &bundles).is_err());
+            assert_eq!(observed(&plan.destination).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn toggle_rechecks_presets_and_rejects_unmanaged_or_linked_entries() {
+        for kind in ["mismatch", "unmanaged", "external", "entry_link", "invalid_marker", "marker_link", "integration"] {
+            let (_temp, root, project, mut bundles) = builtin_fixture();
+            let copy = project.join("skills/example");
+            assert!(inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+            match kind {
+                "mismatch" => fs::write(copy.join("SKILL.md"), "changed after UI snapshot").unwrap(),
+                "unmanaged" => bundles.clear(),
+                "external" => {
+                    fs::rename(&copy, project.join("external")).unwrap();
+                    std::os::unix::fs::symlink(project.join("external"), &copy).unwrap();
+                }
+                "entry_link" => {
+                    fs::rename(copy.join("SKILL.md"), project.join("external.md")).unwrap();
+                    std::os::unix::fs::symlink(project.join("external.md"), copy.join("SKILL.md")).unwrap();
+                }
+                "invalid_marker" => fs::write(copy.join(MARKER), "invalid").unwrap(),
+                "marker_link" => std::os::unix::fs::symlink(project.join("missing-marker"), copy.join(MARKER)).unwrap(),
+                "integration" => {
+                    let body = "Nowledge Mem integration";
+                    let entry = project.join("skills/status");
+                    fs::rename(&copy, &entry).unwrap();
+                    let template = root.join("default-skills/status");
+                    fs::create_dir_all(&template).unwrap();
+                    fs::write(template.join("SKILL.md"), body).unwrap();
+                    fs::write(entry.join("SKILL.md"), body).unwrap();
+                    // Integration identity still wins over a matching bundle.
+                    bundles.insert("status".into(), BTreeSet::from([skill_entry_fingerprint(&entry.join("SKILL.md")).unwrap()]));
+                }
+                _ => unreachable!(),
+            }
+            let path = if kind == "integration" { project.join("skills/status") } else { copy };
+            let before = observed(&path).unwrap();
+            let scan = inspect_with_bundles(&root, &project, &bundles).unwrap();
+            assert!(!scan[0].can_toggle(), "{kind}");
+            assert!(set_enabled_path_with_bundles(&root, &path, false, &bundles).is_err(), "{kind}");
+            assert_eq!(observed(&path).unwrap(), before, "{kind}");
+            assert!(!project.join("skills-inactive").exists());
+        }
+    }
+
+    #[test]
+    fn toggle_requires_registered_native_path_and_expected_source_directory() {
+        let (temp, root, project, bundles) = builtin_fixture();
+        let active = project.join("skills/example");
+        let before = observed(&active).unwrap();
+        assert!(set_enabled_path_with_bundles(&root, &active, true, &bundles).is_err());
+        assert!(set_enabled_path_with_bundles(&root, Path::new("skills/example"), false, &bundles).is_err());
+        let unrelated = root.join("agent-workspaces/unregistered");
+        let business = temp.path().join("business");
+        for workspace in [&unrelated, &business] {
+            fs::create_dir_all(workspace.join("skills/example")).unwrap();
+            fs::copy(active.join("SKILL.md"), workspace.join("skills/example/SKILL.md")).unwrap();
+            let path = workspace.join("skills/example");
+            let original = observed(&path).unwrap();
+            assert!(set_enabled_path_with_bundles(&root, &path, false, &bundles).is_err());
+            assert_eq!(observed(&path).unwrap(), original);
+            assert!(!workspace.join("skills-inactive").exists());
+        }
+        // A Finder association does not make its Skill directory native.
+        fs::write(root.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({
+            "version": 2, "workspaces": [{"id": "workspace-1", "slug": "pilot", "name": "Pilot", "projectRootPath": business}]
+        })).unwrap()).unwrap();
+        assert!(set_enabled_path_with_bundles(&root, &business.join("skills/example"), false, &bundles).is_err());
+        fs::create_dir_all(project.join("other/example")).unwrap();
+        assert!(set_enabled_path_with_bundles(&root, &project.join("other/example"), false, &bundles).is_err());
+        let alias = temp.path().join("native-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        assert!(set_enabled_path_with_bundles(&root, &alias.join("skills/example"), false, &bundles).is_err());
+        assert_eq!(observed(&active).unwrap(), before);
+        assert!(!project.join("skills-inactive").exists());
+    }
+
+    #[test]
+    fn toggle_rejects_pending_recovery_and_a_concurrent_writer() {
+        let (_temp, root, project, bundles) = builtin_fixture();
+        let active = project.join("skills/example");
+        let before = observed(&active).unwrap();
+        let workspace = Directory::open_anchored(&project).unwrap();
+        let lock = workspace.lock(Path::new(".kitter-proma.lock")).unwrap();
+        assert!(set_enabled_path_with_bundles(&root, &active, false, &bundles).is_err());
+        drop(lock);
+        let pending = project.join(RECOVERY).join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let transaction = Transaction {
+            workspace: workspace_for_path(&root, &project).unwrap(), workspace_signature: workspace.identity().unwrap(),
+            target: active.clone(), backup: None, before: before.clone(), after: String::new(), phase: "prepared".into(),
+        };
+        fs::write(pending.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
+        let scan = inspect_with_bundles(&root, &project, &bundles).unwrap();
+        assert!(scan[0].bundled && !scan[0].can_toggle());
+        assert!(set_enabled_path_with_bundles(&root, &active, false, &bundles).is_err());
+        assert_eq!(observed(&active).unwrap(), before);
+        assert!(!project.join("skills-inactive").exists());
+    }
+
+    #[test]
+    fn toggle_restores_a_package_changed_in_the_last_rename_gap() {
+        for reoccupy in [false, true] {
+            let (_temp, root, project, bundles) = builtin_fixture();
+            let active = project.join("skills/example");
+            let changed = active.clone();
+            let inactive = project.join("skills-inactive/example");
+            if reoccupy {
+                AFTER_TOGGLE_MOVE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        fs::write(inactive.join("extra.txt"), "concurrent edit").unwrap();
+                        fs::create_dir(&changed).unwrap();
+                        fs::write(changed.join("keep.txt"), "new occupant").unwrap();
+                    }));
+                });
+            } else {
+                BEFORE_TOGGLE_MOVE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        fs::write(changed.join("extra.txt"), "concurrent edit").unwrap();
+                    }));
+                });
+            }
+            assert!(set_enabled_path_with_bundles(&root, &active, false, &bundles).is_err());
+            if reoccupy {
+                assert_eq!(fs::read_to_string(active.join("keep.txt")).unwrap(), "new occupant");
+                assert!(project.join("skills-inactive/example/extra.txt").is_file());
+            } else {
+                assert_eq!(fs::read_to_string(active.join("extra.txt")).unwrap(), "concurrent edit");
+                assert!(active.join("SKILL.md").is_file());
+                assert!(!project.join("skills-inactive/example").exists());
+            }
+        }
     }
 
     #[test]
@@ -1749,5 +2057,28 @@ mod tests {
                 .join("previous/SKILL.md")
                 .is_file()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_rejects_unsupported_writes_without_changing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("proma");
+        let project = root.join("agent-workspaces/pilot");
+        let active = project.join("skills/example");
+        fs::create_dir_all(&active).unwrap();
+        fs::write(root.join("agent-workspaces.json"),
+            r#"{"version":1,"workspaces":[{"id":"workspace-1","slug":"pilot","name":"Pilot"}]}"#).unwrap();
+        fs::write(active.join("SKILL.md"), "builtin fixture").unwrap();
+        let fingerprint = Sha256::digest(b"builtin fixture").into();
+        let bundles = BTreeMap::from([("example".into(), BTreeSet::from([fingerprint]))]);
+        assert!(set_enabled_path_with_bundles(&root, &active, false, &bundles).is_err());
+        assert_eq!(fs::read_to_string(active.join("SKILL.md")).unwrap(), "builtin fixture");
+        assert!(!project.join("skills-inactive").exists());
+        assert!(!project.join(".kitter-proma.lock").exists());
     }
 }

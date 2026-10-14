@@ -161,6 +161,13 @@ enum ProjectSkillsTab {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectBatchAction {
+    Remove,
+    DisableProma,
+    EnableProma,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AddKind {
     Local,
     Npx,
@@ -853,6 +860,7 @@ impl KitterApp {
                 batch_project: None,
                 batch_selected: HashSet::new(),
                 batch_filter: None,
+                batch_action: ProjectBatchAction::Remove,
                 project_skills_tab: ProjectSkillsTab::Skills,
                 selected_project_agent: preview_proma.then_some(AgentKind::Proma),
                 project_agents_expanded: false,
@@ -861,6 +869,8 @@ impl KitterApp {
                 project_select,
                 project_snapshots: RefCell::new(BTreeMap::new()),
                 skill_rows_cache: RefCell::new(SkillRowsCache::default()),
+                skill_list: ListState::new(0, ListAlignment::Top, px(120.)),
+                skill_list_items: RefCell::new((None, None, Vec::new())),
                 project_snapshot_tasks: RefCell::new(BTreeMap::new()),
                 context_estimates: RefCell::new(BTreeMap::new()),
                 context_estimate_tasks: RefCell::new(BTreeMap::new()),

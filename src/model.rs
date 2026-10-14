@@ -220,6 +220,9 @@ pub struct ProjectSkillInstallation {
     /// Read-only scan result for removal controls; mutations still revalidate.
     #[serde(default)]
     pub removable: bool,
+    /// Read-only Proma state-change capability; mutations recheck live files.
+    #[serde(default)]
+    pub toggleable: bool,
     #[serde(default)]
     pub bundled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
