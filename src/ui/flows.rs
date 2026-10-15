@@ -87,6 +87,7 @@ impl KitterApp {
     }
 
     pub(super) fn open_install_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_installed_agents();
         self.install_flow.modal = true;
         self.install_flow.global = self.projects_view.global_project_view;
         self.install_flow.project_picker_open = false;

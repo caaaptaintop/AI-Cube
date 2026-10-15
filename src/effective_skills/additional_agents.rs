@@ -458,7 +458,7 @@ mod tests {
         if agent == AgentKind::DimAgent {
             return adapters::inspect_dimagent(context, context.home.join(".dimcode/v2"));
         }
-        adapters::inspect_project(context, false)
+        adapters::inspect_project(context, false, crate::agents::AGENT_ICON_ORDER)
             .into_iter()
             .find(|s| s.agent == agent)
             .unwrap()

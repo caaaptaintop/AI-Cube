@@ -194,36 +194,38 @@ legacy_adapter!(HermesAdapter, HermesPolicy);
 pub(super) fn inspect_project(
     context: &DiscoveryContext,
     include_global_only: bool,
+    agents: &[crate::agents::AgentIconInfo],
 ) -> Vec<AgentContextEstimate> {
     let dimagent = DimAgentAdapter {
         home: super::additional_agents::dim_home(context),
     };
-    let adapters: [&dyn AgentAdapter; 12] = [
-        &CodexAdapter,
-        &ClaudeCodeAdapter,
-        &CursorAdapter,
-        &OpenCodeAdapter,
-        &CopilotAdapter,
-        &AntigravityAdapter,
-        &AmpAdapter,
-        &DroidAdapter,
-        &PiAdapter,
-        &OmpAdapter,
-        &dimagent,
-        &GrokAdapter,
+    let adapters: [(&str, &dyn AgentAdapter); 12] = [
+        ("codex", &CodexAdapter),
+        ("claude-code", &ClaudeCodeAdapter),
+        ("cursor", &CursorAdapter),
+        ("opencode", &OpenCodeAdapter),
+        ("copilot", &CopilotAdapter),
+        ("antigravity", &AntigravityAdapter),
+        ("amp", &AmpAdapter),
+        ("droid", &DroidAdapter),
+        ("pi", &PiAdapter),
+        ("omp", &OmpAdapter),
+        ("dimagent", &dimagent),
+        ("grok", &GrokAdapter),
     ];
+    let installed = |id| agents.iter().any(|agent| agent.id == id);
     let mut estimates = adapters
         .into_iter()
-        .map(|adapter| adapter.inspect(context))
+        .filter(|(id, _)| installed(*id))
+        .map(|(_, adapter)| adapter.inspect(context))
         .collect::<Vec<_>>();
-    if !super::proma_workspaces(context).is_empty() {
+    if installed("proma") && !super::proma_workspaces(context).is_empty() {
         estimates.push(PromaAdapter.inspect(context));
     }
     if include_global_only {
-        estimates.extend([
-            OpenClawAdapter.inspect(context),
-            HermesAdapter.inspect(context),
-        ]);
+        for (id, adapter) in [("openclaw", &OpenClawAdapter as &dyn AgentAdapter), ("hermes", &HermesAdapter)] {
+            if installed(id) { estimates.push(adapter.inspect(context)); }
+        }
     }
     estimates
 }
