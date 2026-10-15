@@ -326,6 +326,7 @@ mod tests {
         assert_ne!(projects[0].path, path_identity(&native));
     }
 
+    #[cfg(unix)]
     #[test]
     fn multi_workspace_projects_use_business_name_and_keep_native_roots() {
         let temp = tempfile::tempdir().unwrap();
