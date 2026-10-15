@@ -21,6 +21,7 @@ use super::{
 };
 
 pub(super) struct AppModel {
+    pub installed_agents: Vec<crate::agents::AgentIconInfo>,
     pub library: SkillLibrary,
     pub skills: Vec<SkillSummary>,
     pub update_check: Option<source::UpdateCheckProgress>,

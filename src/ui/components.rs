@@ -117,6 +117,17 @@ impl KitterApp {
         }
     }
 
+    pub(super) fn agent_status_icon(&self, path: &'static str, size: f32, installed: bool) -> AnyElement {
+        let p = self.palette();
+        if installed {
+            Self::brand_icon(path, size, p.text, self.uses_dark_theme())
+        } else if path.ends_with(".png") {
+            div().opacity(0.4).child(Self::brand_icon(path, size, p.muted, self.uses_dark_theme())).into_any_element()
+        } else {
+            Self::icon(path, size, p.muted).into_any_element()
+        }
+    }
+
     pub(super) fn manual_skill_badge(&self) -> Div {
         let p = self.palette();
         div()
@@ -174,8 +185,16 @@ impl KitterApp {
                 }),
             );
         let is_global_context = dirs::home_dir().as_ref().is_some_and(|home| home == path);
+        let unavailable = crate::agents::AGENT_ICON_ORDER.iter().filter_map(|info| {
+            let agent = AgentKind::from_id(info.id)?;
+            (!estimates.iter().any(|estimate| estimate.agent == agent)).then_some(AgentContextEstimate {
+                agent, discovered_count: 0, model_visible_count: 0, manual_only_count: 0,
+                name_only_count: 0, conditional_count: 0, estimated_tokens: 0, skills: Vec::new(),
+            })
+        }).collect::<Vec<_>>();
         let mut ordered_estimates = estimates
             .iter()
+            .chain(unavailable.iter())
             .filter(|estimate| {
                 let is_global_only = crate::agents::AGENT_ICON_ORDER
                     .iter()
@@ -185,10 +204,8 @@ impl KitterApp {
             })
             .collect::<Vec<_>>();
         ordered_estimates.sort_by_key(|estimate| {
-            crate::agents::AGENT_ICON_ORDER
-                .iter()
-                .position(|agent| agent.id == estimate.agent.id())
-                .unwrap_or(usize::MAX)
+            crate::agents::display_sort_key(estimate.agent.label(),
+                self.model.installed_agents.iter().any(|agent| agent.id == estimate.agent.id()))
         });
         let expanded = self.projects_view.project_agents_expanded;
         let selected_agent = self.projects_view.selected_project_agent;
@@ -273,6 +290,8 @@ impl KitterApp {
                 continue;
             }
             let agent = estimate.agent;
+            let installed = self.model.installed_agents.iter().any(|info| info.id == agent.id());
+            let has_estimate = installed && estimates.iter().any(|item| item.agent == agent);
             let selected = self.projects_view.selected_project_agent == Some(agent);
             let automatic_count = estimate
                 .model_visible_count
@@ -284,7 +303,7 @@ impl KitterApp {
             else {
                 continue;
             };
-            let severity = if estimate.estimated_tokens >= CONTEXT_TOKEN_DANGER_THRESHOLD
+            let severity = if !has_estimate { p.muted } else if estimate.estimated_tokens >= CONTEXT_TOKEN_DANGER_THRESHOLD
                 || automatic_count >= CONTEXT_COUNT_DANGER_THRESHOLD
             {
                 p.danger
@@ -295,17 +314,25 @@ impl KitterApp {
             } else {
                 p.success
             };
-            let automatic = if self.uses_english() {
+            let automatic = if !installed {
+                self.tr("未安装", "Not installed").to_string()
+            } else if !has_estimate {
+                if agent == AgentKind::Proma && is_global_context {
+                    self.tr("仅项目可用", "Project only").to_string()
+                } else {
+                    self.tr("未关联工作区", "No workspace linked").to_string()
+                }
+            } else if self.uses_english() {
                 format!("{} automatic", automatic_count)
             } else {
                 format!("{} 自动", automatic_count)
             };
-            let manual = if self.uses_english() {
+            let manual = if !has_estimate { String::new() } else if self.uses_english() {
                 format!(" · {} manual", estimate.manual_only_count)
             } else {
                 format!(" · {} 手动", estimate.manual_only_count)
             };
-            let detail = if self.uses_english() {
+            let detail = if !has_estimate { "—".to_string() } else if self.uses_english() {
                 format!(
                     "{} conditional · {} name-only",
                     estimate.conditional_count, estimate.name_only_count
@@ -334,13 +361,13 @@ impl KitterApp {
                     .pr(px(36.))
                     .py(px(2.))
                     .rounded(px(6.))
-                    .cursor_pointer()
+                    .when(has_estimate, |row| row.cursor_pointer())
                     .bg(if selected {
                         p.selected
                     } else {
                         rgba(0x00000000)
                     })
-                    .hover(move |card| card.bg(p.hover))
+                    .when(has_estimate, |row| row.hover(move |card| card.bg(p.hover)))
                     .child(
                         div()
                             .h(px(20.))
@@ -348,7 +375,7 @@ impl KitterApp {
                             .items_center()
                             .gap(px(8.))
                             .text_size(px(11.))
-                            .text_color(p.secondary)
+                            .text_color(if installed { p.secondary } else { p.muted })
                             .child(
                                 div()
                                     .size(px(18.))
@@ -356,11 +383,10 @@ impl KitterApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(Self::brand_icon(
+                                    .child(self.agent_status_icon(
                                         icon,
                                         Self::brand_icon_size(icon, 15.),
-                                        p.text,
-                                        self.uses_dark_theme(),
+                                        installed,
                                     )),
                             )
                             .child(
@@ -379,7 +405,7 @@ impl KitterApp {
                                     .text_size(px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(severity)
-                                    .child(format!("≈ {} tokens", estimate.estimated_tokens)),
+                                    .child(if has_estimate { format!("≈ {} tokens", estimate.estimated_tokens) } else { "—".to_string() }),
                             )
                             .child(
                                 div()
@@ -404,6 +430,7 @@ impl KitterApp {
                             }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if !has_estimate { return; }
                         this.projects_view.selected_project_agent =
                             (this.projects_view.selected_project_agent != Some(agent))
                                 .then_some(agent);
@@ -483,6 +510,18 @@ impl KitterApp {
             .border_color(p.border)
             .bg(p.surface)
             .overflow_hidden()
+            .child(
+                div()
+                    .px(px(14.))
+                    .pt(px(8.))
+                    .pb(px(4.))
+                    .text_size(px(10.))
+                    .text_color(p.muted)
+                    .child(self.tr(
+                        "未安装的 Agent 显示为灰色 · 技能与 Token 为已安装 Agent 的目录扫描估算",
+                        "Uninstalled Agents are gray · Skills and tokens are estimated for installed Agents",
+                    )),
+            )
             .child(table)
             .child(expand_control)
             .child(refresh_button.absolute().bottom(px(0.)).right(px(7.)));

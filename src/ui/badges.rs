@@ -24,7 +24,7 @@ impl KitterApp {
             .items_center()
             .gap(px(4.))
             .flex_wrap();
-        for agent in crate::agents::AGENT_ICON_ORDER
+        for agent in self.model.installed_agents
             .iter()
             .copied()
             .filter(|agent| entry.agents.iter().any(|kind| kind.id() == agent.id))
@@ -290,7 +290,7 @@ impl KitterApp {
         include_global_only: bool,
         cx: &mut Context<Self>,
     ) -> Div {
-        let agents = crate::agents::AGENT_ICON_ORDER
+        let agents = self.model.installed_agents
             .iter()
             .filter(|agent| {
                 if agent.global_only {
@@ -310,7 +310,7 @@ impl KitterApp {
         kinds: &[AgentKind],
         cx: &mut Context<Self>,
     ) -> Div {
-        let agents = crate::agents::AGENT_ICON_ORDER
+        let agents = self.model.installed_agents
             .iter()
             .filter(|agent| kinds.iter().any(|kind| kind.id() == agent.id))
             .map(|agent| (agent.name, agent.icon_path))
@@ -321,9 +321,10 @@ impl KitterApp {
     pub(super) fn render_agent_badges(
         &self,
         popover_id: String,
-        agents: Vec<(&'static str, &'static str)>,
+        mut agents: Vec<(&'static str, &'static str)>,
         cx: &mut Context<Self>,
     ) -> Div {
+        agents.sort_by_key(|(name, _)| crate::agents::display_sort_key(name, true));
         let p = self.palette();
         let dark = self.uses_dark_theme();
         let hidden = agents.len().saturating_sub(5);

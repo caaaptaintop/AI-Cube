@@ -37,6 +37,13 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    pub fn from_id(id: &str) -> Option<Self> {
+        [Self::Codex, Self::ClaudeCode, Self::Cursor, Self::OpenCode, Self::Copilot,
+            Self::Antigravity, Self::Amp, Self::Droid, Self::Pi, Self::Proma,
+            Self::Omp, Self::DimAgent, Self::Grok, Self::OpenClaw, Self::Hermes]
+            .into_iter().find(|agent| agent.id() == id)
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Codex => "codex",
@@ -380,9 +387,6 @@ enum NameCollision {
 trait AgentSkillPolicy {
     fn agent(&self) -> AgentKind;
     fn roots(&self, context: &DiscoveryContext) -> Vec<SkillRoot>;
-    fn builtins(&self, _context: &DiscoveryContext) -> Vec<EffectiveSkill> {
-        Vec::new()
-    }
     fn is_enabled(
         &self,
         _skill_dir: &Path,
@@ -504,17 +508,33 @@ const PiPolicy: PiAdapter = PiAdapter;
 const GrokPolicy: GrokAdapter = GrokAdapter;
 
 pub fn estimate_project(project: &Path) -> Vec<AgentContextEstimate> {
-    let home = dirs::home_dir().unwrap_or_else(|| project.to_path_buf());
-    estimate_project_with_home(project, &home)
+    estimate_project_for_agents(project, &crate::agents::installed_agents())
 }
 
+pub fn estimate_project_for_agents(
+    project: &Path,
+    agents: &[crate::agents::AgentIconInfo],
+) -> Vec<AgentContextEstimate> {
+    let home = dirs::home_dir().unwrap_or_else(|| project.to_path_buf());
+    estimate_for_agents(project, &home, agents)
+}
+
+/// Explicit compatibility inspection, also used with isolated fixture homes.
 pub fn estimate_project_with_home(project: &Path, home: &Path) -> Vec<AgentContextEstimate> {
+    estimate_for_agents(project, home, crate::agents::AGENT_ICON_ORDER)
+}
+
+fn estimate_for_agents(
+    project: &Path,
+    home: &Path,
+    agents: &[crate::agents::AgentIconInfo],
+) -> Vec<AgentContextEstimate> {
     let context = DiscoveryContext {
         cwd: project.to_path_buf(),
         home: home.to_path_buf(),
         repository_root: find_repository_root(project),
     };
-    adapters::inspect_project(&context, project == home)
+    adapters::inspect_project(&context, project == home, agents)
 }
 
 #[derive(Clone, Copy)]
@@ -599,11 +619,8 @@ fn discover(
     scan_profile: scanner::ScanProfile,
     metadata_profile: MetadataProfile,
 ) -> Vec<EffectiveSkill> {
-    let mut result = policy.builtins(context);
-    let mut ids = result
-        .iter()
-        .map(|skill| skill.id.clone())
-        .collect::<HashSet<_>>();
+    let mut result = Vec::new();
+    let mut ids = HashSet::new();
     let mut canonical_paths = HashSet::new();
     for root in policy.roots(context) {
         for skill_file in scanner::scan(&root, scan_profile) {
@@ -1057,24 +1074,6 @@ impl AgentSkillPolicy for OpenCodePolicy {
                 .map(|(path, scope)| SkillRoot::new(path, scope).with_root_markdown()),
         );
         roots
-    }
-
-    fn builtins(&self, context: &DiscoveryContext) -> Vec<EffectiveSkill> {
-        if opencode_skill_permission(context, "customize-opencode") == "deny" {
-            return Vec::new();
-        }
-        vec![EffectiveSkill {
-            id: "customize-opencode".to_string(),
-            name: "customize-opencode".to_string(),
-            description: "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself.".to_string(),
-            when_to_use: None,
-            path: PathBuf::from("<built-in>"),
-            root_path: None,
-            prompt_path: None,
-            scope: SkillScope::System,
-            visibility: SkillVisibility::Automatic,
-            source: SkillSource::Builtin,
-        }]
     }
 
     fn is_enabled(
@@ -4396,6 +4395,58 @@ path = 'D:\skills\active\SKILL.md'
                 .visibility,
             SkillVisibility::ManualOnly
         );
+    }
+
+    #[test]
+    fn installed_agent_filter_excludes_compatible_but_absent_agents() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        write_skill(&home.join(".agents/skills"), "shared", "");
+        write_skill(&home.join(".opencode/skills"), "leftover", "");
+        let agents = crate::agents::AGENT_ICON_ORDER.iter().copied()
+            .filter(|agent| matches!(agent.id, "codex" | "grok")).collect::<Vec<_>>();
+        assert!(estimate_for_agents(&home, &home, &[]).is_empty());
+        let estimates = estimate_for_agents(&home, &home, &agents);
+        assert_eq!(estimates.iter().map(|estimate| estimate.agent).collect::<Vec<_>>(), [AgentKind::Codex, AgentKind::Grok]);
+        for estimate in estimates {
+            assert_eq!(estimate.discovered_count, 1);
+            assert_eq!(estimate.skills[0].name, "shared");
+        }
+    }
+
+    #[test]
+    fn opencode_estimates_only_skills_with_local_evidence() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        for cwd in [&home, &repo] {
+            let context = DiscoveryContext {
+                cwd: cwd.clone(),
+                home: home.clone(),
+                repository_root: (cwd == &repo).then(|| repo.clone()),
+            };
+            let estimate = estimate_with_policy(&OpenCodePolicy, &context);
+            assert_eq!(estimate.discovered_count, 0);
+            assert_eq!(estimate.estimated_tokens, 0);
+        }
+
+        // Shared compatibility remains discoverable without an OpenCode install,
+        // including a real skill that happens to use the former synthetic name.
+        write_skill(&home.join(".agents/skills"), "customize-opencode", "");
+        let context = DiscoveryContext {
+            cwd: repo.clone(),
+            home,
+            repository_root: Some(repo),
+        };
+        let estimate = estimate_with_policy(&OpenCodePolicy, &context);
+        assert_eq!(estimate.discovered_count, 1);
+        assert_eq!(estimate.skills[0].name, "customize-opencode");
+        assert_eq!(estimate.skills[0].source, SkillSource::Filesystem);
+        assert!(estimate.skills[0].path.is_file());
+        assert!(estimate.estimated_tokens > 0);
     }
 
     #[test]

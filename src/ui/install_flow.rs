@@ -451,6 +451,8 @@ impl KitterApp {
 
     pub(super) fn toggle_install_target(&mut self, target: InstallTarget) {
         if self.install_flow.selected_targets.remove(&target) { return; }
+        if target != InstallTarget::Universal
+            && !self.model.installed_agents.iter().any(|agent| agent.owns_target(target)) { return; }
         if target != InstallTarget::Proma || self.can_install_proma() {
             self.install_flow.selected_targets.insert(target);
         }
@@ -462,13 +464,13 @@ impl KitterApp {
             .install_flow
             .selected_targets
             .contains(&InstallTarget::Universal);
-        let compatible_agents = crate::agents::AGENT_ICON_ORDER.iter()
+        let compatible_agents = self.model.installed_agents.iter()
             .filter(|agent| !agent.global_only && agent.supports_target(InstallTarget::Universal))
             .map(|agent| agent.name).collect::<Vec<_>>().join(" · ");
         let compatible_label = if self.uses_english() {
-            format!("Compatible: {compatible_agents}")
+            format!("Installed and compatible: {compatible_agents}")
         } else {
-            format!("兼容：{compatible_agents}")
+            format!("本机已安装且兼容：{compatible_agents}")
         };
         let universal_box = div()
             .rounded(px(RADIUS_CARD))
@@ -517,11 +519,14 @@ impl KitterApp {
             .child(div().px(px(13.)).pb(px(10.)).text_size(px(11.))
                 .text_color(p.muted).whitespace_normal().child(compatible_label));
         let mut independent_rows = div().flex().flex_wrap();
-        for info in crate::agents::INDEPENDENT_INSTALL_TARGETS {
+        let mut targets = crate::agents::INDEPENDENT_INSTALL_TARGETS.to_vec();
+        targets.sort_by_key(|info| crate::agents::display_sort_key(info.name,
+            self.model.installed_agents.iter().any(|agent| agent.owns_target(info.target))));
+        for info in targets {
             if info.target == InstallTarget::Proma && self.install_flow.global {
                 continue;
             }
-            independent_rows = independent_rows.child(self.target_row(*info, cx).min_w_0().flex_basis(relative(0.5)));
+            independent_rows = independent_rows.child(self.target_row(info, cx).min_w_0().flex_basis(relative(0.5)));
         }
         let independent_box = div()
             .mt(px(10.))
@@ -569,7 +574,8 @@ impl KitterApp {
             InstallTarget::Universal => "target-universal",
         };
         let active = self.install_flow.selected_targets.contains(&info.target);
-        let available = info.target != InstallTarget::Proma || self.can_install_proma();
+        let installed = self.model.installed_agents.iter().any(|agent| agent.owns_target(info.target));
+        let available = installed && (info.target != InstallTarget::Proma || self.can_install_proma());
         let is_last = crate::agents::INDEPENDENT_INSTALL_TARGETS
             .last()
             .is_some_and(|last| last.target == info.target);
@@ -580,14 +586,15 @@ impl KitterApp {
             .border_t_1()
             .border_color(p.border)
             .bg(if active { p.selected } else { p.surface })
-            .when(!available, |row| row.opacity(0.55))
+            .text_color(if installed { p.text } else { p.muted })
+            .when(installed && !available, |row| row.opacity(0.55))
             .when(is_last, |row| {
                 row.rounded_bl(px(RADIUS_CARD - 1.))
                     .rounded_br(px(RADIUS_CARD - 1.))
             })
             .flex()
             .items_center()
-            .cursor_pointer()
+            .when(available, |row| row.cursor_pointer())
             .child(Checkbox::new(ElementId::Name(format!("{id}-checkbox").into())).checked(active))
             .child(
                 div()
@@ -602,11 +609,10 @@ impl KitterApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Self::brand_icon(
+                    .child(self.agent_status_icon(
                         info.icon_path,
                         18.,
-                        p.text,
-                        self.uses_dark_theme(),
+                        installed,
                     )),
             )
             .child(div().ml(px(9.)).min_w_0().flex_1().truncate().text_size(px(13.)).child(info.name))
@@ -616,7 +622,9 @@ impl KitterApp {
                     .text_size(px(11.))
                     .text_color(p.muted)
                     .ml(px(8.)).max_w(px(90.)).truncate()
-                    .child(if self.install_flow.global {
+                    .child(if !installed {
+                        self.tr("未安装", "Not installed").to_string()
+                    } else if self.install_flow.global {
                         dirs::home_dir()
                             .map(|home| {
                                 display_path(&crate::agents::global_target_root(&home, info.target))
@@ -633,6 +641,7 @@ impl KitterApp {
                     }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
+                if !available { return; }
                 this.toggle_install_target(info.target);
                 this.notify_dialog(cx);
             }))

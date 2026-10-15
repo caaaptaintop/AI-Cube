@@ -493,10 +493,13 @@ impl KitterApp {
             app.projects_view.discovery_task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(15)).await;
-                    let discovered = cx.background_executor().spawn(async move {
-                        crate::project_discovery::discover_agent_projects()
+                    let (agents, discovered) = cx.background_executor().spawn(async move {
+                        let agents = crate::agents::installed_agents();
+                        let discovered = crate::project_discovery::discover_agent_projects();
+                        (agents, discovered)
                     }).await;
                     if this.update(cx, |this, cx| {
+                        if this.set_installed_agents(agents) { this.notify_dialog(cx); }
                         if let Ok(discovered) = discovered {
                             if this.projects_view.discovered_projects != discovered {
                                 this.projects_view.discovered_projects = discovered;
@@ -821,6 +824,7 @@ impl KitterApp {
             && std::env::var("KITTER_PREVIEW_PROMA").as_deref() == Ok("1");
         let mut app = Self {
             model: AppModel {
+                installed_agents: crate::agents::installed_agents(),
                 library,
                 skills,
                 update_check: None,
@@ -1239,11 +1243,12 @@ impl KitterApp {
                 .borrow_mut()
                 .insert(path.clone(), generation);
             let path = path.clone();
+            let agents = self.model.installed_agents.clone();
             cx.spawn(async move |this, cx| {
                 let worker_path = path.clone();
                 let estimates = cx
                     .background_executor()
-                    .spawn(async move { effective_skills::estimate_project(&worker_path) })
+                    .spawn(async move { effective_skills::estimate_project_for_agents(&worker_path, &agents) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let is_current = this.projects_view.scan_generation == generation
@@ -1277,6 +1282,7 @@ impl KitterApp {
     }
 
     fn refresh_context_estimate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.refresh_installed_agents();
         self.projects_view.scan_generation = self.projects_view.scan_generation.wrapping_add(1);
         self.projects_view
             .context_estimate_tasks
@@ -1287,6 +1293,24 @@ impl KitterApp {
             .borrow_mut()
             .remove(&path);
         cx.notify();
+    }
+
+    fn refresh_installed_agents(&mut self) {
+        self.set_installed_agents(crate::agents::installed_agents());
+    }
+
+    fn set_installed_agents(&mut self, agents: Vec<crate::agents::AgentIconInfo>) -> bool {
+        if agents == self.model.installed_agents { return false; }
+        self.model.installed_agents = agents;
+        let installed = |kind: &AgentKind| self.model.installed_agents.iter().any(|agent| agent.id == kind.id());
+        self.projects_view.selected_project_agent = self.projects_view.selected_project_agent.filter(installed);
+        self.projects_view.project_agent_filter.agents.retain(installed);
+        self.install_flow.selected_targets.retain(|target| *target == InstallTarget::Universal
+            || self.model.installed_agents.iter().any(|agent| agent.owns_target(*target)));
+        self.projects_view.scan_generation = self.projects_view.scan_generation.wrapping_add(1);
+        self.projects_view.context_estimate_tasks.borrow_mut().clear();
+        self.projects_view.context_estimates.borrow_mut().clear();
+        true
     }
 
     fn content_snapshot(&self, skill: &SkillSummary) -> ContentSnapshot {
@@ -1656,6 +1680,43 @@ mod e2e_tests {
 
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+    }
+
+    #[test]
+    fn removed_agent_stays_visible_but_cannot_be_selected() {
+        use super::{AgentKind, InstallTarget};
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data = temp.path().join("data");
+            move |window, cx| KitterApp::new_in(data, window, cx)
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.open_install_dialog(window, cx);
+            app.model.installed_agents = crate::agents::AGENT_ICON_ORDER.iter().copied()
+                .filter(|agent| matches!(agent.id, "codex" | "cursor")).collect();
+            app.projects_view.selected_project_agent = Some(AgentKind::Cursor);
+            app.projects_view.project_agent_filter.agents = vec![AgentKind::Cursor, AgentKind::Codex];
+            app.install_flow.selected_targets = std::collections::HashSet::from([
+                InstallTarget::Cursor, InstallTarget::Codex, InstallTarget::Universal,
+            ]);
+            let codex = app.model.installed_agents.iter().copied().find(|agent| agent.id == "codex").unwrap();
+            assert!(app.set_installed_agents(vec![codex]));
+            assert!(app.projects_view.selected_project_agent.is_none());
+            assert_eq!(app.projects_view.project_agent_filter.agents, [AgentKind::Codex]);
+            assert!(!app.install_flow.selected_targets.contains(&InstallTarget::Cursor));
+            assert!(app.install_flow.selected_targets.contains(&InstallTarget::Codex));
+            app.toggle_install_target(InstallTarget::OpenCode);
+            assert!(!app.install_flow.selected_targets.contains(&InstallTarget::OpenCode));
+            app.notify_dialog(cx);
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("target-codex").is_some());
+        let cursor = cx.debug_bounds("target-cursor").unwrap();
+        cx.simulate_click(cursor.center(), Modifiers::none());
+        cx.read_entity(&app, |app, _| assert!(!app.install_flow.selected_targets.contains(&InstallTarget::Cursor)));
+        assert!(cx.debug_bounds("target-opencode").is_some());
     }
 
     #[test]

@@ -1,6 +1,14 @@
 use crate::InstallTarget;
 use std::path::{Path, PathBuf};
 
+mod installed;
+pub use installed::installed_agents;
+
+/// Installed Agents first; names are alphabetical regardless of letter case.
+pub fn display_sort_key(name: &str, installed: bool) -> (bool, String) {
+    (!installed, name.to_ascii_lowercase())
+}
+
 /// User-level roots must not be derived from project-relative directories.
 pub fn global_target_root(home: &Path, target: InstallTarget) -> PathBuf {
     assert_ne!(target, InstallTarget::Proma, "Proma has no global skill target");
@@ -175,15 +183,32 @@ pub struct AgentIconInfo {
 }
 
 impl AgentIconInfo {
+    pub fn owns_target(self, target: InstallTarget) -> bool {
+        let id = match target {
+            InstallTarget::Universal => return false,
+            InstallTarget::Codex => "codex",
+            InstallTarget::ClaudeCode => "claude-code",
+            InstallTarget::Cursor => "cursor",
+            InstallTarget::OpenCode => "opencode",
+            InstallTarget::Pi => "pi",
+            InstallTarget::Proma => "proma",
+            InstallTarget::Omp => "omp",
+            InstallTarget::Grok => "grok",
+            InstallTarget::Antigravity => "antigravity",
+            InstallTarget::Droid => "droid",
+            InstallTarget::Copilot => "copilot",
+        };
+        self.id == id
+    }
+
     pub fn supports_target(self, target: InstallTarget) -> bool {
         self.install_targets.contains(&target)
             || (target == InstallTarget::Universal && self.shared_agents)
     }
 }
 
-/// Agent badge order follows the user's practical usage priority. Keep this
-/// as the single source of truth so project rows, global rows, and the install
-/// target preview do not drift into separate default orders.
+/// Supported Agent metadata. Display order uses `display_sort_key` rather
+/// than this catalog's declaration order.
 pub const AGENT_ICON_ORDER: &[AgentIconInfo] = &[
     AgentIconInfo {
         id: "codex",
@@ -420,6 +445,28 @@ mod tests {
                     .any(|target| *target != InstallTarget::Universal),
                 "{id} should have a provider-specific project target"
             );
+        }
+    }
+
+    #[test]
+    fn display_order_keeps_installed_agents_first_and_each_group_alphabetical() {
+        let installed = ["proma", "grok", "codex", "antigravity"];
+        let mut agents = AGENT_ICON_ORDER.to_vec();
+        agents.sort_by_key(|agent| display_sort_key(agent.name, installed.contains(&agent.id)));
+        let names = agents.iter().map(|agent| agent.name).collect::<Vec<_>>();
+        assert_eq!(&names[..4], ["Antigravity", "Codex", "Grok", "Proma"]);
+        assert_eq!(&names[4..], ["Amp", "Claude Code", "Cursor", "DimAgent", "Droid",
+            "GitHub Copilot", "Hermes", "omp", "OpenClaw", "OpenCode", "Pi", "Trae"]);
+    }
+
+    #[test]
+    fn compatibility_does_not_make_a_provider_an_installed_target() {
+        let grok = *AGENT_ICON_ORDER.iter().find(|agent| agent.id == "grok").unwrap();
+        assert!(grok.supports_target(InstallTarget::ClaudeCode));
+        assert!(!grok.owns_target(InstallTarget::ClaudeCode));
+        assert!(grok.owns_target(InstallTarget::Grok));
+        for target in INDEPENDENT_INSTALL_TARGETS {
+            assert_eq!(AGENT_ICON_ORDER.iter().filter(|agent| agent.owns_target(target.target)).count(), 1);
         }
     }
 

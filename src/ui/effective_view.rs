@@ -381,15 +381,9 @@ pub(super) fn skill_rows(
             }
         }
     }
-    let agent_order = |agent: &AgentKind| {
-        crate::agents::AGENT_ICON_ORDER
-            .iter()
-            .position(|item| item.id == agent.id())
-            .unwrap_or(usize::MAX)
-    };
     for row in &mut rows {
         row.locations.sort_by_key(|path| super::display_path(path));
-        row.agents.sort_by_key(agent_order);
+        row.agents.sort_by_key(|agent| crate::agents::display_sort_key(agent.label(), true));
     }
     rows
 }

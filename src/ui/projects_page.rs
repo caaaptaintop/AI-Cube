@@ -926,6 +926,7 @@ impl KitterApp {
         let selected = &self.projects_view.project_agent_filter;
         let all_label = self.tr("全部 Agent", "All agents").to_string();
         let unmarked_label = self.tr("未标注 Agent", "Unmarked agent").to_string();
+        let not_installed_label = self.tr("未安装", "Not installed").to_string();
         let selected_count = selected.agents.len() + usize::from(selected.unmarked);
         let label = if selected.is_all() {
             all_label.clone()
@@ -940,19 +941,18 @@ impl KitterApp {
         } else {
             format!("已选 {selected_count} 项")
         };
-        let mut kinds = entries
-            .iter()
-            .flat_map(|entry| entry.agents.iter().copied())
-            .collect::<Vec<_>>();
-        kinds.extend(selected.agents.iter().copied());
         let mut options = vec![(
             ProjectAgentFilterOption::All,
             all_label,
             matching.len(),
             None,
+            true,
         )];
-        for info in crate::agents::AGENT_ICON_ORDER {
-            let Some(kind) = kinds.iter().copied().find(|kind| kind.id() == info.id) else {
+        let mut agents = crate::agents::AGENT_ICON_ORDER.to_vec();
+        agents.sort_by_key(|info| crate::agents::display_sort_key(info.name,
+            self.model.installed_agents.iter().any(|agent| agent.id == info.id)));
+        for info in agents {
+            let Some(kind) = AgentKind::from_id(info.id) else {
                 continue;
             };
             options.push((
@@ -963,6 +963,7 @@ impl KitterApp {
                     .filter(|entry| entry.agents.contains(&kind))
                     .count(),
                 Some(info.icon_path),
+                self.model.installed_agents.iter().any(|agent| agent.id == info.id),
             ));
         }
         if entries.iter().any(|entry| entry.agents.is_empty()) || selected.unmarked {
@@ -974,6 +975,7 @@ impl KitterApp {
                     .filter(|entry| entry.agents.is_empty())
                     .count(),
                 None,
+                true,
             ));
         }
         let app = cx.entity().downgrade();
@@ -1009,8 +1011,10 @@ impl KitterApp {
                     .bg(p.elevated)
                     .shadow_lg()
                     .overflow_y_scroll();
-                for (index, (filter, label, count, icon)) in options.iter().enumerate() {
+                for (index, (filter, label, count, icon, installed)) in options.iter().enumerate() {
                     let filter = *filter;
+                    let installed = *installed;
+                    let status = if installed { count.to_string() } else { not_installed_label.clone() };
                     let checked = selected.selected(filter);
                     let app = app.clone();
                     let popover = popover_cx.entity();
@@ -1018,7 +1022,7 @@ impl KitterApp {
                         gpui_base::Button::new(ElementId::Name(
                             format!("project-agent-filter-option-{index}").into(),
                         ))
-                        .accessibility_label(format!("{label} · {count}"))
+                        .accessibility_label(format!("{label} · {status}"))
                         .h(px(30.))
                         .w_full()
                         .px(px(8.))
@@ -1028,13 +1032,13 @@ impl KitterApp {
                         .gap(px(7.))
                         .font_family(FONT_UI)
                         .text_size(px(13.))
-                        .text_color(p.text)
+                        .text_color(if installed { p.text } else { p.muted })
                         .bg(if checked {
                             p.selected
                         } else {
                             rgba(0x00000000)
                         })
-                        .hover(move |row| row.bg(p.hover))
+                        .when(installed, |row| row.hover(move |row| row.bg(p.hover)))
                         .child(div().w(px(14.)).when(checked, |slot| {
                             slot.child(Self::icon("icons/check.svg", 12., p.secondary))
                         }))
@@ -1045,12 +1049,14 @@ impl KitterApp {
                                 .flex()
                                 .justify_center()
                                 .when_some(*icon, |slot, icon| {
-                                    slot.child(Self::brand_icon(
-                                        icon,
-                                        Self::brand_icon_size(icon, 16.),
-                                        p.text,
-                                        dark,
-                                    ))
+                                    let size = Self::brand_icon_size(icon, 16.);
+                                    if installed {
+                                        slot.child(Self::brand_icon(icon, size, p.text, dark))
+                                    } else if icon.ends_with(".png") {
+                                        slot.child(div().opacity(0.4).child(Self::brand_icon(icon, size, p.muted, dark)))
+                                    } else {
+                                        slot.child(Self::icon(icon, size, p.muted))
+                                    }
                                 }),
                         )
                         .child(div().min_w_0().flex_1().truncate().child(label.clone()))
@@ -1058,9 +1064,10 @@ impl KitterApp {
                             div()
                                 .text_size(px(12.))
                                 .text_color(p.muted)
-                                .child(count.to_string()),
+                                .child(status),
                         )
                         .on_click(move |_, _, cx| {
+                            if !installed { return; }
                             let _ = app.update(cx, |this, cx| {
                                 this.projects_view.project_agent_filter.toggle(filter);
                                 cx.notify();
