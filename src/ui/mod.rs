@@ -493,9 +493,10 @@ impl KitterApp {
             app.projects_view.discovery_task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(15)).await;
+                    let Ok(previous) = this.read_with(cx, |this, _| this.projects_view.discovered_projects.clone()) else { break; };
                     let (agents, discovered) = cx.background_executor().spawn(async move {
                         let agents = crate::agents::installed_agents();
-                        let discovered = crate::project_discovery::discover_agent_projects();
+                        let discovered = crate::project_discovery::refresh_agent_projects(&previous);
                         (agents, discovered)
                     }).await;
                     if this.update(cx, |this, cx| {
@@ -876,6 +877,7 @@ impl KitterApp {
                 expanded_project_plugins: HashSet::new(),
                 project_search,
                 project_agent_filter: ProjectAgentFilter::default(),
+                list_view: ProjectListView::default(),
                 project_select,
                 project_snapshots: RefCell::new(BTreeMap::new()),
                 skill_rows_cache: RefCell::new(SkillRowsCache::default()),

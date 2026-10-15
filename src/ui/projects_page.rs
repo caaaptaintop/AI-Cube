@@ -1080,6 +1080,65 @@ impl KitterApp {
             })
     }
 
+    fn project_list_label(&self, view: ProjectListView) -> &'static str {
+        match view {
+            ProjectListView::Active => self.tr("活跃项目", "Active projects"),
+            ProjectListView::Archived => self.tr("已归档／隐藏", "Archived / hidden"),
+            ProjectListView::All => self.tr("全部项目", "All projects"),
+        }
+    }
+
+    fn project_list_control(&self, entries: &[crate::project_discovery::ProjectEntry], count: usize, cx: &mut Context<Self>) -> Popover {
+        let p = self.palette();
+        let selected = self.projects_view.list_view;
+        let app = cx.entity().downgrade();
+        let options = [ProjectListView::Active, ProjectListView::Archived, ProjectListView::All]
+            .map(|view| (view, self.project_list_label(view).to_string(), entries.iter().filter(|entry| view.matches(entry)).count()));
+        let help = [
+            self.tr("项目列表显示", "Project visibility"),
+            self.tr("活跃项目：默认显示；任一关联 Agent 活跃就保留。", "Active: shown by default while any associated Agent is active."),
+            self.tr("已归档／隐藏：关联 Agent 均已归档，或你手动隐藏。", "Archived / hidden: every associated Agent explicitly archived it, or you hid it in Kitter."),
+            self.tr("全部项目：同时查看以上两类。", "All: show both groups together."),
+            self.tr("右键可隐藏；在归档／隐藏列表中可恢复到活跃项目。", "Right-click to hide; restore from the Archived / hidden list."),
+            self.tr("目录、技能和安装记录均保留。状态不明或读取失败不会自动归档；Codex 项目可手动隐藏。", "Folders, skills and installation records are retained. Unknown states or scan failures never trigger archival; Codex projects can be hidden manually."),
+        ];
+        Popover::new("project-list-view-menu").appearance(false).anchor(Anchor::TopLeft)
+            .trigger(self.dropdown_button("project-list-view-trigger", format!("{}  {count}", self.project_list_label(selected)), 12.)
+                .h(px(26.)).max_w(px(145.)).border_0().bg(rgba(0x00000000))
+                .tooltip(move |window, cx| Tooltip::element(move |_, _| {
+                    div().w(px(320.)).py(px(6.)).flex().flex_col().gap(px(7.)).text_size(px(12.)).line_height(relative(1.5))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(help[0]))
+                        .children(help[1..].iter().map(|text| div().child(*text)))
+                }).build(window, cx)))
+            .content(move |_, _, popover_cx| {
+                let mut menu = div().w(px(210.)).p(px(4.)).rounded(px(RADIUS_MENU))
+                    .border_1().border_color(p.border).bg(p.elevated).shadow_lg();
+                for (view, label, count) in &options {
+                    let view = *view;
+                    let app = app.clone();
+                    menu = menu.child(div().id(ElementId::Name(format!("project-list-view-{}", view as u8).into()))
+                        .h(px(32.)).px(px(9.)).rounded(px(RADIUS_CONTROL)).flex().items_center().gap(px(8.))
+                        .cursor_pointer().text_size(px(13.)).text_color(p.text)
+                        .bg(if view == selected { p.selected } else { rgba(0x00000000) })
+                        .hover(move |row| row.bg(p.hover))
+                        .child(div().w(px(14.)).when(view == selected, |icon| icon.child(Self::icon("icons/check.svg", 14., p.text))))
+                        .child(div().flex_1().child(label.clone()))
+                        .child(div().text_color(p.muted).child(count.to_string()))
+                        .on_click(popover_cx.listener(move |_, _, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.projects_view.list_view = view;
+                                this.projects_view.batch_project = None;
+                                this.projects_view.batch_selected.clear();
+                                this.projects_view.batch_filter = None;
+                                cx.notify();
+                            });
+                            cx.emit(DismissEvent);
+                        })));
+                }
+                menu
+            })
+    }
+
     pub(super) fn projects_page(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         #[cfg(debug_assertions)]
         let render_started = Instant::now();
@@ -1096,9 +1155,10 @@ impl KitterApp {
             .as_ref()
             .and_then(|path| self.project_snapshot(path, cx));
         let global_skill_count = global_skills.as_ref().map(Vec::len);
-        let all_projects = self.project_entries();
-        let total_project_count = all_projects.len();
-        let matching_projects = all_projects
+        let all_projects = self.all_project_entries();
+        let view_projects = all_projects.iter().filter(|entry| self.projects_view.list_view.matches(entry)).cloned().collect::<Vec<_>>();
+        let total_project_count = view_projects.len();
+        let matching_projects = view_projects
             .iter()
             .filter(|entry| {
                 let path = &entry.path;
@@ -1121,12 +1181,13 @@ impl KitterApp {
             .cloned()
             .collect::<Vec<_>>();
         let agent_filter_control =
-            self.project_agent_filter_control(&all_projects, &matching_projects, cx);
+            self.project_agent_filter_control(&view_projects, &matching_projects, cx);
         let projects = matching_projects
             .into_iter()
             .filter(|entry| self.projects_view.project_agent_filter.matches(entry))
             .collect::<Vec<_>>();
         let visible_project_count = projects.len();
+        let list_control = self.project_list_control(&all_projects, visible_project_count, cx);
         let project_context_app = cx.entity().downgrade();
         let mut recent_rows = div()
             .id("projects-scroll")
@@ -1142,7 +1203,9 @@ impl KitterApp {
                     .text_size(px(13.))
                     .text_color(p.muted)
                     .text_center()
-                    .child(if all_projects.is_empty() {
+                    .child(if self.projects_view.list_view == ProjectListView::Archived && view_projects.is_empty() {
+                        self.tr("没有已归档或隐藏的项目", "No archived or hidden projects")
+                    } else if all_projects.is_empty() {
                         self.tr("还没有项目", "No projects yet")
                     } else {
                         self.tr("没有匹配的项目", "No matching projects")
@@ -1150,6 +1213,15 @@ impl KitterApp {
             );
         }
         for entry in projects {
+            let inactive = !entry.is_active();
+            let status = if entry.hidden {
+                Some(self.tr("已隐藏", "Hidden"))
+            } else if entry.archived && entry.retained {
+                Some(self.tr("手动保留", "Kept active"))
+            } else if entry.archived {
+                Some(self.tr("已归档", "Archived"))
+            } else { None };
+            let retained = entry.retained && entry.archived;
             let agent_shortcuts = self.project_agent_shortcuts(&entry, cx);
             let proma_workspace_count = entry.proma_workspaces.len();
             let path = entry.path;
@@ -1192,8 +1264,12 @@ impl KitterApp {
                 self.tr("在文件夹中显示", "Show in folder")
             }
             .to_string();
-            let remove_label = self.tr("移除项目", "Remove project").to_string();
-            let remove_menu_color = p.danger;
+            let visibility_action = if inactive { ProjectVisibilityAction::Restore } else { ProjectVisibilityAction::Hide };
+            let remove_label = if inactive { self.tr("恢复到活跃项目", "Restore to active projects") }
+                else { self.tr("在 Kitter 中隐藏", "Hide in Kitter") }.to_string();
+            let follow_label = self.tr("跟随 Agent 归档状态", "Follow Agent archive status").to_string();
+            let follow_app = project_context_app.clone();
+            let follow_path = path.clone();
             recent_rows = recent_rows.child(
                 div()
                     .id(ElementId::Name(
@@ -1235,6 +1311,7 @@ impl KitterApp {
                                     .text_size(px(13.))
                                     .line_height(px(18.))
                                     .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if inactive { p.muted } else { p.text })
                                     .truncate()
                                     .child(project_label),
                             )
@@ -1259,7 +1336,10 @@ impl KitterApp {
                             ))
                             .when(!assigned_project_tags.is_empty(), |content| {
                                 content.child(project_tag_chips)
-                            }),
+                            })
+                            .when_some(status, |content, status| content.child(
+                                div().mt(px(3.)).text_size(px(11.)).text_color(p.muted).child(status)
+                            )),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.projects_view.open_project.as_ref() != Some(&selected_path) {
@@ -1279,8 +1359,8 @@ impl KitterApp {
                         let set_tags_path = set_tags_path.clone();
                         let remove_app = remove_app.clone();
                         let remove_path = remove_path.clone();
-                        let remove_menu_item =
-                            Self::danger_menu_item(remove_label.clone(), remove_menu_color);
+                        let follow_app = follow_app.clone();
+                        let follow_path = follow_path.clone();
                         menu.min_w(px(160.))
                             .item(
                                 PopupMenuItem::new(set_tags_label.clone())
@@ -1299,27 +1379,14 @@ impl KitterApp {
                                     .icon(Icon::new(IconName::Folder))
                                     .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
                             )
-                            .item(remove_menu_item.on_click(move |_, window, cx| {
+                            .item(PopupMenuItem::new(remove_label.clone()).on_click(move |_, window, cx| {
                                 let _ = remove_app.update(cx, |this, cx| {
-                                    this.model.library.config.remove_project(&remove_path);
-                                    if this.projects_view.open_project.as_ref()
-                                        == Some(&remove_path)
-                                    {
-                                        this.projects_view.open_project = None;
-                                        this.projects_view.global_project_view = true;
-                                    }
-                                    if this.projects_view.batch_project.as_ref()
-                                        == Some(&remove_path)
-                                    {
-                                        this.projects_view.batch_project = None;
-                                        this.projects_view.batch_selected.clear();
-                                        this.projects_view.batch_filter = None;
-                                    }
-                                    let _ = this.model.library.save();
-                                    this.sync_project_select(window, cx);
-                                    cx.notify();
+                                    this.change_project_visibility(&remove_path, visibility_action, window, cx);
                                 });
                             }))
+                            .when(retained, |menu| menu.item(PopupMenuItem::new(follow_label.clone()).on_click(move |_, window, cx| {
+                                let _ = follow_app.update(cx, |this, cx| this.change_project_visibility(&follow_path, ProjectVisibilityAction::FollowAgent, window, cx));
+                            })))
                     }),
             );
         }
@@ -1440,17 +1507,14 @@ impl KitterApp {
                     .text_size(px(12.))
                     .text_color(p.muted)
                     .child(
-                        div().min_w_0().flex_1().truncate().child(self.tags_flow
-                            .selected_project_filter
-                            .and_then(|tag| self.tags_flow.projects.path(tag))
-                            .map(|path| format!("#{path}  {visible_project_count}"))
-                            .unwrap_or_else(|| {
-                                format!("{}  {visible_project_count}", self.tr("项目", "Projects"))
-                            })),
+                        div().min_w_0().flex_1().child(list_control),
                     )
                     .child(agent_filter_control)
                     .child(self.tag_filter_control(TagScope::Projects, cx)),
             )
+            .when_some(self.tags_flow.selected_project_filter.and_then(|tag| self.tags_flow.projects.path(tag)), |panel, tag| {
+                panel.child(div().px(px(16.)).pb(px(6.)).text_size(px(11.)).text_color(p.secondary).child(format!("#{tag}")))
+            })
             .child(recent_rows);
 
         let selected_root = if self.projects_view.global_project_view {
@@ -1460,6 +1524,13 @@ impl KitterApp {
         };
         let detail = if let Some(open_project) = selected_root {
             let is_global = self.projects_view.global_project_view;
+            let inactive_entry = all_projects.iter().find(|entry| entry.path == *open_project && !entry.is_active());
+            let visibility_notice = inactive_entry.map(|entry| if entry.hidden {
+                self.tr("已在 Kitter 中隐藏 · 文件和技能均保留", "Hidden in Kitter · files and skills are retained")
+            } else {
+                self.tr("已在 Agent 中归档 · 文件和技能均保留", "Archived in Agent · files and skills are retained")
+            });
+            let restore_path = open_project.clone();
             let project_skills = if is_global {
                 global_skills
             } else {
@@ -1687,9 +1758,9 @@ impl KitterApp {
                                     if is_global {
                                         self.tr("全局生效", "Global").to_string()
                                     } else {
-                                        self.project_entries().into_iter()
+                                        all_projects.iter()
                                             .find(|entry| entry.path == *open_project)
-                                            .map(|entry| entry.name)
+                                            .map(|entry| entry.name.clone())
                                             .unwrap_or_else(|| open_project.file_name().unwrap_or_default()
                                                 .to_string_lossy().into_owned())
                                     },
@@ -1712,7 +1783,13 @@ impl KitterApp {
                                         cx,
                                     )),
                             )
-                        }),
+                        })
+                        .when_some(visibility_notice, |header, message| header.child(
+                            div().mt(px(10.)).flex().items_center().gap(px(10.)).text_size(px(12.)).text_color(p.muted)
+                                .child(message)
+                                .child(Button::new("restore-project-visibility").xsmall().label(self.tr("恢复到活跃项目", "Restore to active projects"))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.change_project_visibility(&restore_path, ProjectVisibilityAction::Restore, window, cx))))
+                        )),
                 )
                 .child(
                     div()

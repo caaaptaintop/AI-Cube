@@ -21,9 +21,17 @@ pub struct ProjectEntry {
     /// Native Skill roots remain separate from the Finder display identity.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proma_workspaces: Vec<PathBuf>,
+    /// True only when every known catalog entry explicitly reports archival.
+    pub archived: bool,
+    pub hidden: bool,
+    pub retained: bool,
 }
 
 impl ProjectEntry {
+    pub fn is_active(&self) -> bool {
+        !self.hidden && (!self.archived || self.retained)
+    }
+
     /// Project-local directories this Agent can read. Proma uses its native
     /// workspaces rather than the business directory shown in the project list.
     pub fn skill_directories(&self, agent: crate::agents::AgentIconInfo) -> Vec<PathBuf> {
@@ -71,6 +79,9 @@ pub fn discover_proma_projects(root: &Path) -> Result<Vec<ProjectEntry>> {
             name: workspace.name,
             agents: vec![AgentKind::Proma],
             proma_workspaces: vec![workspace.path],
+            archived: workspace.archived,
+            hidden: false,
+            retained: false,
         })
         .collect::<Vec<_>>();
     let mut counts = BTreeMap::new();
@@ -86,22 +97,40 @@ pub fn discover_proma_projects(root: &Path) -> Result<Vec<ProjectEntry>> {
 }
 
 pub fn discover_agent_projects() -> Result<Vec<ProjectEntry>> {
-    discover_catalogs(codex_home().as_deref(), crate::proma::home().as_deref())
+    refresh_agent_projects(&[])
 }
 
-fn discover_catalogs(codex: Option<&Path>, proma: Option<&Path>) -> Result<Vec<ProjectEntry>> {
+pub fn refresh_agent_projects(previous: &[ProjectEntry]) -> Result<Vec<ProjectEntry>> {
+    discover_catalogs(codex_home().as_deref(), crate::proma::home().as_deref(), previous)
+}
+
+fn discover_catalogs(codex: Option<&Path>, proma: Option<&Path>, previous: &[ProjectEntry]) -> Result<Vec<ProjectEntry>> {
     let mut entries = Vec::new();
     let mut failure = None;
-    for catalog in [codex.map(discover_codex_projects), proma.map(discover_proma_projects)].into_iter().flatten() {
+    for (agent, catalog, present) in [
+        (AgentKind::Codex, codex.map(discover_codex_projects), codex.is_some_and(|root| root.join(".codex-global-state.json").is_file())),
+        (AgentKind::Proma, proma.map(discover_proma_projects), proma.is_some_and(|root| root.join("agent-workspaces.json").is_file())),
+    ] {
+        let Some(catalog) = catalog else { continue; };
+        let catalog = if !present && previous.iter().any(|entry| entry.agents.contains(&agent)) {
+            Err(anyhow!("Agent 项目记录暂不可用"))
+        } else { catalog };
         match catalog {
             Ok(projects) => entries.extend(projects),
-            Err(error) => failure = Some(error),
+            Err(error) => {
+                failure = Some(error);
+                entries.extend(previous.iter().filter(|entry| entry.agents.contains(&agent)).cloned());
+            }
         }
     }
     if entries.is_empty() && let Some(error) = failure {
         return Err(error);
     }
-    Ok(merge_projects(&[], &entries, &BTreeSet::new()))
+    // A partial scan cannot prove that all associated Agents are archived.
+    if failure.is_some() {
+        for entry in &mut entries { entry.archived = false; }
+    }
+    Ok(all_projects(&[], &entries, &BTreeSet::new(), &BTreeSet::new()))
 }
 
 pub fn discover_codex_projects(home: &Path) -> Result<Vec<ProjectEntry>> {
@@ -157,7 +186,7 @@ pub fn discover_codex_projects(home: &Path) -> Result<Vec<ProjectEntry>> {
     }
     let cloud_cache = path_identity(&home.join(".chatgpt-projects"));
     entries.retain(|entry| !entry.path.starts_with(&cloud_cache));
-    let mut merged = merge_projects(&[], &entries, &BTreeSet::new());
+    let mut merged = all_projects(&[], &entries, &BTreeSet::new(), &BTreeSet::new());
     merged.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     Ok(merged)
 }
@@ -176,6 +205,10 @@ fn append_codex(entries: &mut Vec<ProjectEntry>, path: &str, name: Option<&str>)
         path,
         agents: vec![AgentKind::Codex],
         proma_workspaces: Vec::new(),
+        // Codex's project-order is a sort preference, not an archive flag.
+        archived: false,
+        hidden: false,
+        retained: false,
     });
 }
 
@@ -200,33 +233,47 @@ pub fn merge_projects(
     discovered: &[ProjectEntry],
     hidden: &BTreeSet<PathBuf>,
 ) -> Vec<ProjectEntry> {
+    all_projects(manual, discovered, hidden, &BTreeSet::new())
+        .into_iter().filter(ProjectEntry::is_active).collect()
+}
+
+pub fn all_projects(
+    manual: &[PathBuf],
+    discovered: &[ProjectEntry],
+    hidden: &BTreeSet<PathBuf>,
+    retained: &BTreeSet<PathBuf>,
+) -> Vec<ProjectEntry> {
     let hidden = hidden
         .iter()
         .map(|path| project_identity(path, discovered))
         .collect::<BTreeSet<_>>();
+    let retained = retained.iter().map(|path| project_identity(path, discovered)).collect::<BTreeSet<_>>();
     let mut merged: Vec<ProjectEntry> = Vec::new();
-    for path in manual {
+    for path in manual.iter().chain(hidden.iter()).chain(retained.iter()) {
         let path = project_identity(path, discovered);
-        if hidden.contains(&path) {
-            continue;
-        }
         if !merged.iter().any(|entry| entry.path == path) {
             merged.push(ProjectEntry {
                 name: project_name(&path),
                 path,
                 agents: Vec::new(),
                 proma_workspaces: Vec::new(),
+                archived: false,
+                hidden: false,
+                retained: false,
             });
         }
     }
     for candidate in discovered {
         let path = path_identity(&candidate.path);
-        if hidden.contains(&path) || !path.is_dir() {
+        if !path.is_dir() {
             continue;
         }
         if let Some(existing) = merged.iter_mut().find(|entry| entry.path == path) {
             if existing.agents.is_empty() {
                 existing.name = candidate.name.clone();
+                existing.archived = candidate.archived;
+            } else {
+                existing.archived &= candidate.archived;
             }
             for agent in &candidate.agents {
                 if !existing.agents.contains(agent) {
@@ -245,6 +292,10 @@ pub fn merge_projects(
             });
         }
     }
+    for entry in &mut merged {
+        entry.hidden = hidden.contains(&entry.path);
+        entry.retained = retained.contains(&entry.path);
+    }
     merged
 }
 
@@ -252,6 +303,70 @@ pub fn merge_projects(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_visibility_merges_agents_and_workspaces_and_restores_without_deleting() {
+        let temp = tempfile::tempdir().unwrap();
+        let business = temp.path().join("project");
+        std::fs::create_dir(&business).unwrap();
+        for slug in ["first", "second"] {
+            std::fs::create_dir_all(temp.path().join("agent-workspaces").join(slug)).unwrap();
+        }
+        let catalog = temp.path().join("agent-workspaces.json");
+        let write = |second_archived| std::fs::write(&catalog, serde_json::to_vec(&json!({
+            "version": 2, "workspaces": [
+                {"id":"first","slug":"first","name":"First","projectRootPath":business,"archived":true},
+                {"id":"second","slug":"second","name":"Second","projectRootPath":business,"archived":second_archived}
+            ]
+        })).unwrap()).unwrap();
+        write(false);
+        assert!(all_projects(&[], &discover_proma_projects(temp.path()).unwrap(), &BTreeSet::new(), &BTreeSet::new())[0].is_active());
+        write(true);
+        let archived = discover_proma_projects(temp.path()).unwrap();
+        let entries = all_projects(&[business.clone()], &archived, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].archived && !entries[0].is_active());
+        assert_eq!(entries[0].proma_workspaces.len(), 2);
+        write_state(temp.path(), json!({"local-projects":{"codex":{"rootPaths":[business]}},"project-order":[]}));
+        let combined = discover_catalogs(Some(temp.path()), Some(temp.path()), &[]).unwrap();
+        assert_eq!(combined.len(), 1);
+        assert!(combined[0].is_active());
+        assert_eq!(combined[0].agents.len(), 2);
+        let mut config = crate::config::AppConfig::default();
+        config.remove_project(&business);
+        assert!(config.project_entries(&combined)[0].hidden);
+        assert!(!config.project_entries(&combined)[0].is_active());
+        config.restore_project(business.clone());
+        let restored = config.project_entries(&archived);
+        assert!(restored[0].archived && restored[0].retained && restored[0].is_active());
+        assert!(business.is_dir());
+        assert!(catalog.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_or_missing_catalog_keeps_previous_projects_and_cannot_archive_shared_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex = temp.path().join("codex");
+        let proma = temp.path().join("proma");
+        let business = temp.path().join("project");
+        std::fs::create_dir(&codex).unwrap();
+        std::fs::create_dir(&business).unwrap();
+        std::fs::create_dir_all(proma.join("agent-workspaces/first")).unwrap();
+        std::fs::write(proma.join("agent-workspaces.json"), serde_json::to_vec(&json!({
+            "version":2,"workspaces":[{"id":"first","slug":"first","name":"First","projectRootPath":business,"archived":true}]
+        })).unwrap()).unwrap();
+        write_state(&codex, json!({"local-projects":{"project":{"rootPaths":[business]}}}));
+        let previous = discover_catalogs(Some(&codex), Some(&proma), &[]).unwrap();
+        std::fs::write(codex.join(".codex-global-state.json"), "private-invalid").unwrap();
+        let failed = discover_catalogs(Some(&codex), Some(&proma), &previous).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].is_active());
+        assert!(failed[0].agents.contains(&AgentKind::Codex));
+        std::fs::remove_file(codex.join(".codex-global-state.json")).unwrap();
+        assert!(discover_catalogs(Some(&codex), Some(&proma), &previous).unwrap()[0].is_active());
+    }
 
     #[test]
     fn project_shortcuts_use_shared_and_native_roots_without_creating_them() {
@@ -264,6 +379,7 @@ mod tests {
             name: "Project".into(),
             agents: vec![AgentKind::Codex, AgentKind::Proma],
             proma_workspaces: vec![first.clone(), second.clone(), first.clone()],
+            archived: false, hidden: false, retained: false,
         };
         let agent = |id| *crate::agents::AGENT_ICON_ORDER.iter()
             .find(|agent| agent.id == id).unwrap();
@@ -290,7 +406,7 @@ mod tests {
         std::os::unix::fs::symlink(&shared, project.join(".codex/skills")).unwrap();
         let entry = ProjectEntry {
             path: project.clone(), name: "Project".into(),
-            agents: vec![AgentKind::Codex], proma_workspaces: Vec::new(),
+            agents: vec![AgentKind::Codex], proma_workspaces: Vec::new(), archived: false, hidden: false, retained: false,
         };
         let codex = *crate::agents::AGENT_ICON_ORDER.iter()
             .find(|agent| agent.id == "codex").unwrap();
@@ -363,7 +479,7 @@ mod tests {
         std::fs::create_dir(&proma).unwrap();
         write_state(&codex, json!({"electron-saved-workspace-roots": [temp.path()]}));
         std::fs::write(proma.join("agent-workspaces.json"), "fixture-private").unwrap();
-        let projects = discover_catalogs(Some(&codex), Some(&proma)).unwrap();
+        let projects = discover_catalogs(Some(&codex), Some(&proma), &[]).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].agents, [AgentKind::Codex]);
     }
@@ -384,7 +500,7 @@ mod tests {
         write_state(temp.path(), json!({"local-projects": {
             "project": {"name": "AI Agent", "rootPaths": [business]}
         }}));
-        let discovered = discover_catalogs(Some(temp.path()), Some(&root)).unwrap();
+        let discovered = discover_catalogs(Some(temp.path()), Some(&root), &[]).unwrap();
         let merged = merge_projects(&[native.clone(), business.clone()], &discovered, &BTreeSet::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].path, path_identity(&business));
@@ -449,7 +565,7 @@ mod tests {
                 {"id": "pilot", "slug": "pilot", "name": "Proma title", "projectRootPath": alias}
             ]})).unwrap()).unwrap();
         write_state(temp.path(), json!({"electron-saved-workspace-roots": [business]}));
-        let projects = discover_catalogs(Some(temp.path()), Some(temp.path())).unwrap();
+        let projects = discover_catalogs(Some(temp.path()), Some(temp.path()), &[]).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].path, path_identity(&business));
         assert_eq!(projects[0].agents, [AgentKind::Codex, AgentKind::Proma]);
@@ -527,7 +643,7 @@ mod tests {
             path: path.clone(),
             name: "Shared".into(),
             agents: vec![AgentKind::Codex],
-            proma_workspaces: Vec::new(),
+            proma_workspaces: Vec::new(), archived: false, hidden: false, retained: false,
         };
         let other = ProjectEntry {
             agents: vec![AgentKind::ClaudeCode, AgentKind::Codex],
