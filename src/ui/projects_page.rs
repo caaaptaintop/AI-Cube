@@ -2,11 +2,11 @@ use super::*;
 
 fn selected_project_skills(
     rows: &[EffectiveSkillRow],
-    selected_names: &HashSet<String>,
+    selected_keys: &HashSet<String>,
     action: ProjectBatchAction,
 ) -> Vec<ProjectSkill> {
     rows.iter()
-        .filter(|row| selected_names.contains(&row.name))
+        .filter(|row| selected_keys.contains(&row.key))
         .map(|row| ProjectSkill {
             name: row.name.clone(),
             installations: row.batch_installations(action),
@@ -405,18 +405,18 @@ impl KitterApp {
         let action = self.projects_view.batch_action;
         let selected = selected_project_skills(all_rows, &self.projects_view.batch_selected, action);
         let selected_count = selected.len();
-        let selectable_names = visible_rows
+        let selectable_keys = visible_rows
             .iter()
             .filter(|row| !row.batch_installations(action).is_empty())
-            .map(|row| row.name.clone())
+            .map(|row| row.key.clone())
             .collect::<Vec<_>>();
-        let all_selected = !selectable_names.is_empty()
-            && selectable_names
+        let all_selected = !selectable_keys.is_empty()
+            && selectable_keys
                 .iter()
-                .all(|name| self.projects_view.batch_selected.contains(name));
-        let visible_selected_count = selectable_names
+                .all(|key| self.projects_view.batch_selected.contains(key));
+        let visible_selected_count = selectable_keys
             .iter()
-            .filter(|name| self.projects_view.batch_selected.contains(*name))
+            .filter(|key| self.projects_view.batch_selected.contains(*key))
             .count();
         let partially_selected = visible_selected_count > 0 && !all_selected;
         let project = open_project.to_path_buf();
@@ -437,11 +437,11 @@ impl KitterApp {
         .to_string();
         let select_first_label = self.tr("请先选择技能", "Select skills first").to_string();
         let exit_label = self.tr("退出选择", "Exit selection").to_string();
-        let select_names = selectable_names.clone();
+        let select_keys = selectable_keys.clone();
         let has_proma = all_rows.iter().any(|row| row.direct_installations.iter().any(|item| item.target == InstallTarget::Proma));
         let mut controls = div().h(px(CONTROL_HEIGHT)).font_family(FONT_UI).font_weight(FontWeight::NORMAL)
             .flex().items_center().gap(px(6.));
-        if !select_names.is_empty() {
+        if !select_keys.is_empty() {
             controls = controls.child(
                 div()
                     .id("project-batch-select-visible")
@@ -483,11 +483,11 @@ impl KitterApp {
                         Tooltip::new(select_all_label.clone()).build(window, cx)
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        for name in &select_names {
+                        for key in &select_keys {
                             if all_selected {
-                                this.projects_view.batch_selected.remove(name);
+                                this.projects_view.batch_selected.remove(key);
                             } else {
-                                this.projects_view.batch_selected.insert(name.clone());
+                                this.projects_view.batch_selected.insert(key.clone());
                             }
                         }
                         cx.notify();
@@ -586,6 +586,7 @@ impl KitterApp {
     fn proma_installation_status(
         &self,
         name: &str,
+        key: &str,
         installations: &[ProjectSkillInstallation],
     ) -> Option<Popover> {
         let p = self.palette();
@@ -694,9 +695,9 @@ impl KitterApp {
         let separate_states = self.tr("启停状态分别作用于各工作区。", "Activation applies separately in each workspace.").to_string();
         let workspace_label = self.tr("工作区", "Workspace").to_string();
         let close = self.tr("关闭详情", "Close details").to_string();
-        Some(Popover::new(ElementId::Name(format!("proma-status-{name}").into()))
+        Some(Popover::new(ElementId::Name(format!("proma-status-{key}").into()))
             .appearance(false).anchor(Anchor::TopLeft)
-            .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{name}").into()))
+            .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{key}").into()))
                 .accessibility_label(format!("{name} · {label} · {}", self.tr("查看详情", "View details")))
                 .h(px(20.)).ml(px(8.)).px(px(6.)).rounded(px(7.5)).flex().items_center().gap(px(5.))
                 .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(11.))
@@ -757,8 +758,8 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
-        let proma_status = self.proma_installation_status(&effective.name, &effective.direct_installations);
-        let name = effective.name.clone();
+        let proma_status = self.proma_installation_status(&effective.name, &effective.key, &effective.direct_installations);
+        let key = effective.key.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {
             name: effective.name.clone(),
@@ -767,8 +768,8 @@ impl KitterApp {
         let can_delete = !installed_for_delete.installations.is_empty();
         let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
         let can_select = !effective.batch_installations(self.projects_view.batch_action).is_empty();
-        let batch_checked = self.projects_view.batch_selected.contains(&name);
-        let row_selector = format!("project-skill-{name}");
+        let batch_checked = self.projects_view.batch_selected.contains(&key);
+        let row_selector = format!("project-skill-{key}");
         let mut row = div()
             .id(ElementId::Name(row_selector.clone().into()))
             .debug_selector(move || row_selector)
@@ -792,7 +793,7 @@ impl KitterApp {
                         .items_center()
                         .child(
                             Checkbox::new(ElementId::Name(
-                                format!("batch-project-skill-{name}").into(),
+                                format!("batch-project-skill-{key}").into(),
                             ))
                             .tab_stop(false)
                             .checked(batch_checked),
@@ -801,7 +802,7 @@ impl KitterApp {
             })
             .when(batch_mode && !can_select, |row| {
                 let reason = self.project_batch_unavailable_reason(effective);
-                row.child(div().id(ElementId::Name(format!("batch-project-unavailable-{name}").into()))
+                row.child(div().id(ElementId::Name(format!("batch-project-unavailable-{key}").into()))
                     .absolute().left(px(8.)).top(px(0.)).bottom(px(0.))
                     .flex().items_center().justify_center().w(px(16.))
                     .child(div().size(px(16.)).rounded(px(4.)).border_1().border_color(p.border)
@@ -826,7 +827,7 @@ impl KitterApp {
                             .child(
                                 div()
                                     .id(ElementId::Name(
-                                        format!("project-skill-name-{name}").into(),
+                                        format!("project-skill-name-{key}").into(),
                                     ))
                                     .min_w_0()
                                     .truncate()
@@ -851,6 +852,11 @@ impl KitterApp {
                                         })
                                     }),
                             )
+                            .when(effective.duplicate_name, |title| {
+                                title.child(div().ml(px(8.)).text_size(px(11.)).text_color(p.muted)
+                                    .child(format!("{} · {}", self.tr("同名", "Same name"),
+                                        effective.agents.iter().map(|agent| agent.label()).collect::<Vec<_>>().join(" / "))))
+                            })
                             .when(effective.manual_only, |title| {
                                 title.child(self.manual_skill_badge().ml(px(10.)))
                             })
@@ -871,18 +877,18 @@ impl KitterApp {
                     ),
             )
             .child(
-                self.effective_agent_badges(format!("project-{name}"), &effective.agents, cx)
+                self.effective_agent_badges(format!("project-{key}"), &effective.agents, cx)
                     .ml(px(12.)),
             );
         if batch_mode && can_select {
-            let selected_name = name.clone();
+            let selected_key = key.clone();
             row = row
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.projects_view.batch_selected.remove(&selected_name) {
+                    if !this.projects_view.batch_selected.remove(&selected_key) {
                         this.projects_view
                             .batch_selected
-                            .insert(selected_name.clone());
+                            .insert(selected_key.clone());
                     }
                     cx.notify();
                 }));
@@ -890,7 +896,7 @@ impl KitterApp {
             let project_for_delete = open_project.to_path_buf();
             row = row.child(
                 self.danger_icon_button(
-                    ElementId::Name(format!("remove-project-{name}").into()),
+                    ElementId::Name(format!("remove-project-{key}").into()),
                     "icons/trash.svg",
                     cx,
                 )
@@ -1891,7 +1897,10 @@ mod tests {
 
     fn row(name: &str, paths: &[&str]) -> EffectiveSkillRow {
         EffectiveSkillRow {
+            key: paths.first().map(|path| super::super::effective_view::skill_file_key(&PathBuf::from(path).join("SKILL.md")))
+                .unwrap_or_else(|| format!("fixture:{name}")),
             name: name.into(),
+            duplicate_name: false,
             description: String::new(),
             locations: Vec::new(),
             built_in: false,
@@ -1915,13 +1924,25 @@ mod tests {
     }
 
     #[test]
+    fn same_named_batch_selection_requires_the_actual_source_key() {
+        let rows = [row("pdf", &["/project/.codex/skills/pdf"]), row("pdf", &["/native/skills/pdf"])];
+        let by_name = HashSet::from(["pdf".to_string()]);
+        assert!(selected_project_skills(&rows, &by_name, super::ProjectBatchAction::Remove).is_empty(),
+            "a display name cannot select multiple independent copies");
+        let by_source = HashSet::from(["file:/project/.codex/skills/pdf/SKILL.md".to_string()]);
+        let targets = selected_project_skills(&rows, &by_source, super::ProjectBatchAction::Remove);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].installations[0].path, PathBuf::from("/project/.codex/skills/pdf"));
+    }
+
+    #[test]
     fn batch_removal_uses_only_the_selected_rows_direct_installations() {
         let rows = vec![
             row("selected", &["/project/.agents/skills/selected"]),
             row("shadowed", &["/project/.claude/skills/shadowed"]),
             row("external-only", &[]),
         ];
-        let selected = HashSet::from(["selected".to_string(), "external-only".to_string()]);
+        let selected = HashSet::from([rows[0].key.clone(), rows[2].key.clone()]);
 
         let targets = selected_project_skills(&rows, &selected, super::ProjectBatchAction::Remove);
 
@@ -1944,7 +1965,7 @@ mod tests {
         protected.direct_installations[0].removable = false;
         assert!(mixed.can_remove());
         assert!(!protected.can_remove());
-        let selected = HashSet::from(["mixed".into(), "protected".into()]);
+        let selected = HashSet::from([mixed.key.clone(), protected.key.clone()]);
         let targets = selected_project_skills(&[mixed, protected], &selected, super::ProjectBatchAction::Remove);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].installations.len(), 1);
@@ -1967,10 +1988,11 @@ mod tests {
         }
         let mut external = mixed.clone();
         external.name = "protected".into();
+        external.key = "fixture:protected".into();
         for installation in &mut external.direct_installations { installation.bundled = false; installation.toggleable = false; }
         let inherited = row("inherited", &[]);
         let rows = [mixed, external, inherited];
-        let selected = HashSet::from(["pdf".into(), "protected".into(), "inherited".into()]);
+        let selected = rows.iter().map(|row| row.key.clone()).collect();
         for (action, path) in [(ProjectBatchAction::DisableProma, "/pilot/skills/pdf"),
                                (ProjectBatchAction::EnableProma, "/pilot/skills-inactive/pdf")] {
             let targets = selected_project_skills(&rows, &selected, action);

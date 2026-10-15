@@ -2115,45 +2115,65 @@ mod e2e_tests {
         });
         cx.refresh().unwrap();
         cx.run_until_parked();
+        let (first_selector, last_selector, fixture_count) = cx.read_entity(&app, |app, _| {
+            let estimates = app.projects_view.context_estimates.borrow();
+            let direct = app.projects_view.project_snapshots.borrow();
+            let rows = effective_view::skill_rows(&estimates[&project].estimates, &direct[&project], None, &project);
+            let fixtures = rows.iter().filter(|row| row.name.starts_with("fixture-skill-")).collect::<Vec<_>>();
+            assert!(fixtures.len() >= 180);
+            (format!("project-skill-{}", fixtures.first().unwrap().key),
+             format!("project-skill-{}", fixtures.last().unwrap().key), fixtures.len())
+        });
+        // GPUI's test selector API requires process-lifetime strings.
+        let first_selector: &'static str = Box::leak(first_selector.into_boxed_str());
+        let last_selector: &'static str = Box::leak(last_selector.into_boxed_str());
         let first_row = cx
-            .debug_bounds("project-skill-fixture-skill-001")
+            .debug_bounds(first_selector)
             .expect("first virtual project row should be rendered");
-        assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_none());
+        assert!(cx.debug_bounds(last_selector).is_none());
         let scroll = cx
             .debug_bounds("project-skills-virtual-list")
             .expect("virtual project list should be rendered");
         assert_eq!(first_row.size.width, scroll.size.width);
         assert!(effective_view::path_resolution_count() > 0);
         effective_view::reset_path_resolution_count();
-        // Avoid saturating GPUI's synthetic pixel delta at the exact maximum
-        // offset; that test-only edge drops the virtual rows for the frame.
-        let scroll_delta = first_row.size.height * 180. - scroll.size.height * 0.5;
-        cx.simulate_event(ScrollWheelEvent {
-            position: scroll.center(),
-            delta: ScrollDelta::Pixels(point(px(0.), -scroll_delta)),
-            ..Default::default()
-        });
-        cx.run_until_parked();
-        cx.refresh().unwrap();
-        assert!(cx.debug_bounds("project-skill-fixture-skill-180").is_some());
+        // GPUI clamps large synthetic wheel deltas. Use bounded page events
+        // rather than assuming that all source rows share one pixel offset.
+        for _ in 0..fixture_count {
+            cx.simulate_event(ScrollWheelEvent {
+                position: scroll.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), -scroll.size.height)),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            cx.refresh().unwrap();
+            if cx.debug_bounds(last_selector).is_some() { break; }
+        }
+        assert!(cx.debug_bounds(last_selector).is_some());
         assert_eq!(effective_view::path_resolution_count(), 0, "scrolling rebuilt filesystem paths");
-        cx.simulate_event(ScrollWheelEvent {
-            position: scroll.center(),
-            delta: ScrollDelta::Pixels(point(px(0.), scroll_delta)),
-            ..Default::default()
-        });
-        cx.run_until_parked();
-        cx.refresh().unwrap();
+        for _ in 0..fixture_count {
+            cx.simulate_event(ScrollWheelEvent {
+                position: scroll.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), scroll.size.height)),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+            cx.refresh().unwrap();
+            if cx.read_entity(&app, |app, _| {
+                let offset = app.projects_view.skill_list.logical_scroll_top();
+                offset.item_ix == 0 && offset.offset_in_item == px(0.)
+            }) { break; }
+        }
         let header = cx.debug_bounds("project-skill-source-project").unwrap();
         cx.simulate_click(header.center(), Modifiers::none());
         cx.run_until_parked();
         cx.refresh().unwrap();
-        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_none());
+        assert!(cx.debug_bounds(first_selector).is_none());
         let header = cx.debug_bounds("project-skill-source-project").unwrap();
         cx.simulate_click(header.center(), Modifiers::none());
         cx.run_until_parked();
         cx.refresh().unwrap();
-        assert!(cx.debug_bounds("project-skill-fixture-skill-001").is_some());
+        assert!(cx.debug_bounds(first_selector).is_some());
         assert_eq!(effective_view::path_resolution_count(), 0, "group toggles rebuilt filesystem paths");
     }
 
