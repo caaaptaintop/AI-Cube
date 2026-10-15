@@ -217,6 +217,9 @@ pub struct ProjectSkillInstallation {
     pub target: InstallTarget,
     pub path: PathBuf,
     pub managed: bool,
+    /// Verified managed-copy origin for display identity, never an action target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
     /// Read-only scan result for removal controls; mutations still revalidate.
     #[serde(default)]
     pub removable: bool,

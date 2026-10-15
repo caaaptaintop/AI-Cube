@@ -1912,7 +1912,7 @@ mod tests {
                 .map(|path| ProjectSkillInstallation {
                     target: InstallTarget::Universal,
                     path: PathBuf::from(path),
-                    managed: true,
+                    managed: true, source: None,
                     removable: true, toggleable: false,
                     bundled: false,
                     integration: None,
