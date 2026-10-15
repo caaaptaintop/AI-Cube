@@ -11,6 +11,9 @@ impl KitterApp {
         let mut changed = 0;
         let mut failures = Vec::new();
         for skill in skills {
+            let selected_keys = skill.installations.iter().map(|installation| {
+                super::effective_view::skill_file_key(&installation.path.join("SKILL.md"))
+            }).collect::<HashSet<_>>();
             let mut succeeded = true;
             for installation in &skill.installations {
                 if installation.target != InstallTarget::Proma || !seen.insert(installation.path.clone()) { continue; }
@@ -22,7 +25,7 @@ impl KitterApp {
                     }
                 }
             }
-            if succeeded { self.projects_view.batch_selected.remove(&skill.name); }
+            if succeeded { self.projects_view.batch_selected.retain(|key| !selected_keys.contains(key)); }
         }
         if changed > 0 { self.refresh(cx); }
         let verb = self.tr(if enabled { "启用" } else { "停用" }, if enabled { "enabled" } else { "disabled" });

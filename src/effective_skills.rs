@@ -4,7 +4,7 @@
 //! static discovery profiles; scanner and catalog modules are internal primitives.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -209,69 +209,25 @@ impl<'a> EffectiveSkillGroup<'a> {
 ///
 /// Agents can expose different names for one filesystem entry (for example,
 /// Claude's `build_from_zero` and Grok's normalized `build-from-zero`). A
-/// matching name or canonical filesystem path joins entries into one group.
+/// canonical filesystem path joins entries into one group. Names alone do
+/// not establish identity; built-ins and plugins also retain their provider.
 pub fn group_effective_skills<'a>(
     entries: impl IntoIterator<Item = (AgentKind, &'a EffectiveSkill)>,
 ) -> Vec<EffectiveSkillGroup<'a>> {
-    struct Candidate<'a> {
-        agent: AgentKind,
-        skill: &'a EffectiveSkill,
-        filesystem_path: Option<PathBuf>,
-    }
-
-    let mut groups = Vec::<Vec<Candidate<'a>>>::new();
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
     for (agent, skill) in entries {
-        let filesystem_path = matches!(skill.source, SkillSource::Filesystem).then(|| {
-            skill
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| skill.path.clone())
-        });
-        let candidate = Candidate {
-            agent,
-            skill,
-            filesystem_path,
+        let (provider, id) = match &skill.source {
+            SkillSource::Filesystem => (String::new(), String::new()),
+            SkillSource::Builtin => (format!("builtin:{}", agent.id()), skill.id.clone()),
+            SkillSource::Plugin { id, .. } => (format!("plugin:{}", agent.id()), id.clone()),
         };
-        let matching = groups
-            .iter()
-            .enumerate()
-            .filter_map(|(index, group)| {
-                group
-                    .iter()
-                    .any(|entry| {
-                        entry.skill.name == candidate.skill.name
-                            || entry
-                                .filesystem_path
-                                .as_ref()
-                                .zip(candidate.filesystem_path.as_ref())
-                                .is_some_and(|(left, right)| left == right)
-                    })
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            groups.push(vec![candidate]);
-            continue;
-        }
-
-        let mut merged = Vec::new();
-        for index in matching.into_iter().rev() {
-            let mut group = groups.remove(index);
-            group.append(&mut merged);
-            merged = group;
-        }
-        merged.push(candidate);
-        groups.push(merged);
+        let path = skill.path.canonicalize().unwrap_or_else(|_| skill.path.clone());
+        groups.entry((provider, id, path)).or_default().push((agent, skill));
     }
 
     let mut result = groups
-        .into_iter()
-        .map(|group| EffectiveSkillGroup {
-            entries: group
-                .into_iter()
-                .map(|entry| (entry.agent, entry.skill))
-                .collect(),
-        })
+        .into_values()
+        .map(|entries| EffectiveSkillGroup { entries })
         .collect::<Vec<_>>();
     result.sort_by(|left, right| left.name().cmp(right.name()));
     result
@@ -3772,6 +3728,51 @@ path = 'D:\skills\active\SKILL.md'
                 .iter()
                 .any(|skill| skill.name == "nested-command")
         );
+    }
+
+    #[test]
+    fn same_named_skills_keep_each_agents_actual_source() {
+        let temp = tempdir().unwrap();
+        let agents = crate::agents::AGENT_ICON_ORDER.iter()
+            .filter_map(|info| AgentKind::from_id(info.id)).collect::<Vec<_>>();
+        let skills = agents.iter().map(|agent| {
+            let path = temp.path().join(agent.id()).join("SKILL.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, agent.id()).unwrap();
+            EffectiveSkill {
+                id: "pdf".into(), name: "pdf".into(), description: agent.label().into(), when_to_use: None,
+                path, root_path: None, prompt_path: None, scope: SkillScope::Repository,
+                visibility: SkillVisibility::Automatic, source: SkillSource::Filesystem,
+            }
+        }).collect::<Vec<_>>();
+        let groups = group_effective_skills(agents.iter().copied().zip(skills.iter()));
+        assert_eq!(groups.len(), agents.len(), "same names must not combine independent files");
+        assert!(groups.iter().all(|group| group.entries().len() == 1));
+        let mut alias = skills[0].clone();
+        alias.name = "pdf-alias".into();
+        let shared = group_effective_skills([(agents[0], &skills[0]), (agents[1], &alias)]);
+        assert_eq!(shared.len(), 1, "one real file shared by Agents remains one row");
+        assert_eq!(shared[0].entries().len(), 2);
+    }
+
+    #[test]
+    fn same_named_builtins_and_plugins_keep_their_provider_identity() {
+        let builtin = EffectiveSkill {
+            id: "pdf".into(), name: "pdf".into(), description: String::new(), when_to_use: None,
+            path: "/virtual/pdf".into(), root_path: None, prompt_path: None,
+            scope: SkillScope::System, visibility: SkillVisibility::Automatic, source: SkillSource::Builtin,
+        };
+        let mut first_plugin = builtin.clone();
+        first_plugin.source = SkillSource::Plugin { id: "first".into(), display_name: "PDF".into() };
+        let mut second_plugin = first_plugin.clone();
+        second_plugin.source = SkillSource::Plugin { id: "second".into(), display_name: "PDF".into() };
+        let groups = group_effective_skills([
+            (AgentKind::Codex, &builtin), (AgentKind::Proma, &builtin),
+            (AgentKind::Codex, &first_plugin), (AgentKind::Codex, &second_plugin),
+            (AgentKind::Codex, &first_plugin),
+        ]);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.iter().filter(|group| group.entries().len() == 2).count(), 1);
     }
 
     #[test]
