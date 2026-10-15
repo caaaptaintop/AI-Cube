@@ -12,7 +12,7 @@ impl KitterApp {
         let mut failures = Vec::new();
         for skill in skills {
             let selected_keys = skill.installations.iter().map(|installation| {
-                super::effective_view::skill_file_key(&installation.path.join("SKILL.md"))
+                super::effective_view::installation_skill_key(installation)
             }).collect::<HashSet<_>>();
             let mut succeeded = true;
             for installation in &skill.installations {

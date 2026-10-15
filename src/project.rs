@@ -390,6 +390,7 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                 target: InstallTarget::Proma,
                 path: installation.path,
                 managed: installation.managed,
+                source: installation.source,
                 removable: installation.removable,
                 toggleable,
                 bundled: installation.bundled,
@@ -442,6 +443,7 @@ pub fn list(project: &Path, library_dir: &Path) -> Result<Vec<ProjectSkill>> {
                     target,
                     path,
                     managed,
+                    source: None,
                     removable: true, toggleable: false,
                     bundled: false,
                     integration: None,
@@ -587,7 +589,7 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("SKILL.md"), "business fixture").unwrap();
         let installation = ProjectSkillInstallation {
-            target: InstallTarget::Proma, path: path.clone(), managed: true, removable: false, toggleable: false, bundled: false, integration: None,
+            target: InstallTarget::Proma, path: path.clone(), managed: true, source: None, removable: false, toggleable: false, bundled: false, integration: None,
             state: Some("active".into()), status: Some("current".into()),
         };
         assert!(remove_project_skill(&installation).is_err());
@@ -794,7 +796,7 @@ mod tests {
         let installation = ProjectSkillInstallation {
             target: InstallTarget::Universal,
             path: path.clone(),
-            managed: false,
+            managed: false, source: None,
             removable: true, toggleable: false,
             bundled: false,
             integration: None,
@@ -818,7 +820,7 @@ mod tests {
         let installation = ProjectSkillInstallation {
             target: InstallTarget::Universal,
             path: path.clone(),
-            managed: false,
+            managed: false, source: None,
             removable: false, toggleable: false,
             bundled: false,
             integration: None,
