@@ -16,7 +16,7 @@ use crate::{
 use super::{
     AddKind, AddTask, ContentSnapshot, ContextEstimateCache, DeleteConfirmation, DialogBody,
     GroupDragScope, GroupEdit, Page, PageBody, ProjectBatchAction, ProjectChoice, ProjectSkillFilter, ProjectSkillsTab,
-    SourceChoice, SpinnerView, TagAssignmentTarget, TagDropPosition, TagDropTarget, TagEdit, TagId,
+    SkillSourceGroup, SourceChoice, SpinnerView, TagAssignmentTarget, TagDropPosition, TagDropTarget, TagEdit, TagId,
     TagScope, adoption_list, effective_skills::AgentKind, skill_selection::SkillSelection,
 };
 
@@ -141,7 +141,7 @@ pub(super) struct ProjectsState {
     pub selected_project_agent: Option<AgentKind>,
     pub project_agents_expanded: bool,
     pub expanded_project_plugins: HashSet<String>,
-    pub collapsed_skill_sources: HashSet<String>,
+    pub selected_skill_source: Option<(PathBuf, SkillSourceGroup)>,
     pub project_search: Entity<InputState>,
     pub project_agent_filter: ProjectAgentFilter,
     pub list_view: ProjectListView,
@@ -149,7 +149,7 @@ pub(super) struct ProjectsState {
     pub project_snapshots: RefCell<BTreeMap<PathBuf, Vec<ProjectSkill>>>,
     pub skill_rows_cache: RefCell<super::SkillRowsCache>,
     pub skill_list: ListState,
-    pub skill_list_items: RefCell<(Option<PathBuf>, Option<AgentKind>, Vec<super::ProjectSkillListItem>)>,
+    pub skill_list_items: RefCell<(Option<PathBuf>, Option<AgentKind>, Option<SkillSourceGroup>, usize)>,
     pub project_snapshot_tasks: RefCell<BTreeMap<PathBuf, u64>>,
     pub context_estimates: RefCell<BTreeMap<PathBuf, ContextEstimateCache>>,
     pub context_estimate_tasks: RefCell<BTreeMap<PathBuf, u64>>,

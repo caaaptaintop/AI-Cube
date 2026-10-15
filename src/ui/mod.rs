@@ -66,7 +66,7 @@ mod tags_groups_actions;
 mod theme;
 
 use crate::text::counted;
-use effective_view::{EffectivePluginGroup, EffectiveSkillRow, ProjectSkillListItem, SkillOrigin, SkillSourceGroup, SkillRowsCache, SkillRowsCacheKey, grouped_skill_items, same_file};
+use effective_view::{EffectivePluginGroup, EffectiveSkillRow, SkillOrigin, SkillSourceGroup, SkillRowsCache, SkillRowsCacheKey, skill_source_groups, same_file};
 use gpui_component::resizable::ResizableState;
 use skill_selection::SkillSelection;
 use state::*;
@@ -862,7 +862,7 @@ impl KitterApp {
             },
             projects_view: ProjectsState {
                 proma_directory_menu: None,
-                collapsed_skill_sources: if preview_proma { HashSet::from(["builtin".into()]) } else { HashSet::new() },
+                selected_skill_source: None,
                 discovered_projects: Vec::new(),
                 discovery_task: None,
                 open_project: initial_project.clone(),
@@ -882,7 +882,7 @@ impl KitterApp {
                 project_snapshots: RefCell::new(BTreeMap::new()),
                 skill_rows_cache: RefCell::new(SkillRowsCache::default()),
                 skill_list: ListState::new(0, ListAlignment::Top, px(120.)),
-                skill_list_items: RefCell::new((None, None, Vec::new())),
+                skill_list_items: RefCell::new((None, None, None, 0)),
                 project_snapshot_tasks: RefCell::new(BTreeMap::new()),
                 context_estimates: RefCell::new(BTreeMap::new()),
                 context_estimate_tasks: RefCell::new(BTreeMap::new()),
@@ -2070,6 +2070,9 @@ mod e2e_tests {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("kitter-data");
         let project = temp.path().join("fixture-project");
+        let parent_skill = temp.path().join(".agents/skills/fixture-parent");
+        fs::create_dir_all(&parent_skill).unwrap();
+        fs::write(parent_skill.join("SKILL.md"), "---\nname: fixture-parent\ndescription: Parent fixture\n---\n").unwrap();
         for target in [".agents/skills", ".codex/skills", ".claude/skills"] {
             for index in 1..=180 {
                 let name = format!("fixture-skill-{index:03}");
@@ -2164,17 +2167,17 @@ mod e2e_tests {
                 offset.item_ix == 0 && offset.offset_in_item == px(0.)
             }) { break; }
         }
-        let header = cx.debug_bounds("project-skill-source-project").unwrap();
-        cx.simulate_click(header.center(), Modifiers::none());
+        let parent_tab = cx.debug_bounds("project-skill-source-parent").unwrap();
+        cx.simulate_click(parent_tab.center(), Modifiers::none());
         cx.run_until_parked();
         cx.refresh().unwrap();
         assert!(cx.debug_bounds(first_selector).is_none());
-        let header = cx.debug_bounds("project-skill-source-project").unwrap();
-        cx.simulate_click(header.center(), Modifiers::none());
+        let project_tab = cx.debug_bounds("project-skill-source-project").unwrap();
+        cx.simulate_click(project_tab.center(), Modifiers::none());
         cx.run_until_parked();
         cx.refresh().unwrap();
         assert!(cx.debug_bounds(first_selector).is_some());
-        assert_eq!(effective_view::path_resolution_count(), 0, "group toggles rebuilt filesystem paths");
+        assert_eq!(effective_view::path_resolution_count(), 0, "source tab changes rebuilt filesystem paths");
     }
 
     #[test]

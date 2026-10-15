@@ -133,27 +133,11 @@ impl SkillSourceGroup {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) enum ProjectSkillListItem {
-    Header { group: SkillSourceGroup, count: usize },
-    Skill(usize),
-}
-
-pub(super) fn grouped_skill_items(
-    rows: &[EffectiveSkillRow], collapsed: &HashSet<String>,
-) -> Vec<ProjectSkillListItem> {
-    let mut items = Vec::new();
-    for group in SkillSourceGroup::ALL {
-        let indices = rows.iter().enumerate().filter_map(|(index, row)| {
-            (row.source_group() == group).then_some(index)
-        }).collect::<Vec<_>>();
-        if indices.is_empty() { continue; }
-        items.push(ProjectSkillListItem::Header { group, count: indices.len() });
-        if !collapsed.contains(group.key()) {
-            items.extend(indices.into_iter().map(ProjectSkillListItem::Skill));
-        }
-    }
-    items
+pub(super) fn skill_source_groups(rows: &[EffectiveSkillRow]) -> Vec<(SkillSourceGroup, usize)> {
+    SkillSourceGroup::ALL.into_iter().filter_map(|group| {
+        let count = rows.iter().filter(|row| row.source_group() == group).count();
+        (count > 0).then_some((group, count))
+    }).collect()
 }
 
 impl EffectiveSkillRow {
@@ -792,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn source_groups_count_each_skill_once_and_collapse_only_their_rows() {
+    fn source_groups_count_each_skill_once_and_omit_empty_categories() {
         let row = |name: &str, origins| EffectiveSkillRow {
             key: name.into(), name: name.into(), duplicate_name: false, description: String::new(), locations: Vec::new(),
             built_in: false, agents: Vec::new(), manual_only: false,
@@ -808,20 +792,12 @@ mod tests {
             row("integration", vec![SkillOrigin::Integration]),
             row("mixed", vec![SkillOrigin::User, SkillOrigin::Builtin]),
         ];
-        let items = grouped_skill_items(&rows, &HashSet::new());
-        let headers = items.iter().filter_map(|item| match item {
-            ProjectSkillListItem::Header { group, count } => Some((group.key(), *count)),
-            _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(headers, [("project", 1), ("user", 2), ("parent", 1), ("system", 1), ("builtin", 1), ("integration", 1), ("multiple", 1)]);
-        let indices = items.iter().filter_map(|item| match item {
-            ProjectSkillListItem::Skill(index) => Some(*index), _ => None,
-        }).collect::<HashSet<_>>();
-        assert_eq!(indices.len(), rows.len());
-        let collapsed = grouped_skill_items(&rows, &HashSet::from(["builtin".into()]));
-        assert_eq!(collapsed.len(), items.len() - 1);
-        assert!(!collapsed.iter().any(|item| matches!(item, ProjectSkillListItem::Skill(5))));
-        assert!(collapsed.iter().any(|item| matches!(item, ProjectSkillListItem::Header { group: SkillSourceGroup::Origin(SkillOrigin::Builtin), count: 1 })));
+        let groups = skill_source_groups(&rows);
+        assert_eq!(groups.iter().map(|(group, count)| (group.key(), *count)).collect::<Vec<_>>(),
+            [("project", 1), ("user", 2), ("parent", 1), ("system", 1), ("builtin", 1), ("integration", 1), ("multiple", 1)]);
+        assert_eq!(groups.iter().map(|(_, count)| count).sum::<usize>(), rows.len());
+        assert_eq!(skill_source_groups(&rows[..1]), [(SkillSourceGroup::Origin(SkillOrigin::Project), 1)]);
+        assert!(skill_source_groups(&[]).is_empty());
     }
 
     #[test]
