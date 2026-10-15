@@ -185,7 +185,10 @@ impl KitterApp {
                 }),
             );
         let is_global_context = dirs::home_dir().as_ref().is_some_and(|home| home == path);
-        let unavailable = crate::agents::AGENT_ICON_ORDER.iter().filter_map(|info| {
+        let project_agents = crate::project_discovery::agents_for_project(
+            path, crate::agents::AGENT_ICON_ORDER, &self.projects_view.discovered_projects,
+        );
+        let unavailable = project_agents.iter().filter_map(|info| {
             let agent = AgentKind::from_id(info.id)?;
             (!estimates.iter().any(|estimate| estimate.agent == agent)).then_some(AgentContextEstimate {
                 agent, discovered_count: 0, model_visible_count: 0, manual_only_count: 0,
@@ -517,10 +520,13 @@ impl KitterApp {
                     .pb(px(4.))
                     .text_size(px(10.))
                     .text_color(p.muted)
-                    .child(self.tr(
+                    .child(if is_global_context { self.tr(
                         "未安装的 Agent 显示为灰色 · 技能与 Token 为已安装 Agent 的目录扫描估算",
                         "Uninstalled Agents are gray · Skills and tokens are estimated for installed Agents",
-                    )),
+                    ) } else { self.tr(
+                        "按项目关联 Agent 统计，含其全局技能 · 未登记项目按兼容性扫描",
+                        "Associated Agents and their global skills · Unregistered projects use compatibility scanning",
+                    ) }),
             )
             .child(table)
             .child(expand_control)

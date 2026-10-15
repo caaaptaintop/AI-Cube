@@ -515,8 +515,18 @@ pub fn estimate_project_for_agents(
     project: &Path,
     agents: &[crate::agents::AgentIconInfo],
 ) -> Vec<AgentContextEstimate> {
+    let discovered = crate::project_discovery::discover_agent_projects().unwrap_or_default();
+    estimate_project_with_catalog(project, agents, &discovered)
+}
+
+pub fn estimate_project_with_catalog(
+    project: &Path,
+    agents: &[crate::agents::AgentIconInfo],
+    discovered: &[crate::project_discovery::ProjectEntry],
+) -> Vec<AgentContextEstimate> {
     let home = dirs::home_dir().unwrap_or_else(|| project.to_path_buf());
-    estimate_for_agents(project, &home, agents)
+    let associated = crate::project_discovery::agents_for_project(project, agents, discovered);
+    estimate_for_agents(project, &home, &associated)
 }
 
 /// Explicit compatibility inspection, also used with isolated fixture homes.

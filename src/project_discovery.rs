@@ -227,6 +227,24 @@ pub fn project_identity(path: &Path, discovered: &[ProjectEntry]) -> PathBuf {
         .unwrap_or(identity)
 }
 
+/// Catalog associations constrain known projects. Global inspection and
+/// unregistered directories retain the full compatibility view.
+pub fn agents_for_project(
+    path: &Path,
+    agents: &[crate::agents::AgentIconInfo],
+    discovered: &[ProjectEntry],
+) -> Vec<crate::agents::AgentIconInfo> {
+    if dirs::home_dir().is_some_and(|home| path_identity(&home) == path_identity(path)) {
+        return agents.to_vec();
+    }
+    let identity = project_identity(path, discovered);
+    let entry = discovered.iter().find(|entry| path_identity(&entry.path) == identity);
+    agents.iter().copied().filter(|info| {
+        entry.is_none_or(|entry| entry.agents.is_empty()
+            || entry.agents.iter().any(|agent| agent.id() == info.id))
+    }).collect()
+}
+
 /// A Finder project is one row, even when an Agent stores Skills elsewhere.
 pub fn merge_projects(
     manual: &[PathBuf],
@@ -303,6 +321,31 @@ pub fn all_projects(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn project_agent_scope_follows_catalog_aliases_and_preserves_global_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let business = temp.path().join("business");
+        let native = temp.path().join("proma/default");
+        let mut entry = ProjectEntry {
+            path: business.clone(), name: "Project".into(),
+            agents: vec![AgentKind::Proma], proma_workspaces: vec![native.clone()],
+            archived: false, hidden: false, retained: false,
+        };
+        let agents = crate::agents::AGENT_ICON_ORDER;
+        for path in [&business, &native] {
+            let scoped = agents_for_project(path, agents, &[entry.clone()]);
+            assert_eq!(scoped.iter().map(|info| info.id).collect::<Vec<_>>(), ["proma"]);
+        }
+        entry.agents.push(AgentKind::Codex);
+        assert_eq!(agents_for_project(&business, agents, &[entry.clone()])
+            .iter().map(|info| info.id).collect::<Vec<_>>(), ["codex", "proma"]);
+        assert_eq!(agents_for_project(&temp.path().join("unknown"), agents, &[entry.clone()]), agents);
+        if let Some(home) = dirs::home_dir() {
+            entry.path = home.clone();
+            assert_eq!(agents_for_project(&home, agents, &[entry]), agents);
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -1246,11 +1246,12 @@ impl KitterApp {
                 .insert(path.clone(), generation);
             let path = path.clone();
             let agents = self.model.installed_agents.clone();
+            let discovered = self.projects_view.discovered_projects.clone();
             cx.spawn(async move |this, cx| {
                 let worker_path = path.clone();
                 let estimates = cx
                     .background_executor()
-                    .spawn(async move { effective_skills::estimate_project_for_agents(&worker_path, &agents) })
+                    .spawn(async move { effective_skills::estimate_project_with_catalog(&worker_path, &agents, &discovered) })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let is_current = this.projects_view.scan_generation == generation
@@ -1267,6 +1268,10 @@ impl KitterApp {
                         .context_estimate_tasks
                         .borrow_mut()
                         .remove(&path);
+                    if this.projects_view.open_project.as_ref() == Some(&path) {
+                        this.projects_view.selected_project_agent = this.projects_view.selected_project_agent
+                            .filter(|agent| estimates.iter().any(|estimate| estimate.agent == *agent));
+                    }
                     this.projects_view.context_estimates.borrow_mut().insert(
                         path,
                         ContextEstimateCache {

@@ -159,3 +159,53 @@ fn merged_project_routes_installation_and_rejects_ambiguous_removal() {
     assert!(codex.exists());
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "business data");
 }
+
+#[test]
+fn isolated_proma_scope_excludes_unrelated_agent_globals() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("proma/agent-workspaces/default");
+    let proma_skill = workspace.join("skills/local-proma-only");
+    let foreign = root.join("codex/skills/foreign-codex-global");
+    let bin = root.join("bin");
+    let local_codex_root = workspace.join(".codex/skills");
+    for directory in [&proma_skill, &foreign, &bin, &local_codex_root] { fs::create_dir_all(directory).unwrap(); }
+    for (folder, name) in [(&proma_skill, "local-proma-only"), (&foreign, "foreign-codex-global")] {
+        fs::write(folder.join("SKILL.md"), format!("---\nname: {name}\ndescription: Scope regression fixture\n---\n")).unwrap();
+    }
+    for name in ["codex", "proma"] {
+        let file = bin.join(name); fs::write(&file, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(root.join("proma/agent-workspaces.json"), serde_json::to_vec(&json!({
+        "version":2,"workspaces":[{"id":"default","slug":"default","name":"Default"}]
+    })).unwrap()).unwrap();
+    let inspect = |path: &Path| {
+        let result = Command::new(env!("CARGO_BIN_EXE_kitter"))
+            .env("KITTER_HOME", root.join("config")).env("KITTER_PROMA_HOME", root.join("proma"))
+            .env("CODEX_HOME", root.join("codex")).env("KITTER_CODEX_PROJECTS_HOME", root.join("codex"))
+            .env("PATH", std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap())
+            .args(["project",path.to_str().unwrap(),"--view","skills","--json"]).output().unwrap();
+        assert!(result.status.success(), "CLI inspection failed");
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
+    };
+    let isolated = inspect(&workspace);
+    let agents = isolated["agents"].as_array().unwrap();
+    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["proma"]);
+    assert!(agents[0]["skills"].as_array().unwrap().iter().any(|s| s["name"]=="local-proma-only"));
+    assert!(!agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="foreign-codex-global"));
+    let local_codex = local_codex_root.join("local-codex");
+    fs::create_dir(&local_codex).unwrap();
+    fs::write(local_codex.join("SKILL.md"), "---\nname: local-codex\ndescription: Local Agent installation\n---\n").unwrap();
+    let local = inspect(&workspace);
+    assert_eq!(local["agents"].as_array().unwrap().iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["proma"]);
+    fs::write(root.join("codex/.codex-global-state.json"), serde_json::to_vec(&json!({
+        "local-projects":{"shared":{"name":"Shared","rootPaths":[workspace]}}
+    })).unwrap()).unwrap();
+    let shared = inspect(&workspace);
+    let agents = shared["agents"].as_array().unwrap();
+    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["codex","proma"]);
+    assert!(agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="foreign-codex-global"));
+    assert!(agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="local-codex"));
+}
