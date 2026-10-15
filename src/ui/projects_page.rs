@@ -153,32 +153,40 @@ impl KitterApp {
         }
     }
 
-    fn project_skill_group_header(
-        &self, group: SkillSourceGroup, count: usize, cx: &mut Context<Self>,
+    fn project_skill_source_tabs(
+        &self, project: &Path, groups: &[(SkillSourceGroup, usize)],
+        selected: Option<SkillSourceGroup>, cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
-        let key = group.key().to_string();
-        let debug_key = key.clone();
-        let collapsed = self.projects_view.collapsed_skill_sources.contains(&key);
-        let label = match group {
-            SkillSourceGroup::Origin(origin) => self.skill_origin_label(origin, self.projects_view.global_project_view),
-            SkillSourceGroup::Multiple => self.tr("多种来源", "Multiple sources"),
-        };
-        div().id(ElementId::Name(format!("project-skill-source-{key}").into()))
-            .debug_selector(move || format!("project-skill-source-{debug_key}").into())
-            .h(px(28.)).w_full().px(px(32.)).flex().items_center().gap(px(6.))
-            .bg(p.surface).cursor_pointer()
-            .hover(move |row| row.bg(p.hover))
-            .child(Self::icon(if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }, 12., p.muted))
-            .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.secondary).child(label))
-            .child(div().text_size(px(10.)).text_color(p.muted).child(count.to_string()))
-            .child(div().ml(px(4.)).flex_1().h(px(1.)).bg(p.border))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.projects_view.collapsed_skill_sources.remove(&key) {
-                    this.projects_view.collapsed_skill_sources.insert(key.clone());
-                }
-                cx.notify();
-            })).into_any_element()
+        let mut tabs = div().id("project-skill-source-tabs")
+            .h(px(44.)).min_w_0().flex_none().px(px(28.))
+            .flex().items_center().gap(px(6.))
+            .border_b_1().border_color(p.border).overflow_x_scroll();
+        for &(group, count) in groups {
+            let key = group.key();
+            let active = selected == Some(group);
+            let label = match group {
+                SkillSourceGroup::Origin(origin) => self.skill_origin_label(origin, self.projects_view.global_project_view),
+                SkillSourceGroup::Multiple => self.tr("多种来源", "Multiple sources"),
+            };
+            let project = project.to_path_buf();
+            tabs = tabs.child(gpui_base::Button::new(ElementId::Name(format!("project-skill-source-{key}").into()))
+                .debug_selector(move || format!("project-skill-source-{key}").into())
+                .accessibility_label(format!("{label} {count}{}", if active { self.tr(" · 已选", " · selected") } else { "" }))
+                .h(px(28.)).px(px(10.)).rounded(px(7.)).flex_none()
+                .flex().items_center().gap(px(6.)).cursor_pointer()
+                .font_family(FONT_UI).text_size(px(11.)).font_weight(FontWeight::MEDIUM)
+                .text_color(if active { p.text } else { p.secondary })
+                .bg(if active { p.selected } else { rgba(0x00000000) })
+                .hover(move |tab| tab.bg(p.hover))
+                .child(label)
+                .child(div().font_family(MONO).text_size(px(10.)).text_color(p.muted).child(count.to_string()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.projects_view.selected_skill_source = Some((project.clone(), group));
+                    cx.notify();
+                })));
+        }
+        tabs.into_any_element()
     }
 
     fn matches_project_skill_filter(&self, row: &EffectiveSkillRow) -> bool {
@@ -1578,21 +1586,21 @@ impl KitterApp {
                 )
             };
             let skill_count = all_effective_rows.len();
+            let source_groups = skill_source_groups(&all_effective_rows);
+            let selected_source = self.projects_view.selected_skill_source.as_ref()
+                .filter(|(project, group)| project == open_project && source_groups.iter().any(|(available, _)| available == group))
+                .map(|(_, group)| *group)
+                .or_else(|| source_groups.first().map(|(group, _)| *group));
             let batch_mode = self.projects_view.batch_project.as_deref() == Some(open_project);
             let can_batch = batch_mode
                 || all_effective_rows
                     .iter()
                     .any(|row| row.can_remove() || !row.batch_installations(ProjectBatchAction::DisableProma).is_empty()
                         || !row.batch_installations(ProjectBatchAction::EnableProma).is_empty());
-            let effective_rows = if batch_mode {
-                Arc::new(all_effective_rows
-                    .iter()
-                    .filter(|row| self.matches_project_skill_filter(row))
-                    .cloned()
-                    .collect::<Vec<_>>())
-            } else {
-                Arc::clone(&all_effective_rows)
-            };
+            let effective_rows = Arc::new(all_effective_rows.iter()
+                .filter(|row| Some(row.source_group()) == selected_source)
+                .filter(|row| !batch_mode || self.matches_project_skill_filter(row))
+                .cloned().collect::<Vec<_>>());
             let mut skills = div()
                 .id("project-skills-scroll")
                 .debug_selector(|| "project-skills-scroll".into())
@@ -1618,7 +1626,9 @@ impl KitterApp {
                         .text_color(p.muted)
                         .child(Self::icon("icons/package.svg", 28., p.muted))
                         .child(div().mt(px(10.)).text_size(px(14.)).child(
-                            if self.projects_view.selected_project_agent.is_some() {
+                            if batch_mode && self.projects_view.batch_filter.is_some() {
+                                self.tr("当前分类没有符合筛选条件的技能", "No skills match the filter in this category").to_string()
+                            } else if self.projects_view.selected_project_agent.is_some() {
                                 if self.uses_english() {
                                     format!("No effective skills for {selected_agent}")
                                 } else {
@@ -1642,10 +1652,9 @@ impl KitterApp {
             }
             if !effective_rows.is_empty() {
                 let rows = Arc::clone(&effective_rows);
-                let items = Arc::new(grouped_skill_items(&rows, &self.projects_view.collapsed_skill_sources));
-                let list_key = (Some(open_project.clone()), self.projects_view.selected_project_agent, items.as_ref().clone());
+                let list_key = (Some(open_project.clone()), self.projects_view.selected_project_agent, selected_source, rows.len());
                 if *self.projects_view.skill_list_items.borrow() != list_key {
-                    self.projects_view.skill_list.reset(items.len());
+                    self.projects_view.skill_list.reset(rows.len());
                     *self.projects_view.skill_list_items.borrow_mut() = list_key;
                 }
                 let project = open_project.clone();
@@ -1655,10 +1664,7 @@ impl KitterApp {
                         .child(list(
                         self.projects_view.skill_list.clone(),
                         cx.processor(move |this, index, _, cx| {
-                            match &items[index] {
-                                    ProjectSkillListItem::Header { group, count } => this.project_skill_group_header(*group, *count, cx),
-                                    ProjectSkillListItem::Skill(index) => this.project_skill_row(&rows[*index], &project, cx),
-                            }
+                            this.project_skill_row(&rows[index], &project, cx)
                         }),
                     )
                     .size_full()),
@@ -1673,26 +1679,6 @@ impl KitterApp {
             let mut tabs = self
                 .project_skills_tabs(skill_count, plugin_skill_count, cx)
                 .child(div().flex_1());
-            if !effective_rows.is_empty() && self.projects_view.project_skills_tab == ProjectSkillsTab::Skills {
-                let groups = SkillSourceGroup::ALL.into_iter()
-                    .filter(|group| effective_rows.iter().any(|row| row.source_group() == *group))
-                    .map(|group| group.key().to_string()).collect::<Vec<_>>();
-                let all_collapsed = groups.iter().all(|key| self.projects_view.collapsed_skill_sources.contains(key));
-                tabs = tabs.child(
-                    div().id("project-skill-source-toggle-all")
-                        .debug_selector(|| "project-skill-source-toggle-all".into()).h(px(CONTROL_HEIGHT)).px(px(8.))
-                        .rounded(px(RADIUS_CONTROL)).flex().items_center().cursor_pointer()
-                        .font_family(FONT_UI).text_size(px(12.)).text_color(p.secondary).hover(move |button| button.bg(p.hover))
-                        .child(if all_collapsed { self.tr("展开分组", "Expand groups") } else { self.tr("收起分组", "Collapse groups") })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            for key in &groups {
-                                if all_collapsed { this.projects_view.collapsed_skill_sources.remove(key); }
-                                else { this.projects_view.collapsed_skill_sources.insert(key.clone()); }
-                            }
-                            cx.notify();
-                        })),
-                );
-            }
             if can_batch && self.projects_view.project_skills_tab == ProjectSkillsTab::Skills {
                 if batch_mode {
                     tabs = tabs.child(self.project_batch_controls(
@@ -1808,6 +1794,9 @@ impl KitterApp {
                         .child(context_panel),
                 )
                 .child(tabs)
+                .when(self.projects_view.project_skills_tab == ProjectSkillsTab::Skills && !source_groups.is_empty(), |panel| {
+                    panel.child(self.project_skill_source_tabs(open_project, &source_groups, selected_source, cx))
+                })
                 .child(skills)
                 .child(self.window_drag_strip("project-detail-window-drag", 24., cx))
         } else {
