@@ -516,10 +516,8 @@ fn run() -> Result<()> {
         Command::Proma { .. } => unreachable!("Proma commands are handled before library opening"),
         Command::Projects { json } => {
             let discovered = kitter::project_discovery::discover_agent_projects()?;
-            let projects = kitter::project_discovery::merge_projects(
-                &library.config.project_paths(), &discovered,
-                &library.config.hidden_discovered_projects,
-            );
+            let projects = library.config.project_entries(&discovered)
+                .into_iter().filter(kitter::project_discovery::ProjectEntry::is_active).collect::<Vec<_>>();
             if json {
                 println!("{}", serde_json::to_string_pretty(&projects)?);
             } else {

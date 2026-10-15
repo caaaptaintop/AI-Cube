@@ -106,6 +106,27 @@ impl ProjectAgentFilter {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ProjectListView {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
+impl ProjectListView {
+    pub(super) fn matches(self, entry: &crate::project_discovery::ProjectEntry) -> bool {
+        match self {
+            Self::Active => entry.is_active(),
+            Self::Archived => !entry.is_active(),
+            Self::All => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ProjectVisibilityAction { Hide, Restore, FollowAgent }
+
 pub(super) struct ProjectsState {
     pub discovered_projects: Vec<crate::project_discovery::ProjectEntry>,
     pub discovery_task: Option<gpui::Task<()>>,
@@ -123,6 +144,7 @@ pub(super) struct ProjectsState {
     pub collapsed_skill_sources: HashSet<String>,
     pub project_search: Entity<InputState>,
     pub project_agent_filter: ProjectAgentFilter,
+    pub list_view: ProjectListView,
     pub project_select: Entity<SelectState<Vec<ProjectChoice>>>,
     pub project_snapshots: RefCell<BTreeMap<PathBuf, Vec<ProjectSkill>>>,
     pub skill_rows_cache: RefCell<super::SkillRowsCache>,

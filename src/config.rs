@@ -63,6 +63,8 @@ pub struct AppConfig {
     pub project_activity: BTreeMap<PathBuf, u64>,
     #[serde(default)]
     pub hidden_discovered_projects: BTreeSet<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retained_projects: BTreeSet<PathBuf>,
     #[serde(default)]
     pub collapsed_skill_groups: BTreeSet<String>,
     #[serde(default)]
@@ -78,6 +80,7 @@ impl Default for AppConfig {
             recent_projects: vec![],
             project_activity: BTreeMap::new(),
             hidden_discovered_projects: BTreeSet::new(),
+            retained_projects: BTreeSet::new(),
             collapsed_skill_groups: BTreeSet::new(),
             collapsed_skill_groups_initialized: false,
         }
@@ -180,8 +183,20 @@ impl AppConfig {
     pub fn remove_project(&mut self, path: &Path) {
         let identity = crate::project_discovery::path_identity(path);
         self.hidden_discovered_projects.insert(identity.clone());
+        self.retained_projects.retain(|project| crate::project_discovery::path_identity(project) != identity);
         self.recent_projects.retain(|project| crate::project_discovery::path_identity(project) != identity);
         self.project_activity.retain(|project, _| crate::project_discovery::path_identity(project) != identity);
+    }
+
+    pub fn restore_project(&mut self, path: PathBuf) {
+        let path = crate::project_discovery::path_identity(&path);
+        self.remember_project(path.clone());
+        self.retained_projects.insert(path);
+    }
+
+    pub fn project_entries(&self, discovered: &[crate::project_discovery::ProjectEntry]) -> Vec<crate::project_discovery::ProjectEntry> {
+        crate::project_discovery::all_projects(&self.project_paths(), discovered,
+            &self.hidden_discovered_projects, &self.retained_projects)
     }
 
     fn prune_project_activity(&mut self) {
@@ -220,6 +235,26 @@ mod tests {
         loaded.remember_project(path.clone());
         assert!(loaded.hidden_discovered_projects.is_empty());
         assert_eq!(loaded.project_paths(), vec![path]);
+    }
+
+    #[test]
+    fn hidden_manual_project_and_explicit_restore_survive_reopening() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = crate::project_discovery::path_identity(temp.path());
+        let mut config = AppConfig::default();
+        config.remember_project(path.clone());
+        config.remove_project(&path);
+        config.save_to(temp.path()).unwrap();
+        let mut loaded = AppConfig::load_from(temp.path()).unwrap();
+        let hidden = loaded.project_entries(&[]);
+        assert_eq!(hidden.len(), 1);
+        assert!(hidden[0].hidden && !hidden[0].is_active());
+        loaded.restore_project(path.clone());
+        loaded.save_to(temp.path()).unwrap();
+        let restored = AppConfig::load_from(temp.path()).unwrap();
+        assert!(restored.retained_projects.contains(&path));
+        assert!(restored.project_entries(&[])[0].is_active());
+        assert!(temp.path().is_dir());
     }
 
     #[cfg(unix)]

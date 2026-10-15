@@ -46,14 +46,62 @@ impl KitterApp {
                 self.projects_view.batch_filter = None;
             }
         }
+        if self.projects_view.list_view == ProjectListView::Active
+            && self.all_project_entries().iter().any(|entry| Some(&entry.path) == self.projects_view.open_project.as_ref() && !entry.is_active())
+        {
+            self.projects_view.open_project = None;
+            self.projects_view.global_project_view = true;
+            self.projects_view.batch_project = None;
+            self.projects_view.batch_selected.clear();
+            self.projects_view.batch_filter = None;
+        }
     }
 
     pub(super) fn project_entries(&self) -> Vec<crate::project_discovery::ProjectEntry> {
-        crate::project_discovery::merge_projects(
-            &self.model.library.config.project_paths(),
-            &self.projects_view.discovered_projects,
-            &self.model.library.config.hidden_discovered_projects,
-        )
+        self.all_project_entries().into_iter().filter(crate::project_discovery::ProjectEntry::is_active).collect()
+    }
+
+    pub(super) fn all_project_entries(&self) -> Vec<crate::project_discovery::ProjectEntry> {
+        self.model.library.config.project_entries(&self.projects_view.discovered_projects)
+    }
+
+    pub(super) fn change_project_visibility(&mut self, path: &Path, action: ProjectVisibilityAction, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(action, ProjectVisibilityAction::Restore) && !path.is_dir() {
+            self.show_notice(self.tr("项目目录不存在，暂时无法恢复", "The project folder is unavailable"), cx);
+            return;
+        }
+        let before = self.model.library.config.clone();
+        match action {
+            ProjectVisibilityAction::Hide => self.model.library.config.remove_project(path),
+            ProjectVisibilityAction::Restore => self.model.library.config.restore_project(path.to_path_buf()),
+            ProjectVisibilityAction::FollowAgent => {
+                let identity = crate::project_discovery::path_identity(path);
+                self.model.library.config.retained_projects.retain(|project| crate::project_discovery::path_identity(project) != identity);
+            }
+        }
+        if self.model.library.config.save_to(self.model.library.data_dir()).is_err() {
+            self.model.library.config = before;
+            self.show_notice(self.tr("无法保存项目显示设置，请重试", "Could not save project visibility; try again"), cx);
+            return;
+        }
+        if matches!(action, ProjectVisibilityAction::Restore) {
+            self.projects_view.list_view = ProjectListView::Active;
+            self.projects_view.open_project = Some(path.to_path_buf());
+            self.projects_view.global_project_view = false;
+        } else if self.projects_view.open_project.as_deref() == Some(path) {
+            self.projects_view.open_project = None;
+            self.projects_view.global_project_view = true;
+        }
+        self.projects_view.batch_project = None;
+        self.projects_view.batch_selected.clear();
+        self.projects_view.batch_filter = None;
+        self.sync_project_select(window, cx);
+        let message = match action {
+            ProjectVisibilityAction::Hide => self.tr("已在 Kitter 中隐藏，可从“已归档／隐藏”恢复", "Hidden in Kitter; restore from Archived / hidden"),
+            ProjectVisibilityAction::Restore => self.tr("已恢复到活跃项目", "Restored to active projects"),
+            ProjectVisibilityAction::FollowAgent => self.tr("已恢复跟随 Agent 归档状态", "Now following Agent archive status"),
+        };
+        self.show_notice(message, cx);
     }
 
     pub(super) fn browse_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -97,6 +145,10 @@ impl KitterApp {
                         this.projects_view.batch_filter = None;
                     }
                     this.projects_view.open_project = Some(path.clone());
+                    this.projects_view.list_view = ProjectListView::Active;
+                    if this.all_project_entries().iter().any(|entry| entry.path == path && !entry.is_active()) {
+                        this.model.library.config.restore_project(path.clone());
+                    }
                     if !this.install_flow.modal {
                         this.projects_view.global_project_view = false;
                         this.projects_view.selected_project_agent = None;

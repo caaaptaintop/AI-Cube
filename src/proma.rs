@@ -26,6 +26,9 @@ pub struct Workspace {
     pub path: PathBuf,
     #[serde(default)]
     pub project_root_path: Option<PathBuf>,
+    // Display metadata never changes existing installation/recovery records.
+    #[serde(skip)]
+    pub archived: bool,
 }
 
 impl PartialEq for Workspace {
@@ -49,6 +52,8 @@ struct IndexedWorkspace {
     name: String,
     #[serde(default, rename = "projectRootPath")]
     project_root_path: Option<PathBuf>,
+    #[serde(default)]
+    archived: bool,
 }
 
 pub fn home() -> Option<PathBuf> {
@@ -125,6 +130,7 @@ pub fn workspaces(root: &Path) -> Result<Vec<Workspace>> {
             name: entry.name,
             path,
             project_root_path,
+            archived: entry.archived,
         });
     }
     Ok(out)
