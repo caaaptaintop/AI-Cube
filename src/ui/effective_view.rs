@@ -141,6 +141,14 @@ pub(super) fn skill_source_groups(rows: &[EffectiveSkillRow]) -> Vec<(SkillSourc
 }
 
 impl EffectiveSkillRow {
+    pub fn proma_is_inactive(&self) -> bool {
+        proma_copies_inactive(&self.direct_installations)
+    }
+
+    pub fn is_inactive(&self) -> bool {
+        self.agents == [AgentKind::Proma] && self.proma_is_inactive()
+    }
+
     pub fn source_group(&self) -> SkillSourceGroup {
         match self.origins.as_slice() {
             [origin] => SkillSourceGroup::Origin(*origin),
@@ -169,6 +177,11 @@ impl EffectiveSkillRow {
             }
         }
     }
+}
+
+pub(super) fn proma_copies_inactive(installations: &[ProjectSkillInstallation]) -> bool {
+    let mut copies = installations.iter().filter(|copy| copy.target == InstallTarget::Proma).peekable();
+    copies.peek().is_some() && copies.all(|copy| copy.state.as_deref() == Some("inactive"))
 }
 
 pub(super) fn same_file(left: &Path, right: &Path) -> bool {
@@ -464,6 +477,7 @@ pub(super) fn skill_rows(
         row.agents.sort_by_key(|agent| crate::agents::display_sort_key(agent.label(), true));
         row.agents.dedup();
     }
+    rows.sort_by_key(|row| (row.is_inactive(), row.name.to_lowercase(), row.key.clone()));
     rows
 }
 
@@ -895,6 +909,14 @@ mod tests {
         assert_ne!(rows[0].key, rows[1].key);
         assert_eq!(rows[0].direct_installations[0].state.as_deref(), Some("active"));
         assert_eq!(rows[1].direct_installations[0].state.as_deref(), Some("inactive"));
+        assert!(!rows[0].is_inactive());
+        assert!(rows[1].is_inactive());
+        let mut shared = rows[1].clone();
+        shared.agents.insert(0, AgentKind::Codex);
+        assert!(shared.proma_is_inactive());
+        assert!(!shared.is_inactive(), "Codex remains active when only its Proma copy is inactive");
+        shared.direct_installations.push(rows[0].direct_installations[0].clone());
+        assert!(!shared.proma_is_inactive(), "mixed Proma copies must not all appear inactive");
         assert!(skill_rows(&[], &direct, Some(AgentKind::Codex), Path::new("/pilot")).is_empty());
     }
 }

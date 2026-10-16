@@ -288,6 +288,7 @@ impl KitterApp {
         popover_id: String,
         targets: &[InstallTarget],
         include_global_only: bool,
+        proma_inactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let agents = self.model.installed_agents
@@ -301,13 +302,14 @@ impl KitterApp {
             })
             .map(|agent| (agent.name, agent.icon_path))
             .collect::<Vec<_>>();
-        self.render_agent_badges(popover_id, agents, cx)
+        self.render_agent_badges(popover_id, agents, proma_inactive, cx)
     }
 
     pub(super) fn effective_agent_badges(
         &self,
         popover_id: String,
         kinds: &[AgentKind],
+        proma_inactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let agents = self.model.installed_agents
@@ -315,13 +317,14 @@ impl KitterApp {
             .filter(|agent| kinds.iter().any(|kind| kind.id() == agent.id))
             .map(|agent| (agent.name, agent.icon_path))
             .collect::<Vec<_>>();
-        self.render_agent_badges(popover_id, agents, cx)
+        self.render_agent_badges(popover_id, agents, proma_inactive, cx)
     }
 
     pub(super) fn render_agent_badges(
         &self,
         popover_id: String,
         mut agents: Vec<(&'static str, &'static str)>,
+        proma_inactive: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         agents.sort_by_key(|(name, _)| crate::agents::display_sort_key(name, true));
@@ -335,10 +338,16 @@ impl KitterApp {
             25. + (visible.saturating_sub(1) as f32 * 20.)
         } + if hidden > 0 { 20. } else { 0. };
         let brand_color = p.text;
+        let inactive_label = self.tr("已停用", "Inactive").to_string();
         let mut badges = div().flex().items_center();
-        for (index, (_, icon)) in agents.iter().take(5).enumerate() {
+        for (index, (name, icon)) in agents.iter().take(5).enumerate() {
+            let inactive = proma_inactive && *name == "Proma";
             badges = badges.child(
                 div()
+                    .id(ElementId::Name(format!("agent-badge-{popover_id}-{index}").into()))
+                    .relative()
+                    .role(Role::Image)
+                    .aria_label(if inactive { format!("{name} · {inactive_label}") } else { name.to_string() })
                     .ml(if index == 0 { px(0.) } else { px(-5.) })
                     .size(px(25.))
                     .rounded_full()
@@ -348,11 +357,17 @@ impl KitterApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Self::brand_icon(
+                    .child(div().opacity(if inactive { 0.35 } else { 1. }).child(Self::brand_icon(
                         icon,
                         Self::brand_icon_size(icon, 17.),
                         p.text,
                         dark,
+                    )))
+                    .when(inactive, |badge| badge.child(
+                        div().absolute().right(px(-3.)).bottom(px(-2.)).size(px(13.))
+                            .rounded_full().bg(p.surface).border_1().border_color(p.border_strong)
+                            .flex().items_center().justify_center()
+                            .child(Self::icon("icons/pause.svg", 8., p.secondary))
                     )),
             );
         }
@@ -391,6 +406,7 @@ impl KitterApp {
                             .shadow_lg()
                             .overflow_y_scroll();
                         for (name, icon) in agents.clone() {
+                            let inactive = proma_inactive && name == "Proma";
                             menu = menu.child(
                                 div()
                                     .h(px(29.))
@@ -405,6 +421,7 @@ impl KitterApp {
                                             .flex()
                                             .items_center()
                                             .justify_center()
+                                            .opacity(if inactive { 0.35 } else { 1. })
                                             .child(Self::brand_icon(
                                                 icon,
                                                 Self::brand_icon_size(icon, 18.),
@@ -416,7 +433,7 @@ impl KitterApp {
                                         div()
                                             .text_size(px(13.))
                                             .text_color(p.secondary)
-                                            .child(name),
+                                            .child(if inactive { format!("{name} · {inactive_label}") } else { name.to_string() }),
                                     ),
                             );
                         }

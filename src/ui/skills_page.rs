@@ -1,5 +1,44 @@
 use super::*;
 
+fn library_search_results<'a>(
+    skills: &'a [SkillSummary], query: &str, descriptions: bool,
+) -> Vec<&'a SkillSummary> {
+    let query = query.trim().to_lowercase();
+    let mut results = skills.iter().filter(|skill| {
+        query.is_empty() || skill.record.name.to_lowercase().contains(&query)
+            || (descriptions && skill.record.description.to_lowercase().contains(&query))
+    }).collect::<Vec<_>>();
+    if !query.is_empty() {
+        results.sort_by_key(|skill| (
+            skill.record.name.to_lowercase() != query,
+            skill.record.name.to_lowercase(),
+            skill_storage_name(skill),
+        ));
+    }
+    results
+}
+
+fn description_search_excerpt(description: &str, query: &str) -> Option<String> {
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let query = query.trim().to_lowercase();
+    if query.is_empty() { return None; }
+    let mut folded = String::new();
+    let mut positions = Vec::new();
+    for (index, ch) in description.char_indices() {
+        let lower = ch.to_lowercase().collect::<String>();
+        positions.extend(std::iter::repeat_n(index, lower.len()));
+        folded.push_str(&lower);
+    }
+    let index = positions[folded.find(&query)?];
+    let prefix = description[..index].chars().rev().take(8).collect::<Vec<_>>();
+    let suffix = description[index..].chars().take(query.chars().count() + 36).collect::<String>();
+    Some(format!("{}{}{}{}",
+        if prefix.len() < description[..index].chars().count() { "…" } else { "" },
+        prefix.into_iter().rev().collect::<String>(), suffix,
+        if suffix.len() < description[index..].len() { "…" } else { "" },
+    ))
+}
+
 fn installable_skills_by_group(
     skills: &[SkillSummary],
     group_ids: &HashSet<&str>,
@@ -19,6 +58,27 @@ fn installable_skills_by_group(
 }
 
 impl KitterApp {
+    pub(super) fn visible_library_skills(&self, cx: &App) -> Vec<&SkillSummary> {
+        library_search_results(&self.model.skills,
+            self.skills_view.skill_search.read(cx).value().as_ref(), self.skills_view.search_descriptions)
+            .into_iter().filter(|skill| {
+                self.tags_flow.selected_skill_filter.is_none_or(|tag| {
+                    self.tags_flow.skills.matches_filter(skill_storage_name(skill), tag)
+                })
+            }).collect()
+    }
+
+    pub(super) fn sync_skill_search_selection(&mut self, cx: &mut Context<Self>) {
+        if self.skills_view.selection.is_multiple() { return; }
+        let results = self.visible_library_skills(cx);
+        if self.skills_view.selection.primary().is_some_and(|key| {
+            results.iter().any(|skill| skill_storage_name(skill) == key)
+        }) { return; }
+        let primary = results.first().map(|skill| skill_storage_name(skill).to_string());
+        self.skills_view.selection.replace(&primary.iter().cloned().collect::<Vec<_>>());
+        self.set_detail_selection(primary);
+    }
+
     pub(super) fn skill_list_row(
         &self,
         skill: &SkillSummary,
@@ -27,6 +87,10 @@ impl KitterApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
+        let query = self.skills_view.skill_search.read(cx).value().trim().to_lowercase();
+        let description_match = (self.skills_view.search_descriptions && !query.is_empty()
+            && !skill.record.name.to_lowercase().contains(&query))
+            .then(|| description_search_excerpt(&skill.record.description, &query)).flatten();
         let name = skill.record.name.clone();
         let built_in = skill.record.origin.is_builtin();
         let storage_name = skill_storage_name(skill).to_string();
@@ -128,8 +192,10 @@ impl KitterApp {
                 cx.stop_propagation();
                 this.toggle_skill_selection(checkbox_name.clone(), cx);
             }));
+        let row_selector = format!("skill-{storage_name}");
         div()
-            .id(ElementId::Name(format!("skill-{storage_name}").into()))
+            .id(ElementId::Name(row_selector.clone().into()))
+            .debug_selector(move || row_selector.clone())
             .min_h(px(44.))
             .px(px(8.))
             .my(px(2.))
@@ -193,7 +259,11 @@ impl KitterApp {
                                 format!("已安装到 {} 个项目", skill.installed_projects)
                             },
                         ),
-                    ),
+                    )
+                    .when_some(description_match, |column, excerpt| column.child(
+                        div().text_size(px(12.)).text_color(p.secondary).truncate()
+                            .child(format!("{} {excerpt}", self.tr("描述匹配：", "Description:")))
+                    )),
             )
             .when(skill.manual_only, |row| {
                 row.child(self.manual_skill_badge())
@@ -860,6 +930,7 @@ impl KitterApp {
                     .on_click(popover_cx.listener(move |_, _, _, cx| {
                         let _ = all_app.update(cx, |this, cx| {
                             this.set_tag_filter(scope, None);
+                            if matches!(scope, TagScope::Skills) { this.sync_skill_search_selection(cx); }
                             cx.notify();
                         });
                         cx.emit(DismissEvent);
@@ -905,6 +976,7 @@ impl KitterApp {
                         .on_click(popover_cx.listener(move |_, _, _, cx| {
                             let _ = root_app.update(cx, |this, cx| {
                                 this.set_tag_filter(scope, Some(root_id));
+                                if matches!(scope, TagScope::Skills) { this.sync_skill_search_selection(cx); }
                                 cx.notify();
                             });
                             cx.emit(DismissEvent);
@@ -951,6 +1023,7 @@ impl KitterApp {
                             .on_click(popover_cx.listener(move |_, _, _, cx| {
                                 let _ = child_app.update(cx, |this, cx| {
                                     this.set_tag_filter(scope, Some(child_id));
+                                    if matches!(scope, TagScope::Skills) { this.sync_skill_search_selection(cx); }
                                     cx.notify();
                                 });
                                 cx.emit(DismissEvent);
@@ -971,26 +1044,8 @@ impl KitterApp {
             .value()
             .trim()
             .to_lowercase();
-        let visible_skills = self
-            .model
-            .skills
-            .iter()
-            .filter(|skill| {
-                let matches_query = query.is_empty()
-                    || skill.record.name.to_lowercase().contains(&query)
-                    || skill.record.description.to_lowercase().contains(&query)
-                    || self
-                        .source_label(&skill.record.origin)
-                        .to_lowercase()
-                        .contains(&query);
-                let matches_tag = self.tags_flow.selected_skill_filter.is_none_or(|tag| {
-                    self.tags_flow
-                        .skills
-                        .matches_filter(skill_storage_name(skill), tag)
-                });
-                matches_query && matches_tag
-            })
-            .collect::<Vec<_>>();
+        let searching = !query.is_empty();
+        let visible_skills = self.visible_library_skills(cx);
         let visible_count = visible_skills.len();
         let configured_groups = self.model.library.groups();
         let group_ids = configured_groups
@@ -1003,7 +1058,7 @@ impl KitterApp {
         let mut pinned = Vec::new();
         let mut ungrouped = Vec::new();
         for skill in visible_skills {
-            if skill.record.origin.is_builtin() {
+            if searching || skill.record.origin.is_builtin() {
                 pinned.push(skill);
             } else if let Some(group_id) = skill.record.group_id.as_deref()
                 && group_ids.contains(group_id)
@@ -1121,6 +1176,18 @@ impl KitterApp {
                             }),
                     )
                     .child(div().flex_1())
+                    .child(
+                        Checkbox::new("search-skill-descriptions")
+                            .label(self.tr("包含描述", "Descriptions"))
+                            .checked(self.skills_view.search_descriptions)
+                            .xsmall()
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.skills_view.search_descriptions = *checked;
+                                this.sync_skill_search_selection(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().w(px(8.)))
                     .child(self.tag_filter_control(TagScope::Skills, cx)),
             )
             .when(self.skills_view.selection.is_multiple(), |list| {
@@ -1176,10 +1243,11 @@ impl KitterApp {
         for skill in pinned {
             rows = rows.child(self.skill_list_row(skill, false, Arc::clone(&selection_order), cx));
         }
-        for group in configured_groups {
+        for group in configured_groups.into_iter().filter(|_| !searching) {
             let group_id = group.id.clone();
             let group_label = group.name.clone();
             let skills = grouped.remove(&group_id).unwrap_or_default();
+            if skills.is_empty() && self.tags_flow.selected_skill_filter.is_some() { continue; }
             let collapsed =
                 query.is_empty() && self.skills_view.collapsed_groups.contains(&group_id);
             let group_count = skills.len();
@@ -1322,6 +1390,10 @@ impl KitterApp {
         for skill in ungrouped {
             rows = rows.child(self.skill_list_row(skill, false, Arc::clone(&selection_order), cx));
         }
+        if searching && visible_count == 0 {
+            rows = rows.child(div().p(px(16.)).text_size(px(13.)).text_color(p.muted)
+                .child(self.tr("没有匹配的技能", "No matching skills")));
+        }
         list = list.child(rows);
         layout::content(
             &self.shell.content_layout,
@@ -1381,6 +1453,7 @@ impl KitterApp {
                     .child(format!("#{path}"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tags_flow.selected_skill_filter = Some(tag_id);
+                        this.sync_skill_search_selection(cx);
                         cx.notify();
                     })),
             );
@@ -1636,6 +1709,7 @@ impl KitterApp {
             return self.multi_skill_detail(cx);
         }
         let Some(skill) = self.selected_skill() else {
+            let searching = !self.skills_view.skill_search.read(cx).value().trim().is_empty();
             return div()
                 .relative()
                 .flex_1()
@@ -1643,10 +1717,10 @@ impl KitterApp {
                 .items_center()
                 .justify_center()
                 .text_color(p.muted)
-                .child(self.tr(
+                .child(if searching { self.tr("没有匹配的技能", "No matching skills") } else { self.tr(
                     "添加第一个技能开始使用 Kitter",
                     "Add your first skill to get started",
-                ))
+                ) })
                 .child(self.window_drag_strip("empty-skill-detail-window-drag", 24., cx));
         };
         let storage_name = skill_storage_name(skill).to_string();
@@ -2058,6 +2132,7 @@ impl KitterApp {
                 };
                 let project_path = display_path(&path);
                 let installations = self.skill_installations_at(skill, &path, cx);
+                let proma_inactive = effective_view::proma_copies_inactive(&installations);
                 let proma_states = installations.iter()
                     .filter(|installation| installation.target == InstallTarget::Proma)
                     .map(|installation| match installation.state.as_deref() {
@@ -2088,15 +2163,26 @@ impl KitterApp {
                                 .ml(px(11.))
                                 .min_w_0()
                                 .flex_1()
-                                .child(div().font_family(MONO).text_size(px(13.)).child(
-                                    self.selectable_text(
-                                        format!("install-project-name-{index}"),
-                                        110 + index as u64 * 2,
-                                        project_name,
-                                        window,
-                                        cx,
-                                    ),
-                                ))
+                                .child(
+                                    div().min_w_0().flex().items_center()
+                                        .child(div().min_w_0().truncate().font_family(MONO).text_size(px(13.)).child(
+                                            self.selectable_text(
+                                                format!("install-project-name-{index}"),
+                                                110 + index as u64 * 2,
+                                                project_name,
+                                                window,
+                                                cx,
+                                            ),
+                                        ))
+                                        .when(!proma_states.is_empty(), |title| {
+                                            title.child(div().ml(px(8.)).px(px(8.)).h(px(26.)).rounded(px(7.5))
+                                                .flex_none().flex().items_center().gap(px(5.))
+                                                .text_size(px(12.)).font_weight(FontWeight::MEDIUM)
+                                                .text_color(p.secondary)
+                                                .when(proma_inactive, |status| status.bg(p.raised).child(Self::icon("icons/pause.svg", 12., p.secondary)))
+                                                .child(proma_states.clone()))
+                                        }),
+                                )
                                 .child(
                                     div()
                                         .mt(px(3.))
@@ -2112,11 +2198,7 @@ impl KitterApp {
                                         )),
                                 ),
                         )
-                        .child(self.agent_badges(popover_id, &targets, false, cx))
-                        .when(!proma_states.is_empty(), |row| {
-                            row.child(div().ml(px(8.)).text_size(px(12.))
-                                .text_color(p.muted).child(proma_states.clone()))
-                        })
+                        .child(self.agent_badges(popover_id, &targets, false, proma_inactive, cx))
                         .child(
                             self.danger_icon_button(
                                 ElementId::Name(format!("remove-install-project-{index}").into()),
@@ -2410,7 +2492,7 @@ impl KitterApp {
 
 #[cfg(test)]
 mod tests {
-    use super::installable_skills_by_group;
+    use super::{installable_skills_by_group, library_search_results, description_search_excerpt};
     use crate::{SkillOrigin, SkillRecord, SkillSummary};
     use std::{collections::HashSet, path::PathBuf};
 
@@ -2444,5 +2526,20 @@ mod tests {
             installable_skills_by_group(&skills, &groups)["group-a"],
             ["storage-visible", "storage-filtered-out"]
         );
+    }
+
+    #[test]
+    fn search_defaults_to_names_and_sorts_exact_name_before_alphabetical_matches() {
+        let mut skills = vec![skill("PDF-tools", None), skill("kdocs", None),
+            skill("pdf", None), skill("apdf", None)];
+        skills[1].record.description = "Create PDF documents".into();
+        let names = |descriptions| library_search_results(&skills, " PDF ", descriptions)
+            .iter().map(|skill| skill.record.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(false), ["pdf", "apdf", "PDF-tools"]);
+        assert_eq!(names(true), ["pdf", "apdf", "kdocs", "PDF-tools"]);
+        assert!(library_search_results(&skills, "not-found", true).is_empty());
+        let description = format!("{}İ 使用 PDF 文档转换与编辑。", "简介 ".repeat(30));
+        let excerpt = description_search_excerpt(&description, "pdf").unwrap();
+        assert!(excerpt.starts_with('…') && excerpt.contains("PDF 文档"));
     }
 }
