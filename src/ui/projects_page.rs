@@ -105,14 +105,8 @@ impl KitterApp {
         ).to_string();
         let cancel = self.tr("取消", "Cancel").to_string();
         Popover::new("project-proma-state-confirmation").appearance(false).anchor(Anchor::TopRight)
-            .trigger(gpui_base::Button::new("project-proma-state-trigger")
-                .accessibility_label(action.clone()).disabled(!has_selection)
-                .h(px(CONTROL_HEIGHT)).min_w(px(42.)).px(px(8.)).rounded(px(RADIUS_CONTROL))
-                .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(12.))
-                .text_color(p.text).bg(rgba(0x00000000)).flex().items_center().justify_center()
-                .hover(move |button| button.bg(p.hover)).active(move |button| button.bg(p.selected))
-                .styles(|styles| styles.disabled(|style| style.bg(rgba(0x00000000)).text_color(p.muted)))
-                .child(div().line_height(relative(1.5)).child(action.clone())))
+            .trigger(self.toolbar_text_button("project-proma-state-trigger", action.clone())
+                .min_w(px(42.)).disabled(!has_selection))
             .content(move |_, _, popover_cx| {
                 let confirm_app = app.clone();
                 let selected = selected.clone();
@@ -570,6 +564,19 @@ impl KitterApp {
         } else {
             controls = controls.child(self.project_proma_state_control(selected, project, cx));
         }
+        {
+            let keys = self.projects_view.batch_selected.iter().cloned().collect::<Vec<_>>();
+            let project = open_project.to_path_buf();
+            let explanation = self.cross_project_explanation();
+            controls = controls.child(self.toolbar_text_button("project-cross-project", self.tr("跨项目管理", "Manage across projects"))
+                .tooltip(move |window, cx| Tooltip::new(explanation.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let action = match action { ProjectBatchAction::Remove => crate::cross_project::Action::Remove,
+                        ProjectBatchAction::EnableProma => crate::cross_project::Action::Enable,
+                        ProjectBatchAction::DisableProma => crate::cross_project::Action::Disable };
+                    this.open_cross_project(keys.clone(), Some(project.clone()), action, None, cx);
+                })));
+        }
         controls.child(
                 div()
                     .id("project-batch-cancel")
@@ -591,11 +598,12 @@ impl KitterApp {
             )
     }
 
-    fn proma_installation_status(
+    pub(super) fn proma_installation_status(
         &self,
         name: &str,
         key: &str,
         installations: &[ProjectSkillInstallation],
+        cx: &mut Context<Self>,
     ) -> Option<Popover> {
         let p = self.palette();
         let mut seen = HashSet::new();
@@ -709,6 +717,9 @@ impl KitterApp {
         let separate_states = self.tr("启停状态分别作用于各工作区。", "Activation applies separately in each workspace.").to_string();
         let workspace_label = self.tr("工作区", "Workspace").to_string();
         let close = self.tr("关闭详情", "Close details").to_string();
+        let app = cx.entity().downgrade();
+        let skill_keys = copies.iter().map(|copy| effective_view::installation_skill_key(copy)).collect::<Vec<_>>();
+        let manage = self.tr("跨项目管理", "Manage across projects").to_string();
         Some(Popover::new(ElementId::Name(format!("proma-status-{key}").into()))
             .appearance(false).anchor(Anchor::TopLeft)
             .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{key}").into()))
@@ -749,6 +760,15 @@ impl KitterApp {
                     .child(div().text_size(px(11.)).text_color(p.muted).child(scope.clone()))
                     .when(multiple, |panel| panel.child(div().text_size(px(11.)).text_color(p.secondary).child(separate_states.clone())))
                     .child(list)
+                    .child(Button::new("proma-status-manage-workspaces").small().label(manage.clone())
+                        .on_click(popover_cx.listener({
+                            let app = app.clone();
+                            let keys = skill_keys.clone();
+                            move |_, _, _, cx| {
+                                let _ = app.update(cx, |this, cx| this.open_proma_batch(keys.clone(), None, inactive, cx));
+                                cx.emit(DismissEvent);
+                            }
+                        })))
             }))
     }
 
@@ -773,7 +793,7 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
-        let proma_status = self.proma_installation_status(&effective.name, &effective.key, &effective.direct_installations);
+        let proma_status = self.proma_installation_status(&effective.name, &effective.key, &effective.direct_installations, cx);
         let key = effective.key.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {

@@ -1106,12 +1106,35 @@ pub fn set_enabled(project: &Path, name: &str, enabled: bool) -> Result<()> {
 /// association is never used to select or fan out this operation.
 pub fn set_enabled_path(path: &Path, enabled: bool) -> Result<()> {
     let root = home().context("无法定位 Proma 配置根")?;
-    set_enabled_path_with_bundles(&root, path, enabled, &bundled_entry_fingerprints(&root))
+    set_enabled_path_in(&root, path, enabled)
+}
+
+pub fn set_enabled_path_in(root: &Path, path: &Path, enabled: bool) -> Result<()> {
+    set_enabled_path_with_bundles(root, path, enabled, &bundled_entry_fingerprints(root))
+}
+
+/// Bind a batch operation to the workspace and source shown in its preview.
+pub fn set_enabled_previewed_in(root: &Path, workspace: &Workspace, copy: &Installation, source_file: Option<&Path>, enabled: bool) -> Result<()> {
+    set_enabled_path_with_expectation(root, &copy.path, enabled,
+        &bundled_entry_fingerprints(root), Some((workspace, copy, source_file)))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_TOGGLE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn set_enabled_path_with_bundles(
     root: &Path, path: &Path, enabled: bool,
     bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+) -> Result<()> {
+    set_enabled_path_with_expectation(root, path, enabled, bundled_entries, None)
+}
+
+fn set_enabled_path_with_expectation(
+    root: &Path, path: &Path, enabled: bool,
+    bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+    preview: Option<(&Workspace, &Installation, Option<&Path>)>,
 ) -> Result<()> {
     if !path.is_absolute() {
         bail!("Proma 安装位置必须是绝对路径");
@@ -1127,9 +1150,19 @@ fn set_enabled_path_with_bundles(
     if parent.file_name().and_then(|p| p.to_str()) != Some(from) {
         bail!("启停源目录应为 {from}，请刷新安装状态");
     }
+    #[cfg(test)]
+    BEFORE_TOGGLE_LOCK.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() { callback(); }
+    });
     let w = workspace_for_path(root, parent.parent().context("安装位置缺少工作区")?)?;
     let workspace = Directory::open_anchored(&w.path)?;
     let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
+    if let Some((expected_workspace, _, _)) = preview {
+        let current = workspace_for_path(root, &w.path)?;
+        if current.id != expected_workspace.id || current.slug != expected_workspace.slug
+            || current.path != expected_workspace.path
+        { bail!("工作区身份与预览不一致，请刷新后重新选择"); }
+    }
     no_pending(&w)?;
     let source = w.path.join(from).join(name);
     // Open the supplied path as well, rejecting linked or traversing aliases.
@@ -1140,6 +1173,19 @@ fn set_enabled_path_with_bundles(
     let installation = inspect_with_bundles(root, &w.path, bundled_entries)?
         .into_iter().find(|item| item.path == source)
         .context("未找到可启停的 Proma 安装")?;
+    if let Some((_, expected_copy, source_file)) = preview {
+        if installation.name != expected_copy.name || installation.path != expected_copy.path
+            || installation.state != expected_copy.state || installation.source != expected_copy.source
+            || installation.managed != expected_copy.managed || installation.bundled != expected_copy.bundled
+            || installation.integration != expected_copy.integration
+        { bail!("副本来源或安装状态与预览不一致，请刷新后重新选择"); }
+        if let Some(expected_source) = source_file {
+            let source = installation.source.as_ref().context("预览的受管副本缺少来源")?.join("SKILL.md");
+            if source.canonicalize().context("无法核验技能源实际位置，请刷新后检查")? != expected_source {
+                bail!("技能源实际位置与预览不一致，请刷新后重新选择");
+            }
+        }
+    }
     if !installation.can_toggle() {
         bail!("只允许启停未修改的受管安装或经核验的内置预设");
     }
@@ -1186,8 +1232,32 @@ fn set_enabled_path_with_bundles(
 
 pub fn uninstall_path(path: &Path) -> Result<()> {
     let (root, w) = path_workspace(path)?;
+    uninstall_at(&root, &w, path, None)
+}
+
+/// Remove exactly the managed copy shown by cross-project preview, under the
+/// same workspace lock as the existing recoverable removal transaction.
+pub fn uninstall_previewed_in(root: &Path, workspace: &Workspace, copy: &Installation, source_file: &Path) -> Result<()> {
+    uninstall_at(root, workspace, &copy.path, Some((copy, source_file)))
+}
+
+fn uninstall_at(root: &Path, w: &Workspace, path: &Path, preview: Option<(&Installation, &Path)>) -> Result<()> {
     let workspace = Directory::open_anchored(&w.path)?;
     let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
+    let current_workspace = workspace_for_path(root, &w.path)?;
+    if current_workspace.id != w.id || current_workspace.slug != w.slug || current_workspace.path != w.path {
+        bail!("工作区身份与预览不一致，请刷新后检查");
+    }
+    if let Some((expected_copy, source_file)) = preview {
+        let copy = inspect_in(root, &w.path)?.into_iter().find(|c| c.path == path)
+            .context("预览安装已不存在，请刷新后检查")?;
+        if copy.name != expected_copy.name || copy.state != expected_copy.state || copy.source != expected_copy.source
+            || !copy.managed || !copy.removable
+        { bail!("副本来源或状态与预览不一致，已保留"); }
+        if copy.source.as_ref().context("受管副本缺少来源")?.join("SKILL.md").canonicalize()
+            .context("无法核验技能源实际位置")? != source_file
+        { bail!("技能源实际位置与预览不一致，已保留"); }
+    }
     no_pending(&w)?;
     clean_marker(path, &w)?;
     let expected = observed(path)?;
@@ -1210,7 +1280,7 @@ pub fn uninstall_path(path: &Path) -> Result<()> {
         Path::new("transaction.json"),
         &serde_json::to_vec_pretty(&t)?,
     )?;
-    if workspace_for_path(&root, &w.path)? != w || observed(path)? != expected {
+    if workspace_for_path(root, &w.path)? != *w || observed(path)? != expected {
         bail!("Proma 工作区或安装内容已变化");
     }
     workspace.verify_location(&w.path)?;
