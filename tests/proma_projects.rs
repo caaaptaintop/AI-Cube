@@ -200,8 +200,9 @@ fn isolated_proma_scope_excludes_unrelated_agent_globals() {
     fs::write(local_codex.join("SKILL.md"), "---\nname: local-codex\ndescription: Local Agent installation\n---\n").unwrap();
     let local = inspect(&workspace);
     let agents = local["agents"].as_array().unwrap();
-    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["codex", "proma"]);
-    assert!(agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="local-codex"));
+    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["proma"]);
+    assert!(!agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="foreign-codex-global"));
+    assert!(local_codex.join("SKILL.md").is_file());
     fs::remove_file(local_codex.join("SKILL.md")).unwrap();
     fs::remove_dir(&local_codex).unwrap();
     let isolated_again = inspect(&workspace);

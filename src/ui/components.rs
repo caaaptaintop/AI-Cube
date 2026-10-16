@@ -175,7 +175,7 @@ impl KitterApp {
                 ElementId::Name(format!("refresh-context-{}", path.display()).into()),
                 "icons/rotate-cw.svg",
                 p.secondary,
-                self.tr("刷新 token 扫描", "Refresh token scan"),
+                self.tr("刷新技能与 Token 扫描", "Refresh skills and token scan"),
                 cx,
             )
             .on_mouse_down(

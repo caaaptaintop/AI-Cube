@@ -636,6 +636,7 @@ impl KitterApp {
             _ => self.tr("状态未知", "Unknown state"),
         };
         let status_label = |copy: &ProjectSkillInstallation| match copy.status.as_deref() {
+            Some("preset_variant") => self.tr("预设副本 · 有差异", "Preset copy · differs").to_string(),
             _ if copy.bundled => self.tr("预设副本", "Bundled copy").to_string(),
             _ if copy.integration.is_some() => copy.integration.clone().unwrap_or_default(),
             Some("current") => self.tr("最新", "Current").to_string(),
@@ -648,6 +649,7 @@ impl KitterApp {
         };
         let mut issues = Vec::new();
         for (status, label) in [
+            ("preset_variant", self.tr("预设有差异", "preset differs")),
             ("modified", self.tr("副本已修改", "modified")),
             ("update_pending", self.tr("待同步", "pending update")),
         ] {
@@ -697,6 +699,7 @@ impl KitterApp {
         };
         let details = copies.iter().map(|copy| {
             let reason = match copy.status.as_deref() {
+                Some("preset_variant") => self.tr("匹配本机 Proma 预设模板，但与当前应用自带内容不同。已归为内置预设并保留本机内容；启停仍受保护。", "Matches a configured Proma preset template but differs from the current app. Shown as a built-in preset while preserving local content; state changes remain protected."),
                 _ if copy.bundled => self.tr("Proma 内置预设，可在批量管理中启用或停用。", "Proma preset; enable or disable it in batch management."),
                 _ if copy.integration.is_some() => self.tr("此副本由集成维护，不参与本地技能自动同步。", "Managed by an integration; excluded from local skill auto-sync."),
                 Some("modified") => self.tr("副本已自行修改，现有内容已保留；自动同步不会覆盖。", "This copy has local changes. Its contents are preserved and auto-sync will not overwrite them."),
@@ -708,7 +711,7 @@ impl KitterApp {
                 Some("current") => self.tr("副本与来源一致。", "This copy matches its source."),
                 _ => self.tr("尚未核验副本状态，现有内容已保留。", "Copy status is unverified; its existing contents are preserved."),
             };
-            (copy.path.clone(), format!("{} · {}", state_label(copy), status_label(copy)), reason.to_string(), matches!(copy.status.as_deref(), Some("modified" | "update_pending")))
+            (copy.path.clone(), format!("{} · {}", state_label(copy), status_label(copy)), reason.to_string(), matches!(copy.status.as_deref(), Some("modified" | "update_pending" | "preset_variant")))
         }).collect::<Vec<_>>();
         let title = format!("Proma · {name}");
         let multiple = workspace_count > 1;

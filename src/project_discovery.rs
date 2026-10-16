@@ -132,7 +132,7 @@ fn discover_catalogs(codex: Option<&Path>, proma: Option<&Path>, previous: &[Pro
     }
     let mut merged = all_projects(&[], &entries, &BTreeSet::new(), &BTreeSet::new());
     for entry in &mut merged {
-        for agent in local_installation_agents(&entry.path) {
+        for agent in local_installation_agents(&entry.path, Some(entry)) {
             if !entry.agents.contains(&agent) { entry.agents.push(agent); }
         }
     }
@@ -245,7 +245,7 @@ pub fn agents_for_project(
     }
     let identity = project_identity(path, discovered);
     let entry = discovered.iter().find(|entry| path_identity(&entry.path) == identity);
-    let local_agents = local_installation_agents(&identity);
+    let local_agents = local_installation_agents(&identity, entry);
     agents.iter().copied().filter(|info| {
         entry.is_none_or(|entry| entry.agents.is_empty()
             || entry.agents.iter().any(|agent| agent.id() == info.id))
@@ -253,9 +253,15 @@ pub fn agents_for_project(
     }).collect()
 }
 
-fn local_installation_agents(project: &Path) -> Vec<AgentKind> {
+fn local_installation_agents(project: &Path, entry: Option<&ProjectEntry>) -> Vec<AgentKind> {
     use crate::agents::{self, installation_root};
     if dirs::home_dir().is_some_and(|home| path_identity(&home) == path_identity(project)) { return Vec::new(); }
+    // Compatibility directories inside an Agent's private workspace are not
+    // native project registrations. Real catalog associations remain intact.
+    if entry.is_some_and(|entry| entry.proma_workspaces.iter()
+        .any(|workspace| path_identity(workspace) == path_identity(project))) {
+        return Vec::new();
+    }
     let targets = agents::PROJECT_INSTALL_TARGETS.iter().copied().filter(|target| {
         std::fs::read_dir(installation_root(project, *target)).into_iter().flatten().flatten()
             .any(|entry| entry.path().join("SKILL.md").is_file())
@@ -341,6 +347,69 @@ pub fn all_projects(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_native_workspace_compatibility_installs_do_not_register_other_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let codex = root.join("codex");
+        let proma = root.join("proma");
+        let business = root.join("business");
+        let codex_only = root.join("codex-only");
+        let source = root.join("tabbit");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::create_dir(&business).unwrap();
+        std::fs::create_dir(&codex_only).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "Tabbit compatibility skill").unwrap();
+        let natives = ["default", "another-native", "business-a", "business-b"]
+            .map(|slug| proma.join("agent-workspaces").join(slug));
+        for native in &natives {
+            for target in crate::agents::PROJECT_INSTALL_TARGETS {
+                let root = crate::agents::installation_root(native, *target);
+                std::fs::create_dir_all(&root).unwrap();
+                std::os::unix::fs::symlink(&source, root.join("tabbit")).unwrap();
+            }
+        }
+        write_state(&codex, json!({"local-projects":{"codex-only":{"rootPaths":[codex_only]}}}));
+        std::fs::write(proma.join("agent-workspaces.json"), serde_json::to_vec(&json!({
+            "version":2,"workspaces":[
+                {"id":"default","slug":"default","name":"Default"},
+                {"id":"another-native","slug":"another-native","name":"Another native"},
+                {"id":"business-a","slug":"business-a","name":"Business A","projectRootPath":business},
+                {"id":"business-b","slug":"business-b","name":"Business B","projectRootPath":business}
+            ]
+        })).unwrap()).unwrap();
+        let entries = discover_catalogs(Some(&codex), Some(&proma), &[]).unwrap();
+        assert_eq!(entries.len(), 4, "two workspaces bound to one business project form one row");
+        for path in natives.iter().chain([&business]) {
+            let identity = project_identity(path, &entries);
+            let entry = entries.iter().find(|entry| entry.path == identity).unwrap();
+            assert_eq!(entry.agents, [AgentKind::Proma], "{}", path.display());
+            assert_eq!(agents_for_project(path, crate::agents::AGENT_ICON_ORDER, &entries)
+                .iter().map(|agent| agent.id).collect::<Vec<_>>(), ["proma"], "{}", path.display());
+        }
+        assert_eq!(entries.iter().find(|entry| entry.path == business).unwrap().proma_workspaces.len(), 2);
+
+        write_state(&codex, json!({"local-projects":{
+            "actual-native":{"rootPaths":[natives[1]]},
+            "actual-business":{"rootPaths":[business]},
+            "codex-only":{"rootPaths":[codex_only]}
+        }}));
+        let shared = discover_catalogs(Some(&codex), Some(&proma), &[]).unwrap();
+        for path in natives.iter().chain([&business, &codex_only]) {
+            let expected = if path == &natives[0] { vec!["proma"] }
+                else if path == &codex_only { vec!["codex"] } else { vec!["codex", "proma"] };
+            assert_eq!(agents_for_project(path, crate::agents::AGENT_ICON_ORDER, &shared)
+                .iter().map(|agent| agent.id).collect::<Vec<_>>(), expected, "{}", path.display());
+        }
+        for native in &natives {
+            for target in crate::agents::PROJECT_INSTALL_TARGETS {
+                assert!(crate::agents::installation_root(native, *target).join("tabbit/SKILL.md").is_file());
+            }
+        }
+    }
 
     #[test]
     fn explicit_local_installs_extend_agent_scope_without_unrelated_global_agents() {

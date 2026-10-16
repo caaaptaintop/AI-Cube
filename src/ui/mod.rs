@@ -1309,6 +1309,9 @@ impl KitterApp {
     fn refresh_context_estimate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.refresh_installed_agents();
         self.projects_view.scan_generation = self.projects_view.scan_generation.wrapping_add(1);
+        // External Agent updates can change installation state and origin too.
+        self.projects_view.project_snapshots.borrow_mut().remove(&path);
+        self.projects_view.project_snapshot_tasks.borrow_mut().clear();
         self.projects_view
             .context_estimate_tasks
             .borrow_mut()
@@ -2156,6 +2159,42 @@ mod e2e_tests {
     }
 
     #[test]
+    fn project_refresh_reloads_installations_changed_outside_kitter() {
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let projects = [temp.path().join("first"), temp.path().join("second")];
+        for project in &projects {
+            let skill = project.join(".codex/skills/external");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(skill.join("SKILL.md"), "---\nname: before-update\ndescription: Fixture\n---\n").unwrap();
+        }
+        let (app, cx) = cx.add_window_view({
+            let data_dir = temp.path().join("kitter-data");
+            move |window, cx| KitterApp::new_in(data_dir, window, cx)
+        });
+        app.update(cx, |app, cx| app.request_project_snapshots(&projects, cx));
+        cx.run_until_parked();
+        for project in &projects {
+            cx.read_entity(&app, |app, _| {
+                assert_eq!(app.projects_view.project_snapshots.borrow()[project][0].name, "before-update");
+            });
+            fs::write(project.join(".codex/skills/external/SKILL.md"),
+                "---\nname: after-update\ndescription: Fixture\n---\n").unwrap();
+            app.update(cx, |app, cx| {
+                app.refresh_context_estimate(project.clone(), cx);
+                assert!(!app.projects_view.project_snapshots.borrow().contains_key(project),
+                    "refresh must invalidate installation classification as well as token estimates");
+                assert!(app.project_snapshot(project, cx).is_none());
+            });
+            cx.run_until_parked();
+            cx.read_entity(&app, |app, _| {
+                assert_eq!(app.projects_view.project_snapshots.borrow()[project][0].name, "after-update");
+            });
+        }
+    }
+
+    #[test]
     fn large_project_renders_and_scrolls_with_virtual_rows() {
         effective_view::reset_path_resolution_count();
         let mut cx = TestAppContext::single();
@@ -2572,6 +2611,15 @@ mod e2e_tests {
                     None,
                 )
                 .unwrap();
+            // Linked local sources are intentionally excluded from update
+            // checks. Use legacy owned copies to exercise two pending scans.
+            for skill in app.model.library.list().unwrap().into_iter()
+                .filter(|skill| matches!(skill.record.name.as_str(), "alpha" | "beta"))
+            {
+                assert!(fs::symlink_metadata(&skill.path).unwrap().file_type().is_symlink());
+                fs::remove_file(&skill.path).unwrap();
+                crate::package_fs::copy_tree(&source.join(&skill.record.name), &skill.path).unwrap();
+            }
             app.refresh(cx);
             app.check_all_updates(cx);
             let progress = app
