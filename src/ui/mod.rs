@@ -966,12 +966,12 @@ impl KitterApp {
         if cfg!(debug_assertions) && std::env::var("KITTER_PREVIEW_PROMA_BATCH").as_deref() == Ok("1") {
             let keys = app.model.skills.iter().filter(|skill| matches!(skill.record.name.as_str(), "humanizer-zh" | "pdf" | "writing-plans"))
                 .map(|skill| crate::proma_batch::source_key(&skill.path.join("SKILL.md"))).collect();
-            app.open_proma_batch(keys, None, false, cx);
+            app.open_cross_project(keys, None, crate::cross_project::Action::Disable, Some("proma".into()), window, cx);
         }
         if cfg!(debug_assertions) && std::env::var("KITTER_PREVIEW_CROSS_PROJECT").as_deref() == Ok("1") {
             let keys = app.model.skills.iter().filter(|s| matches!(s.record.name.as_str(), "humanizer-zh" | "pdf" | "writing-plans"))
                 .map(|s| crate::proma_batch::source_key(&s.path.join("SKILL.md"))).collect();
-            app.open_cross_project(keys, None, crate::cross_project::Action::Install, None, cx);
+            app.open_cross_project(keys, None, crate::cross_project::Action::Install, None, window, cx);
         }
         app
     }

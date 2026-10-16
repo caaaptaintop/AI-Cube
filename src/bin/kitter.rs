@@ -174,14 +174,14 @@ enum PromaAction {
         #[arg(required = true)]
         skills: Vec<String>,
     },
-    /// Move managed skills into the active directory
+    /// Enable verified Proma built-in presets; user skills use install/uninstall
     Enable {
         #[arg(long)]
         workspace: String,
         #[arg(required = true)]
         skills: Vec<String>,
     },
-    /// Move managed skills into the inactive directory
+    /// Disable verified Proma built-in presets while retaining their files
     Disable {
         #[arg(long)]
         workspace: String,

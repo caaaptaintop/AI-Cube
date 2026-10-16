@@ -328,6 +328,31 @@ fn observed(path: &Path) -> Result<String> {
     parent.observation(Path::new(path.file_name().context("安装位置缺少名称")?))
 }
 
+fn directory_signature(path: &Path) -> Result<Option<String>> {
+    match Directory::open_anchored(path) {
+        Ok(directory) => Ok(Some(directory.identity()?)),
+        Err(error) if crate::package_fs::is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn installation_directory<'a>(w: &Workspace, path: &'a Path) -> Result<&'a str> {
+    let name = path.file_name().and_then(|name| name.to_str()).context("缺少技能名称")?;
+    crate::library::validate_name(name)?;
+    let directory = path.parent().and_then(Path::file_name).and_then(|name| name.to_str())
+        .context("缺少安装目录")?;
+    if !path.is_absolute() || !matches!(directory, "skills" | "skills-inactive") {
+        bail!("不是已注册工作区下的直接技能安装位置");
+    }
+    if path != w.path.join(directory).join(name) {
+        // Allow the platform's /var and /tmp aliases without resolving the
+        // entry itself. Arbitrary directory links and traversal still fail.
+        Directory::open_anchored(path.parent().context("缺少安装目录")?)?
+            .verify_location(&w.path.join(directory))?;
+    }
+    Ok(directory)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstallPlan {
     pub workspace: Workspace,
@@ -340,6 +365,20 @@ pub struct InstallPlan {
     root: PathBuf,
     workspace_signature: String,
     expected: String,
+    #[serde(default)]
+    original: Option<PathBuf>,
+    #[serde(default)]
+    original_parent_signature: Option<String>,
+    #[serde(default)]
+    destination_parent_signature: Option<String>,
+}
+
+impl InstallPlan {
+    /// Existing entry retained by migrate/reinstall; destination is always the
+    /// publication location. Older plans use destination for both locations.
+    pub fn original_path(&self) -> &Path {
+        self.original.as_deref().unwrap_or(&self.destination)
+    }
 }
 
 fn no_pending(w: &Workspace) -> Result<()> {
@@ -384,27 +423,42 @@ fn plan_install_at(
     let source_hash = hash(&public_manifest(&source)?)?;
     let destination = workspace.path.join(directory).join(name);
     let other = if directory == "skills" { "skills-inactive" } else { "skills" };
-    if fs::symlink_metadata(workspace.path.join(other).join(name)).is_ok() {
-        bail!("技能启停位置已变化或重复；未改变工作区选择");
-    }
-    let action = match fs::symlink_metadata(&destination) {
+    let other_path = workspace.path.join(other).join(name);
+    let other_exists = match fs::symlink_metadata(&other_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let original = if other_exists {
+        if existing_only || directory != "skills" || observed(&destination)? != "absent" {
+            bail!("技能启停位置已变化或重复；未改变工作区选择");
+        }
+        Some(other_path)
+    } else { None };
+    let existing = original.as_deref().unwrap_or(&destination);
+    let expected = observed(existing)?;
+    let original_parent_signature = directory_signature(existing.parent().context("缺少原安装目录")?)?;
+    let destination_parent_signature = directory_signature(destination.parent().context("缺少安装目录")?)?;
+    let action = match fs::symlink_metadata(existing) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !existing_only => "create",
         Err(e) => return Err(e.into()),
         Ok(m) if m.file_type().is_symlink() => {
             if existing_only {
                 bail!("已有安装变成外部链接，未迁移或覆盖");
             }
-            if destination.canonicalize().ok().as_ref() != Some(&source) {
+            if existing.canonicalize().ok().as_ref() != Some(&source) {
                 bail!("同名链接指向其他来源，未覆盖");
             }
             "migrate"
         }
         Ok(_) => {
-            let m = clean_marker(&destination, &workspace).context("同名目录不能安全更新")?;
+            let m = clean_marker(existing, &workspace).context("同名目录不能安全更新")?;
             if m.source != source {
                 bail!("同名技能来源不同，未覆盖");
             }
-            if m.source_hash == source_hash {
+            if original.is_some() {
+                "reinstall"
+            } else if m.source_hash == source_hash {
                 "unchanged"
             } else {
                 "update"
@@ -423,7 +477,9 @@ fn plan_install_at(
     BEFORE_PLAN_OBSERVATION.with(|hook| {
         if let Some(callback) = hook.borrow_mut().take() { callback(); }
     });
-    let expected = observed(&destination)?;
+    if observed(existing)? != expected {
+        bail!("安装位置在规划期间变化，请重新预览");
+    }
     if existing_only && expected == "absent" {
         bail!("已有安装已被移除，未重新创建");
     }
@@ -431,6 +487,9 @@ fn plan_install_at(
         root: root.canonicalize()?,
         workspace_signature: signature(&workspace.path)?,
         expected,
+        original,
+        original_parent_signature,
+        destination_parent_signature,
         workspace,
         name: name.into(),
         source,
@@ -533,6 +592,8 @@ struct Transaction {
     workspace: Workspace,
     workspace_signature: String,
     target: PathBuf,
+    #[serde(default)]
+    original: Option<PathBuf>,
     backup: Option<PathBuf>,
     before: String,
     after: String,
@@ -542,14 +603,21 @@ struct Transaction {
 fn recheck(plan: &InstallPlan) -> Result<()> {
     crate::library::validate_name(&plan.name)?;
     let inactive = plan.destination == plan.workspace.path.join("skills-inactive").join(&plan.name);
-    if (matches!(plan.action.as_str(), "update" | "unchanged") && plan.expected == "absent")
+    let original = plan.original_path();
+    if (matches!(plan.action.as_str(), "migrate" | "reinstall" | "update" | "unchanged") && plan.expected == "absent")
+        || (plan.action == "create" && plan.expected != "absent")
+        || (plan.action == "reinstall" && plan.original.is_none())
+        || plan.original.as_ref().is_some_and(|path| {
+            *path != plan.workspace.path.join("skills-inactive").join(&plan.name)
+                || inactive || !matches!(plan.action.as_str(), "migrate" | "reinstall")
+        })
         || (plan.destination != plan.workspace.path.join("skills").join(&plan.name)
         && !(inactive && plan.expected != "absent"
             && matches!(plan.action.as_str(), "update" | "unchanged")))
         || plan.source.canonicalize()? != plan.source
         || !matches!(
             plan.action.as_str(),
-            "create" | "migrate" | "update" | "unchanged"
+            "create" | "migrate" | "reinstall" | "update" | "unchanged"
         )
         || plan
             .local_data
@@ -562,25 +630,30 @@ fn recheck(plan: &InstallPlan) -> Result<()> {
         real_directory(path)?;
     }
     let other = if inactive { "skills" } else { "skills-inactive" };
-    if fs::symlink_metadata(plan.workspace.path.join(other).join(&plan.name)).is_ok() {
+    if plan.original.is_none() && fs::symlink_metadata(plan.workspace.path.join(other).join(&plan.name)).is_ok() {
         bail!("技能启停位置已变化，请重新预览");
     }
     if workspace_for_path(&plan.root, &plan.workspace.path)? != plan.workspace
         || signature(&plan.workspace.path)? != plan.workspace_signature
-        || observed(&plan.destination)? != plan.expected
+        || observed(original)? != plan.expected
+        || (plan.original.is_some() && observed(&plan.destination)? != "absent")
+        || (plan.original_parent_signature.is_some()
+            && directory_signature(original.parent().context("缺少原安装目录")?)? != plan.original_parent_signature)
+        || (plan.destination_parent_signature.is_some()
+            && directory_signature(plan.destination.parent().context("缺少安装目录")?)? != plan.destination_parent_signature)
         || hash(&public_manifest(&plan.source)?)? != plan.source_hash
     {
         bail!("工作区、来源或安装位置已变化，请重新预览");
     }
     if plan.expected != "absent" {
-        if fs::symlink_metadata(&plan.destination)?
+        if fs::symlink_metadata(original)?
             .file_type()
             .is_symlink()
         {
-            if plan.action != "migrate" || plan.destination.canonicalize()? != plan.source {
+            if plan.action != "migrate" || original.canonicalize()? != plan.source {
                 bail!("安装链接不属于计划来源");
             }
-        } else if clean_marker(&plan.destination, &plan.workspace)?.source != plan.source {
+        } else if plan.action == "migrate" || clean_marker(original, &plan.workspace)?.source != plan.source {
             bail!("安装目录不属于计划来源");
         }
     }
@@ -597,6 +670,8 @@ thread_local! {
     static BEFORE_PLAN_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static BEFORE_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static AFTER_TOGGLE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_REMOVE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_INSPECTION_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
 fn new_operation(
@@ -642,11 +717,14 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
         workspace.mkdir(Path::new(directory))?;
     }
     let parent = workspace.child(Path::new(directory))?;
+    let original_directory = installation_directory(&plan.workspace, plan.original_path())?;
+    let input = workspace.child(Path::new(original_directory))?;
     let (operation, output) = new_operation(&workspace, &plan.workspace.path, "install")?;
     let mut t = Transaction {
         workspace: plan.workspace.clone(),
         workspace_signature: plan.workspace_signature.clone(),
         target: plan.destination.clone(),
+        original: plan.original.clone(),
         backup: (plan.expected != "absent").then(|| operation.join("previous")),
         before: plan.expected.clone(),
         after: "unpublished".into(),
@@ -675,6 +753,7 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
     recheck(plan)?;
     workspace.verify_location(&plan.workspace.path)?;
     parent.verify_location(&plan.workspace.path.join(directory))?;
+    input.verify_location(&plan.workspace.path.join(original_directory))?;
     output.verify_location(&operation)?;
     #[cfg(test)]
     BEFORE_PUBLISH.with(|hook| {
@@ -683,14 +762,21 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
         }
     });
     let result = (|| -> Result<()> {
+        workspace.verify_location(&plan.workspace.path)?;
+        parent.verify_location(&plan.workspace.path.join(directory))?;
+        input.verify_location(&plan.workspace.path.join(original_directory))?;
+        output.verify_location(&operation)?;
+        if workspace_for_path(&plan.root, &plan.workspace.path)? != plan.workspace {
+            bail!("Proma 工作区身份已变化");
+        }
         if t.backup.is_some() {
-            parent.rename_to(Path::new(&plan.name), &output, Path::new("previous"))?;
+            input.rename_to(Path::new(&plan.name), &output, Path::new("previous"))?;
             if !output
                 .observation(Path::new("previous"))
                 .is_ok_and(|value| value == t.before)
             {
                 // Preserve the actual concurrent object at its original location.
-                output.rename_to(Path::new("previous"), &parent, Path::new(&plan.name))?;
+                output.rename_to(Path::new("previous"), &input, Path::new(&plan.name))?;
                 t.phase = "rolled_back".into();
                 output.write(
                     Path::new("transaction.json"),
@@ -717,7 +803,7 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
         Ok(())
     })();
     if let Err(error) = result {
-        if t.phase != "rolled_back" && restore_with_handles(&t, &output, &parent).is_ok() {
+        if t.phase != "rolled_back" && restore_with_handles(&t, &output, &parent, &input).is_ok() {
             t.phase = "rolled_back".into();
             output.write(
                 Path::new("transaction.json"),
@@ -732,16 +818,34 @@ pub fn apply_plan(plan: &InstallPlan) -> Result<()> {
     Ok(())
 }
 
-fn restore_with_handles(t: &Transaction, output: &Directory, parent: &Directory) -> Result<()> {
+fn restore_with_handles(t: &Transaction, output: &Directory, parent: &Directory, input: &Directory) -> Result<()> {
     let name = Path::new(t.target.file_name().context("目标缺少名称")?);
-    let current = parent.observation(name)?;
-    if current == t.before {
+    let original = t.original.as_deref().unwrap_or(&t.target);
+    let original_name = Path::new(original.file_name().context("原安装位置缺少名称")?);
+    parent.verify_location(t.target.parent().context("目标缺少父目录")?)?;
+    input.verify_location(original.parent().context("原安装位置缺少父目录")?)?;
+    let current = match parent.observation(name) {
+        Ok(value) => Some(value),
+        // An unobservable active occupant is also foreign. Restoring a separate
+        // inactive entry needs no access to that occupant.
+        Err(_) if t.original.is_some() => None,
+        Err(error) => return Err(error),
+    };
+    if t.original.is_some() {
+        let previous = input.observation(original_name)?;
+        if previous == t.before && current.as_deref() != Some(t.after.as_str()) {
+            return Ok(());
+        }
+        if previous != "absent" {
+            bail!("原安装位置已有其他对象，保留现场");
+        }
+    } else if current.as_deref() == Some(t.before.as_str()) {
         return Ok(());
     }
     if t.backup.is_some() && output.observation(Path::new("previous"))? != t.before {
         bail!("恢复原件已变化，保留现场");
     }
-    if current != "absent" && current != t.after {
+    if t.original.is_none() && current.as_deref() != Some("absent") && current.as_deref() != Some(t.after.as_str()) {
         bail!("目标不属于本事务，保留现场");
     }
     #[cfg(test)]
@@ -750,7 +854,12 @@ fn restore_with_handles(t: &Transaction, output: &Directory, parent: &Directory)
             callback();
         }
     });
-    if current != "absent" {
+    parent.verify_location(t.target.parent().context("目标缺少父目录")?)?;
+    input.verify_location(original.parent().context("原安装位置缺少父目录")?)?;
+    // A concurrent active occupant never prevents restoring an inactive entry,
+    // and is never moved by this transaction.
+    let move_current = current.as_deref().is_some_and(|value| value != "absent" && value == t.after);
+    if move_current {
         parent.rename_to(name, output, Path::new("failed"))?;
         if !output
             .observation(Path::new("failed"))
@@ -761,13 +870,18 @@ fn restore_with_handles(t: &Transaction, output: &Directory, parent: &Directory)
         }
     }
     if t.backup.is_some() {
-        output.rename_to(Path::new("previous"), parent, name)?;
-        if !parent
-            .observation(name)
+        if let Err(error) = output.rename_to(Path::new("previous"), input, original_name) {
+            if move_current {
+                output.rename_to(Path::new("failed"), parent, name)?;
+            }
+            return Err(error);
+        }
+        if !input
+            .observation(original_name)
             .is_ok_and(|value| value == t.before)
         {
-            parent.rename_to(name, output, Path::new("previous"))?;
-            if current != "absent" {
+            input.rename_to(original_name, output, Path::new("previous"))?;
+            if move_current {
                 output.rename_to(Path::new("failed"), parent, name)?;
             }
             bail!("恢复时原件已替换，保留恢复前状态");
@@ -782,6 +896,7 @@ fn restore_transaction(t: &Transaction, operation: &Path) -> Result<()> {
         t,
         &Directory::open_anchored(operation)?,
         &Directory::open_anchored(t.target.parent().context("目标缺少父目录")?)?,
+        &Directory::open_anchored(t.original.as_deref().unwrap_or(&t.target).parent().context("原安装位置缺少父目录")?)?,
     )
 }
 
@@ -942,12 +1057,68 @@ pub struct Installation {
     pub bundled: bool,
     pub integration: Option<String>,
     toggleable: bool,
+    #[serde(skip)]
+    snapshot: Option<InstallationSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstallationSnapshot {
+    root: PathBuf,
+    workspace: Workspace,
+    workspace_signature: String,
+    parent_signature: String,
+    path: PathBuf,
+    observation: String,
+    raw_target: Option<PathBuf>,
+    link_source: Option<PathBuf>,
+    binding: String,
+}
+
+fn capture_installation(root: &Path, w: &Workspace, path: &Path) -> Result<InstallationSnapshot> {
+    let directory = installation_directory(w, path)?;
+    let workspace = Directory::open_anchored(&w.path)?;
+    let parent = workspace.child(Path::new(directory))?;
+    let name = Path::new(path.file_name().context("缺少技能名称")?);
+    let observation = parent.observation(name)?;
+    let raw_target = if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        Some(fs::read_link(path)?)
+    } else { None };
+    let link_source = if raw_target.is_some() && path.is_dir() {
+        Some(path.canonicalize()?)
+    } else { None };
+    if parent.observation(name)? != observation || workspace_for_path(root, &w.path)? != *w {
+        bail!("Proma 工作区或技能在观察期间变化，请刷新后重试");
+    }
+    workspace.verify_location(&w.path)?;
+    parent.verify_location(&w.path.join(directory))?;
+    Ok(InstallationSnapshot {
+        root: root.canonicalize()?, workspace: w.clone(),
+        workspace_signature: workspace.identity()?, parent_signature: parent.identity()?,
+        path: path.to_path_buf(), observation, raw_target, link_source, binding: String::new(),
+    })
+}
+
+/// Check the exact object captured by inspect, without adopting a newer copy.
+/// Serialized display records intentionally have no usable execution snapshot.
+pub fn validate_previewed_installation(root: &Path, workspace: &Workspace, expected: &Installation) -> Result<()> {
+    let snapshot = expected.snapshot.as_ref().context("预览缺少冻结快照，请刷新后重新选择")?;
+    if snapshot.workspace != *workspace || snapshot.path != expected.path
+        || hash(expected)? != snapshot.binding
+    {
+        bail!("Proma 安装记录与预览快照不一致，请刷新后重新选择");
+    }
+    let mut current = capture_installation(root, workspace, &expected.path)?;
+    current.binding = snapshot.binding.clone();
+    if current != *snapshot {
+        bail!("Proma 工作区、安装目录或技能与预览不一致，已保留现场");
+    }
+    Ok(())
 }
 
 impl Installation {
     /// Snapshot capability only; set_enabled_path rechecks the live package.
     pub fn can_toggle(&self) -> bool {
-        self.toggleable
+        self.toggleable && self.bundled && !self.managed && self.integration.is_none() && self.snapshot.is_some()
     }
 }
 
@@ -981,32 +1152,46 @@ fn integration_entry_fingerprints(root: &Path) -> BTreeMap<String, [u8; 32]> {
 }
 
 fn bundled_entry_fingerprints(root: &Path) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
+    #[cfg(test)]
+    if let Some(templates) = root.canonicalize().ok().and_then(|root| {
+        TEST_BUNDLED_TEMPLATES.with(|entries| entries.borrow().get(&root).cloned())
+    }) {
+        return bundled_entry_fingerprints_in(&root.join("default-skills"), &templates);
+    }
     #[cfg(target_os = "macos")]
     return bundled_entry_fingerprints_in(&root.join("default-skills"), Path::new("/Applications/Proma.app/Contents/Resources/default-skills"));
     #[cfg(not(target_os = "macos"))]
     { let _ = root; BTreeMap::new() }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BUNDLED_TEMPLATES: std::cell::RefCell<BTreeMap<PathBuf, PathBuf>> = const {
+        std::cell::RefCell::new(BTreeMap::new())
+    };
+}
+
+/// Isolated fixture override; never compiled into a production build.
+#[cfg(test)]
+pub(crate) fn register_test_bundled_templates(root: &Path, app_templates: &Path) {
+    let root = root.canonicalize().expect("test Proma root must exist");
+    let templates = app_templates.canonicalize().expect("test bundled templates must exist");
+    TEST_BUNDLED_TEMPLATES.with(|entries| entries.borrow_mut().insert(root, templates));
+}
+
 fn bundled_entry_fingerprints_in(
-    defaults: &Path, app_templates: &Path,
+    _defaults: &Path, app_templates: &Path,
 ) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
     let mut entries = BTreeMap::<String, BTreeSet<[u8; 32]>>::new();
     if real_directory(app_templates).is_err() { return entries; }
-    // The user template directory may also contain later additions. Only
-    // names supplied by the installed application qualify as bundled.
+    // Only current application bytes establish bundled trust. A same-name
+    // user cache is not a verified record of a prior application version.
     for entry in fs::read_dir(app_templates).into_iter().flatten().flatten() {
         let path = entry.path();
         if real_directory(&path).is_err() { continue; }
         let Some(fingerprint) = skill_entry_fingerprint(&path.join("SKILL.md")) else { continue; };
         let name = entry.file_name().to_string_lossy().into_owned();
-        let fingerprints = entries.entry(name.clone()).or_default();
-        fingerprints.insert(fingerprint);
-        let cached = defaults.join(name);
-        if real_directory(&cached).is_ok()
-            && let Some(fingerprint) = skill_entry_fingerprint(&cached.join("SKILL.md"))
-        {
-            fingerprints.insert(fingerprint);
-        }
+        entries.entry(name).or_default().insert(fingerprint);
     }
     entries
 }
@@ -1024,6 +1209,8 @@ fn inspect_with_bundles(
     root: &Path, project: &Path, bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
 ) -> Result<Vec<Installation>> {
     let w = workspace_for_path(root, project)?;
+    let workspace = Directory::open_anchored(&w.path)?;
+    let workspace_signature = workspace.identity()?;
     let recovery_clear = no_pending(&w).is_ok();
     let integration_entries = integration_entry_fingerprints(root);
     let mut out = vec![];
@@ -1033,12 +1220,21 @@ fn inspect_with_bundles(
             continue;
         }
         real_directory(&parent)?;
-        for entry in fs::read_dir(parent)? {
+        let input = workspace.child(Path::new(directory))?;
+        let parent_signature = input.identity()?;
+        for entry in fs::read_dir(&parent)? {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
+            }
+            let before = capture_installation(root, &w, &path).ok();
+            if before.as_ref().is_some_and(|snapshot| {
+                snapshot.workspace_signature != workspace_signature
+                    || snapshot.parent_signature != parent_signature
+            }) {
+                bail!("Proma 工作区或安装目录在扫描期间变化，请刷新后重试");
             }
             let linked = fs::symlink_metadata(&path)?.file_type().is_symlink();
             let found = marker(&path, &w).ok();
@@ -1046,7 +1242,7 @@ fn inspect_with_bundles(
                 continue;
             }
             let status = if linked {
-                "external_link"
+                if path.try_exists().unwrap_or(false) { "external_link" } else { "broken_link" }
             } else if let Some(m) = &found {
                 if clean_marker(&path, &w).is_err() {
                     "modified"
@@ -1076,20 +1272,43 @@ fn inspect_with_bundles(
                     skill_entry_fingerprint(&path.join("SKILL.md"))
                         .is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
                 });
-            out.push(Installation {
+            let removable_link = linked && cfg!(unix) && crate::library::validate_name(&name).is_ok()
+                && observed(&path).is_ok();
+            let source = found.as_ref().map(|m| m.source.clone()).or_else(|| {
+                before.as_ref().and_then(|snapshot| snapshot.link_source.clone())
+            });
+            #[cfg(test)]
+            BEFORE_INSPECTION_RECHECK.with(|hook| {
+                if let Some(callback) = hook.borrow_mut().take() { callback(); }
+            });
+            if capture_installation(root, &w, &path).ok() != before {
+                bail!("Proma 技能在扫描期间变化，请刷新后重试");
+            }
+            let stable = before.is_some();
+            let mut installation = Installation {
                 name,
                 path,
                 state: state.into(),
                 status: status.into(),
-                source: found.as_ref().map(|m| m.source.clone()),
+                source,
                 managed: found.is_some(),
-                removable: recovery_clear && matches!(status, "current" | "update_pending"),
+                removable: stable && recovery_clear && (matches!(status, "current" | "update_pending") || removable_link),
                 bundled,
                 integration,
-                toggleable: cfg!(unix) && recovery_clear
-                    && (matches!(status, "current" | "update_pending") || bundled),
-            });
+                toggleable: stable && cfg!(unix) && recovery_clear && bundled,
+                snapshot: None,
+            };
+            if let Some(mut snapshot) = before {
+                snapshot.binding = hash(&installation)?;
+                installation.snapshot = Some(snapshot);
+            }
+            out.push(installation);
         }
+        input.verify_location(&parent)?;
+    }
+    workspace.verify_location(&w.path)?;
+    if workspace_for_path(root, &w.path)? != w {
+        bail!("Proma 工作区身份在扫描期间变化，请刷新后重试");
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.state.cmp(&b.state)));
     Ok(out)
@@ -1110,13 +1329,13 @@ pub fn set_enabled_path(path: &Path, enabled: bool) -> Result<()> {
 }
 
 pub fn set_enabled_path_in(root: &Path, path: &Path, enabled: bool) -> Result<()> {
-    set_enabled_path_with_bundles(root, path, enabled, &bundled_entry_fingerprints(root))
+    set_enabled_path_with_expectation(root, path, enabled, None, None)
 }
 
 /// Bind a batch operation to the workspace and source shown in its preview.
 pub fn set_enabled_previewed_in(root: &Path, workspace: &Workspace, copy: &Installation, source_file: Option<&Path>, enabled: bool) -> Result<()> {
     set_enabled_path_with_expectation(root, &copy.path, enabled,
-        &bundled_entry_fingerprints(root), Some((workspace, copy, source_file)))
+        None, Some((workspace, copy, source_file)))
 }
 
 #[cfg(test)]
@@ -1124,16 +1343,17 @@ thread_local! {
     pub(crate) static BEFORE_TOGGLE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn set_enabled_path_with_bundles(
     root: &Path, path: &Path, enabled: bool,
     bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
 ) -> Result<()> {
-    set_enabled_path_with_expectation(root, path, enabled, bundled_entries, None)
+    set_enabled_path_with_expectation(root, path, enabled, Some(bundled_entries), None)
 }
 
 fn set_enabled_path_with_expectation(
     root: &Path, path: &Path, enabled: bool,
-    bundled_entries: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+    test_bundled_entries: Option<&BTreeMap<String, BTreeSet<[u8; 32]>>>,
     preview: Option<(&Workspace, &Installation, Option<&Path>)>,
 ) -> Result<()> {
     if !path.is_absolute() {
@@ -1157,7 +1377,11 @@ fn set_enabled_path_with_expectation(
     let w = workspace_for_path(root, parent.parent().context("安装位置缺少工作区")?)?;
     let workspace = Directory::open_anchored(&w.path)?;
     let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
-    if let Some((expected_workspace, _, _)) = preview {
+    if let Some((expected_workspace, expected_copy, _)) = preview {
+        validate_previewed_installation(root, expected_workspace, expected_copy)?;
+        if workspace.identity()? != expected_copy.snapshot.as_ref().context("预览缺少冻结快照")?.workspace_signature {
+            bail!("持锁工作区与预览不一致，请刷新后重试");
+        }
         let current = workspace_for_path(root, &w.path)?;
         if current.id != expected_workspace.id || current.slug != expected_workspace.slug
             || current.path != expected_workspace.path
@@ -1169,8 +1393,18 @@ fn set_enabled_path_with_expectation(
     let input = Directory::open_anchored(parent)?;
     input.verify_location(source.parent().context("缺少源目录")?)?;
     real_directory(&source)?;
-    let expected = input.observation(Path::new(name))?;
-    let installation = inspect_with_bundles(root, &w.path, bundled_entries)?
+    let expected = if let Some((_, copy, _)) = preview {
+        let snapshot = copy.snapshot.as_ref().context("预览缺少冻结快照")?;
+        if input.identity()? != snapshot.parent_signature || !copy.can_toggle() {
+            bail!("预览安装目录或启停权限已变化");
+        }
+        snapshot.observation.clone()
+    } else { input.observation(Path::new(name))? };
+    // Production callers resolve current templates only while holding the
+    // workspace lock. The explicit map is confined to the test-only helper.
+    let bundled_entries = test_bundled_entries.cloned()
+        .unwrap_or_else(|| bundled_entry_fingerprints(root));
+    let installation = inspect_with_bundles(root, &w.path, &bundled_entries)?
         .into_iter().find(|item| item.path == source)
         .context("未找到可启停的 Proma 安装")?;
     if let Some((_, expected_copy, source_file)) = preview {
@@ -1187,10 +1421,7 @@ fn set_enabled_path_with_expectation(
         }
     }
     if !installation.can_toggle() {
-        bail!("只允许启停未修改的受管安装或经核验的内置预设");
-    }
-    if installation.managed {
-        clean_marker(&source, &w)?;
+        bail!("只允许启停经核验的内置预设；用户技能请安装或卸载");
     }
     workspace.mkdir(Path::new(to))?;
     let output = workspace.child(Path::new(to))?;
@@ -1209,6 +1440,9 @@ fn set_enabled_path_with_expectation(
             callback();
         }
     });
+    if let Some((expected_workspace, expected_copy, _)) = preview {
+        validate_previewed_installation(root, expected_workspace, expected_copy)?;
+    }
     input.rename_to(Path::new(name), &output, Path::new(name))?;
     #[cfg(test)]
     AFTER_TOGGLE_MOVE.with(|hook| {
@@ -1230,8 +1464,75 @@ fn set_enabled_path_with_expectation(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct LinkRemovalPlan {
+    pub workspace: Workspace,
+    pub path: PathBuf,
+    pub raw_target: PathBuf,
+    root: PathBuf,
+    workspace_signature: String,
+    parent_signature: String,
+    expected: String,
+    binding: String,
+}
+
+/// Plan removal without resolving the link, including relative/dangling links.
+pub fn plan_remove_link(root: &Path, project: &Path, path: &Path) -> Result<LinkRemovalPlan> {
+    let workspace = workspace_for_path(root, project)?;
+    let directory = installation_directory(&workspace, path)?;
+    let normalized = workspace.path.join(directory).join(path.file_name().context("缺少技能名称")?);
+    let path = normalized.as_path();
+    no_pending(&workspace)?;
+    let native = Directory::open_anchored(&workspace.path)?;
+    let parent = native.child(Path::new(directory))?;
+    if !fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!("移除链接计划只接受直接软链接");
+    }
+    let raw_target = fs::read_link(path)?;
+    let expected = parent.observation(Path::new(path.file_name().context("缺少技能名称")?))?;
+    native.verify_location(&workspace.path)?;
+    parent.verify_location(path.parent().context("缺少安装目录")?)?;
+    if fs::read_link(path)? != raw_target || observed(path)? != expected {
+        bail!("链接在规划期间变化，请重新预览");
+    }
+    Ok(LinkRemovalPlan {
+        binding: hash(&(&workspace, path, &raw_target))?,
+        workspace_signature: native.identity()?,
+        parent_signature: parent.identity()?,
+        root: root.canonicalize()?,
+        workspace,
+        path: path.to_path_buf(),
+        raw_target,
+        expected,
+    })
+}
+
+pub fn apply_remove_link(plan: &LinkRemovalPlan) -> Result<()> {
+    if hash(&(&plan.workspace, &plan.path, &plan.raw_target))? != plan.binding {
+        bail!("链接移除计划与预览不一致");
+    }
+    let directory = installation_directory(&plan.workspace, &plan.path)?;
+    let workspace = Directory::open_anchored(&plan.workspace.path)?;
+    let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
+    let input = workspace.child(Path::new(directory))?;
+    if workspace_for_path(&plan.root, &plan.workspace.path)? != plan.workspace
+        || workspace.identity()? != plan.workspace_signature
+        || input.identity()? != plan.parent_signature
+        || !fs::symlink_metadata(&plan.path)?.file_type().is_symlink()
+        || fs::read_link(&plan.path)? != plan.raw_target
+        || input.observation(Path::new(plan.path.file_name().context("缺少技能名称")?))? != plan.expected
+    {
+        bail!("工作区、安装目录或链接与预览不一致");
+    }
+    no_pending(&plan.workspace)?;
+    remove_entry_locked(&plan.root, &plan.workspace, &plan.path, &workspace, &input, &plan.expected)
+}
+
 pub fn uninstall_path(path: &Path) -> Result<()> {
     let (root, w) = path_workspace(path)?;
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return apply_remove_link(&plan_remove_link(&root, &w.path, path)?);
+    }
     uninstall_at(&root, &w, path, None)
 }
 
@@ -1242,6 +1543,9 @@ pub fn uninstall_previewed_in(root: &Path, workspace: &Workspace, copy: &Install
 }
 
 fn uninstall_at(root: &Path, w: &Workspace, path: &Path, preview: Option<(&Installation, &Path)>) -> Result<()> {
+    let directory = installation_directory(w, path)?;
+    let normalized = w.path.join(directory).join(path.file_name().context("缺少技能名称")?);
+    let path = normalized.as_path();
     let workspace = Directory::open_anchored(&w.path)?;
     let _lock = workspace.lock(Path::new(".kitter-proma.lock"))?;
     let current_workspace = workspace_for_path(root, &w.path)?;
@@ -1249,6 +1553,12 @@ fn uninstall_at(root: &Path, w: &Workspace, path: &Path, preview: Option<(&Insta
         bail!("工作区身份与预览不一致，请刷新后检查");
     }
     if let Some((expected_copy, source_file)) = preview {
+        validate_previewed_installation(root, w, expected_copy)?;
+        if workspace.identity()? != expected_copy.snapshot.as_ref().context("预览缺少冻结快照")?.workspace_signature
+            || !expected_copy.managed || !expected_copy.removable
+        {
+            bail!("持锁工作区或移除权限与预览不一致，已保留");
+        }
         let copy = inspect_in(root, &w.path)?.into_iter().find(|c| c.path == path)
             .context("预览安装已不存在，请刷新后检查")?;
         if copy.name != expected_copy.name || copy.state != expected_copy.state || copy.source != expected_copy.source
@@ -1260,19 +1570,27 @@ fn uninstall_at(root: &Path, w: &Workspace, path: &Path, preview: Option<(&Insta
     }
     no_pending(&w)?;
     clean_marker(path, &w)?;
-    let expected = observed(path)?;
-    let input = workspace.child(Path::new(
-        path.parent()
-            .and_then(|p| p.file_name())
-            .context("缺少安装目录")?,
-    ))?;
+    let input = workspace.child(Path::new(directory))?;
+    let expected = if let Some((copy, _)) = preview {
+        validate_previewed_installation(root, w, copy)?;
+        let snapshot = copy.snapshot.as_ref().context("预览缺少冻结快照")?;
+        if input.identity()? != snapshot.parent_signature {
+            bail!("安装父目录与预览不一致，已保留");
+        }
+        snapshot.observation.clone()
+    } else { observed(path)? };
+    remove_entry_locked(root, w, path, &workspace, &input, &expected)
+}
+
+fn remove_entry_locked(root: &Path, w: &Workspace, path: &Path, workspace: &Directory, input: &Directory, expected: &str) -> Result<()> {
     let (operation, output) = new_operation(&workspace, &w.path, "uninstall")?;
     let mut t = Transaction {
         workspace: w.clone(),
         workspace_signature: workspace.identity()?,
         target: path.to_path_buf(),
+        original: None,
         backup: Some(operation.join("previous")),
-        before: expected.clone(),
+        before: expected.into(),
         after: "absent".into(),
         phase: "prepared".into(),
     };
@@ -1284,6 +1602,18 @@ fn uninstall_at(root: &Path, w: &Workspace, path: &Path, preview: Option<(&Insta
         bail!("Proma 工作区或安装内容已变化");
     }
     workspace.verify_location(&w.path)?;
+    input.verify_location(path.parent().context("缺少安装目录")?)?;
+    output.verify_location(&operation)?;
+    #[cfg(test)]
+    BEFORE_REMOVE_MOVE.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().take() { callback(); }
+    });
+    if workspace_for_path(root, &w.path)? != *w {
+        bail!("Proma 工作区身份已变化");
+    }
+    workspace.verify_location(&w.path)?;
+    input.verify_location(path.parent().context("缺少安装目录")?)?;
+    output.verify_location(&operation)?;
     input.rename_to(
         Path::new(path.file_name().context("缺少技能名称")?),
         &output,
@@ -1361,12 +1691,23 @@ fn recover_in(w: &Workspace) -> Result<()> {
                 .and_then(|p| p.to_str())
                 .context("恢复记录名称无效")?,
         )?;
+        if let Some(original) = &t.original {
+            let name = t.target.file_name().context("恢复记录名称无效")?;
+            if t.target != w.path.join("skills").join(name)
+                || *original != w.path.join("skills-inactive").join(name)
+                || t.backup.is_none() || t.before == "absent"
+            {
+                bail!("恢复记录原安装位置无效，保留现场");
+            }
+        }
         let parent = workspace.child(Path::new(
             t.target
                 .parent()
                 .and_then(|p| p.file_name())
                 .context("恢复记录目录无效")?,
         ))?;
+        let original = t.original.as_deref().unwrap_or(&t.target);
+        let input = workspace.child(Path::new(installation_directory(w, original)?))?;
         #[cfg(test)]
         BEFORE_RECOVERY_MUTATION.with(|hook| {
             if let Some(callback) = hook.borrow_mut().take() {
@@ -1376,7 +1717,7 @@ fn recover_in(w: &Workspace) -> Result<()> {
         workspace.verify_location(&w.path)?;
         recovery.verify_location(&w.path.join(RECOVERY))?;
         output.verify_location(&operation)?;
-        restore_with_handles(&t, &output, &parent)?;
+        restore_with_handles(&t, &output, &parent, &input)?;
         t.phase = "rolled_back".into();
         output.write(
             Path::new("transaction.json"),
@@ -1392,7 +1733,7 @@ mod tests {
     use crate::{package_fs, update_protection};
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("proma");
+        let root = temp.path().canonicalize().unwrap().join("proma");
         let project = root.join("agent-workspaces/pilot");
         let source = temp.path().join("library/example");
         fs::create_dir_all(project.join("skills")).unwrap();
@@ -1435,6 +1776,173 @@ mod tests {
         (temp, root, project, bundles)
     }
 
+    fn replace_previewed_entry(project: &Path, path: &Path, change: &str) {
+        match change {
+            "package" => {
+                let saved = project.join("saved-package");
+                fs::rename(path, &saved).unwrap();
+                package_fs::copy_tree(&saved, path).unwrap();
+                let reference = saved.join("local-data");
+                if let Ok(metadata) = fs::symlink_metadata(&reference) {
+                    if metadata.file_type().is_symlink() {
+                        std::os::unix::fs::symlink(fs::read_link(&reference).unwrap(), path.join("local-data")).unwrap();
+                    } else if metadata.is_dir() {
+                        package_fs::copy_tree(&reference, &path.join("local-data")).unwrap();
+                    }
+                }
+            }
+            "parent" => {
+                let saved = project.join("saved-parent");
+                fs::rename(path.parent().unwrap(), &saved).unwrap();
+                fs::create_dir(path.parent().unwrap()).unwrap();
+                fs::rename(saved.join(path.file_name().unwrap()), path).unwrap();
+            }
+            "workspace" => {
+                let saved = project.with_file_name("saved-workspace");
+                fs::rename(project, &saved).unwrap();
+                fs::create_dir(project).unwrap();
+                fs::rename(saved.join("skills"), project.join("skills")).unwrap();
+            }
+            "content" => {
+                fs::write(path.join("new-content"), "same inode, new version").unwrap();
+                if path.join(MARKER).exists() {
+                    let mut m: Marker = read_json(&path.join(MARKER)).unwrap();
+                    m.content_hash = content_hash(path).unwrap();
+                    fs::write(path.join(MARKER), serde_json::to_vec(&m).unwrap()).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn previewed_removal_rejects_replacement_and_same_source_updates() {
+        for change in ["package", "parent", "workspace", "content", "updated"] {
+            let (_temp, root, project, source) = fixture();
+            apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+            let workspace = workspace_for_path(&root, &project).unwrap();
+            let copy = inspect_in(&root, &project).unwrap().remove(0);
+            if change == "updated" {
+                fs::write(source.join("new-version"), "v2").unwrap();
+                apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+            } else { replace_previewed_entry(&project, &copy.path, change); }
+            let before = observed(&copy.path).unwrap();
+            let source_file = source.join("SKILL.md").canonicalize().unwrap();
+            assert!(uninstall_previewed_in(&root, &workspace, &copy, &source_file).is_err(), "{change}");
+            assert_eq!(observed(&copy.path).unwrap(), before, "{change}");
+            assert!(source.join("SKILL.md").is_file());
+        }
+    }
+
+    #[test]
+    fn previewed_toggle_rejects_replacement_after_preview_under_the_write_lock() {
+        for change in ["package", "parent", "workspace", "content"] {
+            let (_temp, root, project, _) = builtin_fixture();
+            register_test_bundled_templates(&root, &root.join("fixture-app/default-skills"));
+            let workspace = workspace_for_path(&root, &project).unwrap();
+            let copy = inspect_in(&root, &project).unwrap().remove(0);
+            let native = project.clone();
+            let path = copy.path.clone();
+            BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                replace_previewed_entry(&native, &path, change);
+            })));
+            assert!(set_enabled_previewed_in(&root, &workspace, &copy, None, false).is_err(), "{change}");
+            assert!(copy.path.join("SKILL.md").is_file());
+            assert!(!project.join("skills-inactive").exists());
+        }
+    }
+
+    #[test]
+    fn preview_snapshots_reject_missing_or_mutated_display_records_and_allow_unchanged_toggle() {
+        let (_temp, root, project, _) = builtin_fixture();
+        register_test_bundled_templates(&root, &root.join("fixture-app/default-skills"));
+        let workspace = workspace_for_path(&root, &project).unwrap();
+        let copy = inspect_in(&root, &project).unwrap().remove(0);
+        validate_previewed_installation(&root, &workspace, &copy).unwrap();
+        let display = serde_json::to_value(&copy).unwrap();
+        assert!(display.get("snapshot").is_none());
+        assert_eq!(display["name"], "example");
+        let mut missing = copy.clone();
+        missing.snapshot = None;
+        assert!(!missing.can_toggle());
+        assert!(validate_previewed_installation(&root, &workspace, &missing).is_err());
+        assert!(set_enabled_previewed_in(&root, &workspace, &missing, None, false).is_err());
+        let mut altered = copy.clone();
+        altered.source = Some(project.join("foreign-source"));
+        assert!(validate_previewed_installation(&root, &workspace, &altered).is_err());
+        set_enabled_previewed_in(&root, &workspace, &copy, None, false).unwrap();
+        let fresh = inspect_in(&root, &project).unwrap().remove(0);
+        set_enabled_previewed_in(&root, &workspace, &fresh, None, true).unwrap();
+    }
+
+    #[test]
+    fn previewed_removal_allows_unchanged_objects_and_immediate_removal_can_sample_a_new_copy() {
+        let (_temp, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        let workspace = workspace_for_path(&root, &project).unwrap();
+        let copy = inspect_in(&root, &project).unwrap().remove(0);
+        let source_file = source.join("SKILL.md").canonicalize().unwrap();
+        // A source edit alone does not change the previewed installed object.
+        fs::write(source.join("upstream"), "v2").unwrap();
+        uninstall_previewed_in(&root, &workspace, &copy, &source_file).unwrap();
+        assert!(fs::symlink_metadata(&copy.path).is_err());
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        let copy = inspect_in(&root, &project).unwrap().remove(0);
+        replace_previewed_entry(&project, &copy.path, "package");
+        assert!(uninstall_previewed_in(&root, &workspace, &copy, &source_file).is_err());
+        uninstall_at(&root, &workspace, &copy.path, None).unwrap();
+        assert!(fs::symlink_metadata(&copy.path).is_err());
+        assert!(source.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn link_snapshots_reject_retargeting_before_or_during_removal_planning() {
+        for indirect in [false, true] {
+            let (_temp, root, project, source) = fixture();
+            let other = source.with_file_name("other");
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join("SKILL.md"), "other source").unwrap();
+            let path = project.join("skills/example");
+            let changed = if indirect {
+                let bridge = project.join("bridge");
+                std::os::unix::fs::symlink(&source, &bridge).unwrap();
+                std::os::unix::fs::symlink("../bridge", &path).unwrap();
+                bridge
+            } else {
+                std::os::unix::fs::symlink(&source, &path).unwrap();
+                path.clone()
+            };
+            let workspace = workspace_for_path(&root, &project).unwrap();
+            let copy = inspect_in(&root, &project).unwrap().remove(0);
+            validate_previewed_installation(&root, &workspace, &copy).unwrap();
+            fs::rename(&changed, project.join("saved-link")).unwrap();
+            std::os::unix::fs::symlink(&other, &changed).unwrap();
+            let newer_plan = plan_remove_link(&root, &project, &path).unwrap();
+            assert!(validate_previewed_installation(&root, &workspace, &copy).is_err());
+            assert_eq!(fs::read_link(&path).unwrap(), newer_plan.raw_target);
+            let fresh = inspect_in(&root, &project).unwrap().remove(0);
+            validate_previewed_installation(&root, &workspace, &fresh).unwrap();
+            assert_eq!(fresh.source, Some(other.canonicalize().unwrap()));
+            assert!(source.join("SKILL.md").is_file() && other.join("SKILL.md").is_file());
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_changes_between_the_before_and_after_snapshot() {
+        for change in ["package", "parent", "workspace", "content"] {
+            let (_temp, root, project, source) = fixture();
+            apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+            let path = project.join("skills/example");
+            let native = project.clone();
+            BEFORE_INSPECTION_RECHECK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                replace_previewed_entry(&native, &path, change);
+            })));
+            assert!(inspect_in(&root, &project).is_err(), "{change}");
+            let fresh = inspect_in(&root, &project).unwrap().remove(0);
+            validate_previewed_installation(&root, &workspace_for_path(&root, &project).unwrap(), &fresh).unwrap();
+        }
+    }
+
     #[test]
     fn builtin_toggle_round_trip_preserves_the_entire_directory() {
         use std::os::unix::fs::PermissionsExt;
@@ -1457,6 +1965,51 @@ mod tests {
             assert!(destination.join("local-data/empty").is_dir());
             assert!(!destination.join(MARKER).exists());
             assert!(inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+        }
+    }
+
+    #[test]
+    fn test_bundled_registration_is_scoped_to_canonical_root_and_thread() {
+        let (_temp, root, project, bundles) = builtin_fixture();
+        let (_other, other_root, _, _) = builtin_fixture();
+        let baseline = bundled_entry_fingerprints(&root);
+        let other_baseline = bundled_entry_fingerprints(&other_root);
+        register_test_bundled_templates(&root, &root.join("fixture-app/default-skills"));
+        assert_eq!(bundled_entry_fingerprints(&root.canonicalize().unwrap()), bundles);
+        assert!(inspect_in(&root, &project).unwrap()[0].can_toggle());
+        assert_eq!(bundled_entry_fingerprints(&other_root), other_baseline);
+        assert_eq!(std::thread::spawn(move || bundled_entry_fingerprints(&root)).join().unwrap(), baseline);
+    }
+
+    #[test]
+    fn toggle_revalidates_app_templates_and_rejects_unverified_cached_versions() {
+        for cached in [false, true] {
+            let (_temp, root, project, _) = builtin_fixture();
+            let templates = root.join("fixture-app/default-skills");
+            register_test_bundled_templates(&root, &templates);
+            let active = project.join("skills/example");
+            let template = if cached {
+                let template = root.join("default-skills/example");
+                fs::create_dir_all(&template).unwrap();
+                fs::write(template.join("SKILL.md"), "previous bundled version").unwrap();
+                fs::copy(template.join("SKILL.md"), active.join("SKILL.md")).unwrap();
+                template
+            } else { templates.join("example") };
+            let before = observed(&active).unwrap();
+            if cached {
+                assert!(!inspect_in(&root, &project).unwrap()[0].can_toggle());
+                assert!(set_enabled_path_in(&root, &active, false).is_err());
+                assert_eq!(observed(&active).unwrap(), before);
+                assert!(!project.join("skills-inactive").exists());
+                continue;
+            }
+            assert!(inspect_in(&root, &project).unwrap()[0].can_toggle());
+            BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(template.join("SKILL.md")).unwrap();
+            })));
+            assert!(set_enabled_path_in(&root, &active, false).is_err());
+            assert_eq!(observed(&active).unwrap(), before);
+            assert!(!project.join("skills-inactive").exists());
         }
     }
 
@@ -1487,19 +2040,28 @@ mod tests {
     }
 
     #[test]
-    fn managed_toggle_keeps_clean_marker_guards_and_allows_pending_updates() {
+    fn managed_user_copies_never_toggle_even_when_clean_or_pending() {
         let (_temp, root, project, source) = fixture();
         let plan = plan_install(&root, &project, &source, "example").unwrap();
         apply_plan(&plan).unwrap();
+        let scan = inspect_in(&root, &project).unwrap();
+        assert!(scan[0].managed && scan[0].removable && !scan[0].can_toggle());
         fs::write(source.join("SKILL.md"), "new upstream version").unwrap();
         let scan = inspect_in(&root, &project).unwrap();
         assert_eq!(scan[0].status, "update_pending");
-        assert!(scan[0].can_toggle());
+        assert!(scan[0].removable && !scan[0].can_toggle());
         let before = observed(&plan.destination).unwrap();
         let inactive = project.join("skills-inactive/example");
-        set_enabled_path_with_bundles(&root, &plan.destination, false, &BTreeMap::new()).unwrap();
+        let fingerprint = skill_entry_fingerprint(&plan.destination.join("SKILL.md")).unwrap();
+        let bundles = BTreeMap::from([("example".into(), BTreeSet::from([fingerprint]))]);
+        assert!(set_enabled_path_with_bundles(&root, &plan.destination, false, &bundles).is_err());
+        assert!(!inactive.exists());
+        fs::create_dir(inactive.parent().unwrap()).unwrap();
+        fs::rename(&plan.destination, &inactive).unwrap();
+        assert!(!inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+        assert!(set_enabled_path_with_bundles(&root, &inactive, true, &bundles).is_err());
         assert_eq!(observed(&inactive).unwrap(), before);
-        set_enabled_path_with_bundles(&root, &inactive, true, &BTreeMap::new()).unwrap();
+        fs::rename(&inactive, &plan.destination).unwrap();
         assert_eq!(observed(&plan.destination).unwrap(), before);
         let original = fs::read(plan.destination.join("SKILL.md")).unwrap();
         for edit_entry in [true, false] {
@@ -1606,7 +2168,7 @@ mod tests {
         fs::create_dir_all(&pending).unwrap();
         let transaction = Transaction {
             workspace: workspace_for_path(&root, &project).unwrap(), workspace_signature: workspace.identity().unwrap(),
-            target: active.clone(), backup: None, before: before.clone(), after: String::new(), phase: "prepared".into(),
+            target: active.clone(), original: None, backup: None, before: before.clone(), after: String::new(), phase: "prepared".into(),
         };
         fs::write(pending.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
         let scan = inspect_with_bundles(&root, &project, &bundles).unwrap();
@@ -1678,7 +2240,10 @@ mod tests {
         fs::create_dir_all(&unmanaged).unwrap();
         fs::write(unmanaged.join("SKILL.md"), "unmanaged").unwrap();
         let scan = inspect_in(&root, &project).unwrap();
-        assert!(scan.iter().all(|item| !item.removable));
+        assert!(scan.iter().filter(|item| item.name != "external").all(|item| !item.removable));
+        let linked = scan.iter().find(|item| item.name == "external").unwrap();
+        assert!(linked.removable && !linked.managed && !linked.can_toggle());
+        assert_eq!(linked.source.as_ref(), Some(&source.canonicalize().unwrap()));
         assert!(scan.iter().any(|item| item.status == "external_link"));
         assert!(scan.iter().any(|item| item.status == "unmanaged"));
 
@@ -1688,7 +2253,7 @@ mod tests {
         fs::create_dir_all(&pending).unwrap();
         let transaction = Transaction {
             workspace: plan.workspace.clone(), workspace_signature: plan.workspace_signature,
-            target: inactive, backup: None, before: String::new(), after: String::new(),
+            target: inactive, original: None, backup: None, before: String::new(), after: String::new(),
             phase: "prepared".into(),
         };
         fs::write(pending.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
@@ -1741,7 +2306,8 @@ mod tests {
         fs::create_dir_all(&cached).unwrap();
         fs::write(cached.join("SKILL.md"), "previous app version").unwrap();
         fs::copy(cached.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
-        assert!(inspect()[0].bundled);
+        assert!(!inspect()[0].bundled);
+        assert!(!inspect()[0].can_toggle());
         let extra = defaults.join("user-added");
         fs::create_dir_all(&extra).unwrap();
         fs::write(extra.join("SKILL.md"), "added later").unwrap();
@@ -1750,6 +2316,7 @@ mod tests {
         fs::copy(extra.join("SKILL.md"), extra_copy.join("SKILL.md")).unwrap();
         assert!(!inspect().iter().find(|item| item.name == "user-added").unwrap().bundled);
         assert!(bundled_entry_fingerprints_in(&defaults, &root.join("missing-app")).is_empty());
+        fs::copy(template.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
         fs::create_dir_all(project.join("skills-inactive")).unwrap();
         let inactive = project.join("skills-inactive/example");
         fs::rename(&copy, &inactive).unwrap();
@@ -1920,6 +2487,292 @@ mod tests {
         fs::create_dir(target.join("local-data")).unwrap();
         assert!(plan_install(&root, &project, &source, "example").is_err());
     }
+
+    #[test]
+    fn link_removal_preserves_targets_and_recovers_absolute_relative_and_broken_links() {
+        for directory in ["skills", "skills-inactive"] {
+            for relative in [false, true] {
+                for broken in [false, true] {
+                    let (_temp, root, project, source) = fixture();
+                    let path = project.join(directory).join("example");
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    let target = if broken { source.with_file_name("missing") } else { source.clone() };
+                    let raw = if relative {
+                        Path::new("../../../../library").join(target.file_name().unwrap())
+                    } else { target };
+                    std::os::unix::fs::symlink(&raw, &path).unwrap();
+                    let source_before = update_protection::snapshot(&source).unwrap();
+                    let scan = inspect_in(&root, &project).unwrap();
+                    assert_eq!(scan[0].status, if broken { "broken_link" } else { "external_link" });
+                    assert!(scan[0].removable && !scan[0].managed && !scan[0].can_toggle());
+                    let plan = plan_remove_link(&root, &project, &path).unwrap();
+                    assert_eq!(plan.raw_target, raw);
+                    assert!(!project.join(RECOVERY).exists(), "planning must be read-only");
+                    apply_remove_link(&plan).unwrap();
+                    assert!(fs::symlink_metadata(&path).is_err());
+                    let operation = fs::read_dir(project.join(RECOVERY)).unwrap().next().unwrap().unwrap().path();
+                    assert_eq!(fs::read_link(operation.join("previous")).unwrap(), raw);
+                    let mut transaction: Transaction = read_json(&operation.join("transaction.json")).unwrap();
+                    transaction.phase = "replacing".into();
+                    fs::write(operation.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
+                    recover_in(&plan.workspace).unwrap();
+                    assert_eq!(fs::read_link(&path).unwrap(), raw);
+                    assert_eq!(update_protection::snapshot(&source).unwrap(), source_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn link_removal_freezes_identity_parents_and_public_plan_fields() {
+        for change in ["link", "parent", "workspace", "registry", "path", "target", "lock"] {
+            let (_temp, root, project, source) = fixture();
+            let path = project.join("skills/example");
+            std::os::unix::fs::symlink(&source, &path).unwrap();
+            let mut plan = plan_remove_link(&root, &project, &path).unwrap();
+            let native = Directory::open_anchored(&project).unwrap();
+            let lock = (change == "lock").then(|| native.lock(Path::new(".kitter-proma.lock")).unwrap());
+            match change {
+                "link" => {
+                    fs::rename(&path, project.join("saved-link")).unwrap();
+                    std::os::unix::fs::symlink(&source, &path).unwrap();
+                }
+                "parent" => {
+                    fs::rename(path.parent().unwrap(), project.join("saved-skills")).unwrap();
+                    fs::create_dir(path.parent().unwrap()).unwrap();
+                    fs::rename(project.join("saved-skills/example"), &path).unwrap();
+                }
+                "workspace" => {
+                    fs::rename(&project, project.with_file_name("saved-workspace")).unwrap();
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(&source, &path).unwrap();
+                }
+                "registry" => fs::write(root.join("agent-workspaces.json"),
+                    r#"{"version":1,"workspaces":[{"id":"changed","slug":"pilot","name":"Pilot"}]}"#).unwrap(),
+                "path" => plan.path = project.join("skills-inactive/example"),
+                "target" => plan.raw_target = source.with_file_name("other"),
+                "lock" => {},
+                _ => unreachable!(),
+            }
+            let before = observed(&path).unwrap();
+            assert!(apply_remove_link(&plan).is_err(), "{change}");
+            assert_eq!(observed(&path).unwrap(), before, "{change}");
+            assert!(source.join("SKILL.md").is_file());
+            assert!(!project.join(RECOVERY).exists());
+            drop(lock);
+        }
+    }
+
+    #[test]
+    fn link_removal_rejects_non_native_nested_linked_parents_and_real_packages() {
+        let (temp, root, project, source) = fixture();
+        let business = temp.path().join("business");
+        let unregistered = root.join("agent-workspaces/unregistered");
+        for parent in [business.join("skills"), unregistered.join("skills"), project.join("other"), project.join("skills/nested")] {
+            fs::create_dir_all(&parent).unwrap();
+            let path = parent.join("example");
+            std::os::unix::fs::symlink(&source, &path).unwrap();
+            assert!(plan_remove_link(&root, &project, &path).is_err());
+        }
+        assert!(plan_remove_link(&root, &unregistered, &unregistered.join("skills/example")).is_err());
+        assert!(plan_remove_link(&root, &project, &source).is_err());
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        assert!(plan_remove_link(&root, &alias, &alias.join("skills/nested/example")).is_err());
+        let linked_parent = project.join("skills-inactive");
+        std::os::unix::fs::symlink(business.join("skills"), &linked_parent).unwrap();
+        assert!(plan_remove_link(&root, &project, &linked_parent.join("example")).is_err());
+        fs::create_dir(project.join("skills/entity")).unwrap();
+        assert!(plan_remove_link(&root, &project, &project.join("skills/entity")).is_err());
+    }
+
+    #[test]
+    fn link_removal_restores_a_link_replaced_in_the_last_move_gap() {
+        let (_temp, root, project, source) = fixture();
+        let path = project.join("skills/example");
+        std::os::unix::fs::symlink(&source, &path).unwrap();
+        let plan = plan_remove_link(&root, &project, &path).unwrap();
+        let changed = path.clone();
+        let saved = project.join("saved-link");
+        let other = source.with_file_name("other");
+        let expected = other.clone();
+        BEFORE_REMOVE_MOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            fs::rename(&changed, saved).unwrap();
+            std::os::unix::fs::symlink(other, changed).unwrap();
+        })));
+        assert!(apply_remove_link(&plan).is_err());
+        assert_eq!(fs::read_link(&path).unwrap(), expected);
+        assert!(source.join("SKILL.md").is_file());
+        no_pending(&plan.workspace).unwrap();
+    }
+
+    fn inactive_fixture(linked: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (temp, root, project, source) = fixture();
+        let inactive = project.join("skills-inactive/example");
+        fs::create_dir(inactive.parent().unwrap()).unwrap();
+        if linked {
+            std::os::unix::fs::symlink("../../../../library/example", &inactive).unwrap();
+        } else {
+            apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+            fs::rename(project.join("skills/example"), &inactive).unwrap();
+        }
+        (temp, root, project, source, inactive)
+    }
+
+    #[test]
+    fn inactive_links_migrate_and_old_managed_copies_reinstall_under_one_lock() {
+        for linked in [false, true] {
+            let (_temp, root, project, source, inactive) = inactive_fixture(linked);
+            let source_before = update_protection::snapshot(&source).unwrap();
+            let before = observed(&inactive).unwrap();
+            let plan = plan_install(&root, &project, &source, "example").unwrap();
+            assert_eq!(plan.action, if linked { "migrate" } else { "reinstall" });
+            assert_eq!(plan.original_path(), inactive);
+            assert_eq!(plan.destination, project.join("skills/example"));
+            let workspace = Directory::open_anchored(&project).unwrap();
+            let lock = workspace.lock(Path::new(".kitter-proma.lock")).unwrap();
+            assert!(apply_plan(&plan).is_err());
+            assert_eq!(observed(&inactive).unwrap(), before);
+            drop(lock);
+            apply_plan(&plan).unwrap();
+            assert!(fs::symlink_metadata(&inactive).is_err());
+            assert!(!fs::symlink_metadata(&plan.destination).unwrap().file_type().is_symlink());
+            clean_marker(&plan.destination, &plan.workspace).unwrap();
+            let transaction = fs::read_dir(project.join(RECOVERY)).unwrap().map(|entry| {
+                let path = entry.unwrap().path();
+                read_json::<Transaction>(&path.join("transaction.json")).unwrap()
+            }).find(|t| t.original.is_some()).unwrap();
+            assert_eq!(transaction.original.as_ref(), Some(&inactive));
+            assert_eq!(observed(transaction.backup.as_ref().unwrap()).unwrap(), before);
+            assert!(!inspect_in(&root, &project).unwrap()[0].can_toggle());
+            assert_eq!(update_protection::snapshot(&source).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn inactive_reinstall_preserves_concurrent_active_occupants_and_restores_original() {
+        for linked in [false, true] {
+            for file in [false, true] {
+                let (_temp, root, project, source, inactive) = inactive_fixture(linked);
+                let before = observed(&inactive).unwrap();
+                let plan = plan_install(&root, &project, &source, "example").unwrap();
+                let winner = plan.destination.clone();
+                BEFORE_PUBLISH.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    if file {
+                        fs::write(&winner, "concurrent winner").unwrap();
+                    } else {
+                        fs::create_dir(&winner).unwrap();
+                        fs::write(winner.join("keep"), "concurrent winner").unwrap();
+                    }
+                })));
+                assert!(apply_plan(&plan).is_err());
+                assert_eq!(observed(&inactive).unwrap(), before);
+                let winner = if file { plan.destination.clone() } else { plan.destination.join("keep") };
+                assert_eq!(fs::read_to_string(winner).unwrap(), "concurrent winner");
+                no_pending(&plan.workspace).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_reinstall_rejects_modified_foreign_duplicate_or_changed_entries() {
+        for change in ["modified", "foreign", "duplicate", "replaced", "parent", "source"] {
+            let (_temp, root, project, source, inactive) = inactive_fixture(false);
+            let source_before = update_protection::snapshot(&source).unwrap();
+            let plan = plan_install(&root, &project, &source, "example").unwrap();
+            match change {
+                "modified" => {
+                    fs::write(inactive.join("extra"), "local edit").unwrap();
+                    assert!(plan_install(&root, &project, &source, "example").is_err());
+                }
+                "foreign" => {
+                    let foreign = source.with_file_name("foreign");
+                    fs::create_dir(&foreign).unwrap();
+                    fs::write(foreign.join("SKILL.md"), "foreign source").unwrap();
+                    assert!(plan_install(&root, &project, &foreign, "example").is_err());
+                    continue;
+                }
+                "duplicate" => fs::create_dir(&plan.destination).unwrap(),
+                "replaced" => {
+                    fs::rename(&inactive, project.join("saved-original")).unwrap();
+                    std::os::unix::fs::symlink(&source, &inactive).unwrap();
+                }
+                "parent" => {
+                    fs::rename(inactive.parent().unwrap(), project.join("saved-inactive")).unwrap();
+                    fs::create_dir(inactive.parent().unwrap()).unwrap();
+                    fs::rename(project.join("saved-inactive/example"), &inactive).unwrap();
+                }
+                "source" => fs::write(source.join("SKILL.md"), "changed upstream").unwrap(),
+                _ => unreachable!(),
+            }
+            let before = observed(&inactive).unwrap();
+            assert!(apply_plan(&plan).is_err(), "{change}");
+            assert_eq!(observed(&inactive).unwrap(), before);
+            if change != "source" {
+                assert_eq!(update_protection::snapshot(&source).unwrap(), source_before);
+            }
+        }
+    }
+
+    #[test]
+    fn cross_directory_recovery_restores_original_inactive_position_at_each_gap() {
+        for linked in [false, true] {
+            for phase in ["prepared", "backed_up", "published", "active_winner", "active_file", "inactive_winner", "invalid_original"] {
+                let (_temp, root, project, source, inactive) = inactive_fixture(linked);
+                let plan = plan_install(&root, &project, &source, "example").unwrap();
+                let source_before = update_protection::snapshot(&source).unwrap();
+                let operation = project.join(RECOVERY).join("interrupted-cross-directory");
+                fs::create_dir_all(operation.join("staging")).unwrap();
+                copy_package(&plan, &Directory::open_anchored(&operation.join("staging")).unwrap()).unwrap();
+                let mut transaction = Transaction {
+                    workspace: plan.workspace.clone(), workspace_signature: plan.workspace_signature.clone(),
+                    target: plan.destination.clone(), original: Some(inactive.clone()),
+                    backup: Some(operation.join("previous")), before: observed(&inactive).unwrap(),
+                    after: observed(&operation.join("staging")).unwrap(), phase: "replacing".into(),
+                };
+                if phase != "prepared" {
+                    package_fs::rename_exclusive(&inactive, transaction.backup.as_ref().unwrap()).unwrap();
+                }
+                if matches!(phase, "published" | "inactive_winner") {
+                    package_fs::rename_exclusive(&operation.join("staging"), &plan.destination).unwrap();
+                }
+                if phase == "active_winner" {
+                    fs::create_dir(&plan.destination).unwrap();
+                    fs::write(plan.destination.join("keep"), "active winner").unwrap();
+                }
+                if phase == "active_file" {
+                    fs::write(&plan.destination, "active file").unwrap();
+                }
+                if phase == "inactive_winner" {
+                    fs::create_dir(&inactive).unwrap();
+                    fs::write(inactive.join("keep"), "inactive winner").unwrap();
+                }
+                if phase == "invalid_original" { transaction.original = Some(source.clone()); }
+                fs::write(operation.join("transaction.json"), serde_json::to_vec(&transaction).unwrap()).unwrap();
+                if phase == "invalid_original" {
+                    assert!(recover_in(&plan.workspace).is_err());
+                    assert_eq!(observed(transaction.backup.as_ref().unwrap()).unwrap(), transaction.before);
+                    assert!(fs::symlink_metadata(&inactive).is_err());
+                } else if phase == "inactive_winner" {
+                    assert!(recover_in(&plan.workspace).is_err());
+                    assert_eq!(fs::read_to_string(inactive.join("keep")).unwrap(), "inactive winner");
+                    assert_eq!(observed(transaction.backup.as_ref().unwrap()).unwrap(), transaction.before);
+                    assert_eq!(observed(&plan.destination).unwrap(), transaction.after);
+                } else {
+                    recover_in(&plan.workspace).unwrap();
+                    assert_eq!(observed(&inactive).unwrap(), transaction.before, "{phase}");
+                    if phase == "active_winner" {
+                        assert_eq!(fs::read_to_string(plan.destination.join("keep")).unwrap(), "active winner");
+                    } else if phase == "active_file" {
+                        assert_eq!(fs::read_to_string(&plan.destination).unwrap(), "active file");
+                    } else { assert!(fs::symlink_metadata(&plan.destination).is_err()); }
+                    transaction = read_json(&operation.join("transaction.json")).unwrap();
+                    assert_eq!(transaction.phase, "rolled_back");
+                }
+                assert_eq!(update_protection::snapshot(&source).unwrap(), source_before);
+            }
+        }
+    }
     #[test]
     fn backup_gap_can_be_restored_without_touching_unknown_target_content() {
         let (_t, root, project, source) = fixture();
@@ -1935,11 +2788,16 @@ mod tests {
             workspace: p.workspace,
             workspace_signature: p.workspace_signature,
             target: target.clone(),
+            original: None,
             backup: Some(backup.clone()),
             before,
             after: "unused".into(),
             phase: "replacing".into(),
         };
+        let mut legacy = serde_json::to_value(&t).unwrap();
+        legacy.as_object_mut().unwrap().remove("original");
+        fs::write(op.join("transaction.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        recover_in(&t.workspace).unwrap();
         restore_transaction(&t, &op).unwrap();
         assert!(target.join("SKILL.md").is_file());
         package_fs::rename_exclusive(&target, &backup).unwrap();
@@ -2056,6 +2914,7 @@ mod tests {
             workspace: p.workspace,
             workspace_signature: p.workspace_signature,
             target: p.destination.clone(),
+            original: None,
             backup: Some(backup),
             before,
             after,
@@ -2330,6 +3189,7 @@ mod tests {
                 workspace: p.workspace,
                 workspace_signature: p.workspace_signature,
                 target: p.destination.clone(),
+                original: None,
                 backup: Some(backup.clone()),
                 before: observed(&backup).unwrap(),
                 after: observed(&p.destination).unwrap(),
@@ -2373,6 +3233,7 @@ mod tests {
             workspace: p.workspace.clone(),
             workspace_signature: p.workspace_signature,
             target: p.destination.clone(),
+            original: None,
             backup: Some(backup.clone()),
             before,
             after: "unpublished".into(),
