@@ -10,6 +10,8 @@ pub(super) struct CrossProjectState {
     agents: BTreeSet<String>,
     projects: BTreeSet<PathBuf>,
     workspaces: BTreeSet<String>,
+    initial_project: Option<PathBuf>,
+    conversion_paths: Option<BTreeSet<PathBuf>>,
     collapsed: BTreeSet<PathBuf>,
     skill_search: Entity<InputState>,
     project_search: Entity<InputState>,
@@ -56,9 +58,27 @@ impl CrossProjectState {
             }).detach();
         }
         Self { catalog: None, plan: None, result: None, skills: BTreeSet::new(), agents: BTreeSet::new(), projects: BTreeSet::new(),
-            workspaces: BTreeSet::new(), collapsed: BTreeSet::new(), skill_search, project_search,
+            workspaces: BTreeSet::new(), initial_project: None, conversion_paths: None, collapsed: BTreeSet::new(), skill_search, project_search,
             skill_scroll: ScrollHandle::new(), project_scroll: ScrollHandle::new(), action: Action::Install, preset_mode: false,
             loading: false, planning: false, busy: false, reviewed: false, generation: 0, plan_generation: 0, error: None }
+    }
+
+    fn select_initial_destinations(&mut self, catalog: &Catalog) {
+        if let Some(project) = self.initial_project.take() {
+            let archived = catalog.projects.iter().any(|p| p.path == project && p.archived);
+            if self.agents.contains("proma") {
+                self.workspaces.extend(catalog.proma.iter().flat_map(|c| &c.workspaces)
+                    .filter(|w| w.workspace.project_root_path.as_ref().unwrap_or(&w.workspace.path) == &project)
+                    .filter(|w| !w.workspace.archived || archived)
+                    .filter(|w| w.error.is_none())
+                    .map(|w| w.workspace.id.clone()));
+            }
+        }
+        if let Some(paths) = &self.conversion_paths {
+            self.workspaces = catalog.proma.iter().flat_map(|c| &c.workspaces)
+                .filter(|w| paths.iter().any(|path| path.parent().and_then(Path::parent) == Some(w.workspace.path.as_path())))
+                .map(|w| w.workspace.id.clone()).collect();
+        }
     }
 }
 
@@ -72,7 +92,7 @@ impl KitterApp {
         self.cross_project.plan_generation = self.cross_project.plan_generation.wrapping_add(1);
         self.cross_project.plan = None;
         self.cross_project.planning = false;
-        self.cross_project.reviewed = false;
+        self.cross_project.reviewed = self.cross_project.conversion_paths.is_some();
         self.cross_project.error = Some(self.tr("Agent 安装状态已变化，请刷新后重新预览", "Agent availability changed; refresh to review again").into());
     }
 
@@ -95,7 +115,8 @@ impl KitterApp {
         self.cross_project.skill_scroll.set_offset(point(px(0.), px(0.)));
         self.cross_project.project_scroll.set_offset(point(px(0.), px(0.)));
         self.cross_project.skills = keys.into_iter().collect();
-        self.cross_project.agents = agent.into_iter().collect();
+        self.cross_project.agents = if action.is_state() || action == Action::Convert { BTreeSet::from(["proma".into()]) }
+            else { agent.into_iter().collect() };
         if self.cross_project.agents.is_empty() && let Some(path) = &project {
             if let Some(selected) = self.projects_view.selected_project_agent {
                 self.cross_project.agents.insert(selected.id().to_string());
@@ -105,6 +126,8 @@ impl KitterApp {
         }
         self.cross_project.projects = project.clone().into_iter().collect();
         self.cross_project.workspaces.clear();
+        self.cross_project.initial_project = project;
+        self.cross_project.conversion_paths = None;
         self.cross_project.collapsed.clear();
         self.cross_project.action = action;
         self.cross_project.preset_mode = action.is_state();
@@ -112,6 +135,13 @@ impl KitterApp {
         self.cross_project.result = None;
         self.open_dialog(DialogKind::CrossProject, cx);
         self.load_cross_project(cx);
+    }
+
+    pub(super) fn open_proma_conversion(&mut self, keys: Vec<String>, project: PathBuf, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cross_project.busy { return; }
+        self.open_cross_project(keys, Some(project), Action::Convert, Some("proma".into()), window, cx);
+        self.cross_project.conversion_paths = Some(paths.into_iter().collect());
+        self.cross_project.reviewed = true;
     }
 
     fn load_cross_project(&mut self, cx: &mut Context<Self>) {
@@ -124,7 +154,7 @@ impl KitterApp {
         self.cross_project.result = None;
         self.cross_project.error = None;
         self.cross_project.plan = None;
-        self.cross_project.reviewed = false;
+        self.cross_project.reviewed = self.cross_project.conversion_paths.is_some();
         let projects = self.all_project_entries();
         let installed = self.model.installed_agents.clone();
         let root = crate::proma::home();
@@ -152,6 +182,7 @@ impl KitterApp {
                 this.cross_project.agents.retain(|id| catalog.installed_agents.iter().any(|a| a.id == id && !a.global_only));
                 this.cross_project.projects.retain(|path| catalog.projects.iter().any(|p| &p.path == path));
                 this.cross_project.workspaces.retain(|id| catalog.proma.as_ref().is_some_and(|p| p.workspaces.iter().any(|w| &w.workspace.id == id)));
+                this.cross_project.select_initial_destinations(&catalog);
                 if preview {
                     this.cross_project.agents = ["codex", "proma"].into_iter().filter(|id| catalog.installed_agents.iter().any(|a| a.id == *id)).map(str::to_string).collect();
                     this.cross_project.projects.extend(catalog.projects.iter().filter(|p| p.is_active()).take(2).map(|p| p.path.clone()));
@@ -170,9 +201,14 @@ impl KitterApp {
         let state = &mut self.cross_project;
         state.plan_generation = state.plan_generation.wrapping_add(1);
         let generation = state.plan_generation;
-        let (action, skills, agents, projects, workspaces) = (state.action, state.skills.clone(), state.agents.clone(), state.projects.clone(), state.workspaces.clone());
-        state.planning = true; state.plan = None; state.error = None; state.reviewed = false;
-        let task = cx.background_executor().spawn(async move { catalog.plan(action, &skills, &agents, &projects, &workspaces).map_err(|e| format!("{e:#}")) });
+        let (action, skills, agents, projects, workspaces, conversion_paths) = (state.action, state.skills.clone(), state.agents.clone(), state.projects.clone(), state.workspaces.clone(), state.conversion_paths.clone());
+        state.planning = true; state.plan = None; state.error = None; state.reviewed = state.conversion_paths.is_some();
+        let task = cx.background_executor().spawn(async move {
+            catalog.plan(action, &skills, &agents, &projects, &workspaces).map(|mut plan| {
+                if let Some(paths) = conversion_paths { plan.items.retain(|item| paths.contains(&item.path)); }
+                plan
+            }).map_err(|e| format!("{e:#}"))
+        });
         cx.spawn(async move |this, cx| {
             let plan = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -275,13 +311,16 @@ impl KitterApp {
 
     fn cross_project_visible_projects(&self, cx: &App) -> Vec<PathBuf> {
         let query = self.cross_project.project_search.read(cx).value().trim().to_lowercase();
-        self.cross_project.catalog.iter().flat_map(|c| &c.projects).filter(|p| {
+        let mut projects = self.cross_project.catalog.iter().flat_map(|c| &c.projects).filter(|p| {
             query.is_empty() || p.name.to_lowercase().contains(&query) || p.path.to_string_lossy().to_lowercase().contains(&query)
                 || self.cross_project.catalog.as_ref().and_then(|c| c.proma.as_ref()).is_some_and(|c| c.workspaces.iter().any(|w| {
                     w.workspace.project_root_path.as_ref().unwrap_or(&w.workspace.path) == &p.path
                         && format!("{} {} {}", w.workspace.name, w.workspace.slug, w.workspace.path.display()).to_lowercase().contains(&query)
                 }))
-        }).map(|p| p.path.clone()).collect()
+        }).map(|p| p.path.clone()).collect::<Vec<_>>();
+        projects.sort_by_key(|path| !(self.cross_project.projects.contains(path) || self.cross_project.catalog.as_ref()
+            .is_some_and(|c| c.workspace_ids(path).iter().any(|id| self.cross_project.workspaces.contains(id)))));
+        projects
     }
 
     fn cross_project_skills_picker(&self, height: f32, cx: &mut Context<Self>) -> Div {
@@ -456,6 +495,13 @@ impl KitterApp {
                     .child(div().mb(px(6.)).text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(self.tr("实际影响清单", "Actual impact")))
                     .child(self.cross_project_items(plan, None));
             }
+            if let Some(error) = &state.error {
+                content = content.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.warning).child(error.clone()));
+            }
+            if state.conversion_paths.is_some() && state.plan.as_ref().is_some_and(|plan| plan.items.is_empty()) {
+                content = content.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.warning)
+                    .child(self.tr("所选链接已变化，请关闭后重新检查。", "The selected links changed. Close this dialog and inspect them again.")));
+            }
         } else {
             let mut modes = div().flex().items_center().gap(px(5.)).mb(px(8.));
             for (preset, id, label) in [(false, "cross-project-users", self.tr("用户技能", "User skills")), (true, "cross-project-presets", self.tr("Proma 预设", "Proma presets"))] {
@@ -552,15 +598,17 @@ impl KitterApp {
         div().bg(background).text_color(p.text).font_family(FONT_UI)
             .child(div().px(px(20.)).pt(px(16.)).pb(px(10.))
                 .child(div().flex().items_center().gap(px(6.))
-                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(self.tr("跨项目管理", "Manage across projects")))
+                    .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(if state.conversion_paths.is_some() { self.tr("转换为副本", "Convert to copies") } else { self.tr("跨项目管理", "Manage across projects") }))
                     .child(self.toolbar_text_button("cross-project-refresh", self.tr("刷新", "Refresh")).disabled(busy).on_click(cx.listener(|this, _, _, cx| this.load_cross_project(cx))))
                     .child(self.toolbar_text_button("cross-project-close", self.tr("关闭", "Close")).disabled(state.busy).on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx)))))
-                .child(div().mt(px(7.)).text_size(px(12.)).text_color(p.secondary).child(self.cross_project_explanation())))
+                .child(div().mt(px(7.)).text_size(px(12.)).text_color(p.secondary).child(if state.conversion_paths.is_some() {
+                    self.tr("仅转换下列工作区中的所选软链接，Kitter 技能源与本机资料保留。确认后执行。", "Convert only the selected links in the workspaces below. Keep Kitter sources and local data; apply after confirmation.").to_string()
+                } else { self.cross_project_explanation() })))
             .child(content)
             .child(div().px(px(20.)).py(px(12.)).border_t_1().border_color(p.border).flex().items_center().gap(px(7.))
                 .child(div().min_w_0().flex_1().text_size(px(11.)).text_color(p.muted).child(if self.uses_english() { format!("{} skills · {} agents", state.skills.len(), state.agents.len()) }
                     else { format!("已选 {} 个技能 · {} 个 Agent", state.skills.len(), state.agents.len()) }))
-                .when(state.result.is_some() || state.reviewed, |d| d.child(self.toolbar_text_button("cross-project-back", self.tr("返回选择", "Back to selection")).disabled(busy)
+                .when(state.conversion_paths.is_none() && (state.result.is_some() || state.reviewed), |d| d.child(self.toolbar_text_button("cross-project-back", self.tr("返回选择", "Back to selection")).disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.cross_project.result.is_some() { this.load_cross_project(cx); }
                         else { this.cross_project.reviewed = false; this.notify_dialog(cx); }
@@ -584,6 +632,100 @@ mod tests {
         let visible = vec!["first".to_string(), "second".to_string()];
         toggle_visible(&mut selected, &visible); assert_eq!(selected.len(), 3);
         toggle_visible(&mut selected, &visible); assert_eq!(selected, BTreeSet::from(["hidden".to_string()]));
+    }
+
+    #[cfg(all(feature = "ui-test", unix))]
+    #[test]
+    fn project_context_is_selected_once_and_direct_conversion_keeps_its_exact_scope() {
+        use super::*;
+        use std::{fs, os::unix::fs::symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let source = base.join("source/alpha");
+        fs::create_dir_all(source.join("local-data")).unwrap();
+        fs::write(source.join("SKILL.md"), "---\nname: alpha\ndescription: Test\n---\nBody\n").unwrap();
+        fs::write(source.join("local-data/keep"), "keep local data").unwrap();
+        let proma = base.join("proma");
+        let project = base.join("Project A");
+        let other = base.join("Project B");
+        fs::create_dir(&project).unwrap(); fs::create_dir(&other).unwrap();
+        let mut workspaces = Vec::new();
+        for (id, root, archived) in [("default", None, false), ("a", Some(&project), false),
+            ("review", Some(&project), false), ("archive", Some(&project), true), ("b", Some(&other), false)] {
+            let skills = proma.join("agent-workspaces").join(id).join("skills");
+            fs::create_dir_all(&skills).unwrap();
+            symlink(&source, skills.join("alpha")).unwrap();
+            workspaces.push(serde_json::json!({"id":id,"slug":id,"name":id,"projectRootPath":root,"archived":archived}));
+        }
+        fs::write(proma.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({"version":2,"workspaces":workspaces})).unwrap()).unwrap();
+        let installed = crate::agents::AGENT_ICON_ORDER.iter().filter(|a| ["codex", "proma"].contains(&a.id)).copied().collect::<Vec<_>>();
+        let skill = Skill { key: crate::proma_batch::source_key(&source.join("SKILL.md")), name: "alpha".into(), source: source.clone(), provider: "library", install_name: Some("alpha".into()) };
+        let catalog = Arc::new(Catalog::scan(vec![skill.clone()], vec![], installed.clone(), Some(&proma)));
+        let native = proma.join("agent-workspaces/default");
+        let link = proma.join("agent-workspaces/a/skills/alpha");
+        let mut test = TestAppContext::single(); test.update(gpui_component::init);
+        let (app, cx) = test.add_window_view({ let data = base.join("data"); move |window, cx| KitterApp::new_in(data, window, cx) });
+        app.update_in(cx, |app, _, cx| {
+            let state = &mut app.cross_project;
+            state.catalog = Some(catalog.clone());
+            state.agents = BTreeSet::from(["codex".into(), "proma".into()]);
+            state.projects = BTreeSet::from([project.clone()]);
+            state.initial_project = Some(project.clone());
+            state.select_initial_destinations(&catalog);
+            assert_eq!(state.workspaces, BTreeSet::from(["a".into(), "review".into()]));
+            state.workspaces.remove("review");
+            state.select_initial_destinations(&catalog);
+            assert_eq!(state.workspaces, BTreeSet::from(["a".into()]), "refresh must preserve explicit deselection");
+            state.workspaces.clear();
+            state.projects = BTreeSet::from([native.clone()]);
+            state.initial_project = Some(native.clone());
+            state.select_initial_destinations(&catalog);
+            assert_eq!(state.workspaces, BTreeSet::from(["default".into()]));
+            assert_eq!(app.cross_project_visible_projects(cx).first(), Some(&native));
+            let state = &mut app.cross_project;
+            state.workspaces.clear(); state.initial_project = None;
+            state.select_initial_destinations(&catalog);
+            assert!(state.workspaces.is_empty(), "library entry must not select unrelated workspaces");
+            state.projects = BTreeSet::from([project.clone()]);
+            state.initial_project = Some(project.clone());
+            state.conversion_paths = Some(BTreeSet::from([link.clone()]));
+            state.skills = BTreeSet::from([skill.key.clone()]);
+            state.agents = BTreeSet::from(["proma".into()]);
+            state.action = Action::Convert;
+            state.select_initial_destinations(&catalog);
+            assert_eq!(state.workspaces, BTreeSet::from(["a".into()]));
+            app.model.installed_agents = installed;
+            app.open_dialog(DialogKind::CrossProject, cx);
+            app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        cx.read_entity(&app, |app, _| {
+            let plan = app.cross_project.plan.as_ref().unwrap();
+            assert!(app.cross_project.reviewed);
+            assert_eq!(plan.count(Disposition::Change), 1);
+            assert_eq!(plan.items[0].path, link);
+        });
+        assert!(cx.debug_bounds("cross-project-select-projects").is_none());
+        assert!(link.is_symlink(), "opening conversion must not execute it");
+        app.update_in(cx, |app, _, cx| {
+            app.cross_project_agents_changed();
+            assert!(app.cross_project.reviewed, "availability checks must not reopen destination selection");
+            app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let confirm = cx.debug_bounds("cross-project-execute").unwrap();
+        cx.simulate_click(confirm.center(), Modifiers::none());
+        cx.run_until_parked(); cx.refresh().unwrap();
+        cx.read_entity(&app, |app, _| {
+            let result = app.cross_project.result.as_ref().unwrap();
+            assert_eq!((result.changed(), result.failed()), (1, 0));
+        });
+        assert!(link.is_dir() && !link.is_symlink());
+        for id in ["default", "review", "archive", "b"] {
+            assert!(proma.join("agent-workspaces").join(id).join("skills/alpha").is_symlink());
+        }
+        assert_eq!(fs::read_to_string(source.join("local-data/keep")).unwrap(), "keep local data");
+        assert!(source.join("SKILL.md").is_file());
     }
 
     #[cfg(feature = "ui-test")]

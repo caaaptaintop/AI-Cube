@@ -2143,7 +2143,7 @@ impl KitterApp {
                 let installations = self.skill_installations_at(skill, &path, cx);
                 let proma_inactive = effective_view::proma_copies_inactive(&installations);
                 let proma_status = self.proma_installation_status(&skill.record.name,
-                    &format!("detail-{}-{index}", skill_storage_name(skill)), &installations, cx);
+                    &format!("detail-{}-{index}", skill_storage_name(skill)), &installations, &path, cx);
                 let targets = installations
                     .iter()
                     .map(|installation| installation.target)

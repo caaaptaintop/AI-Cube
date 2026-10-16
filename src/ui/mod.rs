@@ -2680,61 +2680,70 @@ fn minimum_window_size(cx: &App) -> Size<Pixels> {
 }
 
 pub fn run() {
-    gpui_platform::application()
-        .with_assets(crate::assets::Assets)
-        .run(|cx: &mut App| {
-            cx.on_action(quit);
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            let preview_id = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_ID").ok()).flatten();
-            let preview_name = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_NAME").ok()).flatten();
-            cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Kitter"));
-            gpui_component::init(cx);
-            crate::assets::register_fonts(cx).expect("failed to register fonts");
-            cx.open_window(
-                WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Kitter".into()),
-                        appears_transparent: cfg!(target_os = "macos"),
-                        traffic_light_position: cfg!(target_os = "macos")
-                            .then(|| point(px(16.), px(17.))),
-                        ..Default::default()
-                    }),
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        initial_window_size(cx),
-                        cx,
-                    ))),
-                    window_min_size: Some(minimum_window_size(cx)),
-                    is_movable: true,
-                    app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                    window_background: if cfg!(target_os = "macos") {
-                        WindowBackgroundAppearance::Blurred
-                    } else {
-                        WindowBackgroundAppearance::Opaque
-                    },
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(|cx| {
-                        let app = KitterApp::new(window, cx);
-                        cx.observe_window_bounds(window, |_, window, cx| {
-                            crate::platform::update_soft_window_shadow(window);
-                            cx.notify();
-                        })
-                        .detach();
-                        app
-                    });
-                    crate::platform::configure_window_material(window, cx.theme().is_dark());
-                    // Kitter uses the platform window decorations. The component Root's
-                    // client-side border adds a full-window mouse-move layer that is
-                    // only needed by borderless Linux windows.
-                    cx.new(|cx| {
-                        Root::new(view, window, cx)
-                            .bordered(false)
-                            .bg(cx.theme().background)
-                    })
-                },
-            )
-            .expect("failed to open Kitter window");
-        });
+    let app = gpui_platform::application().with_assets(crate::assets::Assets);
+    app.on_reopen(open_main_window);
+    app.run(|cx: &mut App| {
+        cx.on_action(quit);
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        let preview_id = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_ID").ok()).flatten();
+        let preview_name = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_NAME").ok()).flatten();
+        cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Kitter"));
+        gpui_component::init(cx);
+        crate::assets::register_fonts(cx).expect("failed to register fonts");
+        open_main_window(cx);
+    });
+}
+
+fn open_main_window(cx: &mut App) {
+    if let Some(window) = cx.windows().first() {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+        cx.activate(true);
+        return;
+    }
+    cx.open_window(
+        WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("Kitter".into()),
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: cfg!(target_os = "macos")
+                    .then(|| point(px(16.), px(17.))),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                initial_window_size(cx),
+                cx,
+            ))),
+            window_min_size: Some(minimum_window_size(cx)),
+            is_movable: true,
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
+            window_background: if cfg!(target_os = "macos") {
+                WindowBackgroundAppearance::Blurred
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| {
+                let app = KitterApp::new(window, cx);
+                cx.observe_window_bounds(window, |_, window, cx| {
+                    crate::platform::update_soft_window_shadow(window);
+                    cx.notify();
+                })
+                .detach();
+                app
+            });
+            crate::platform::configure_window_material(window, cx.theme().is_dark());
+            // Kitter uses the platform window decorations. The component Root's
+            // client-side border adds a full-window mouse-move layer that is
+            // only needed by borderless Linux windows.
+            cx.new(|cx| {
+                Root::new(view, window, cx)
+                    .bordered(false)
+                    .bg(cx.theme().background)
+            })
+        },
+    )
+    .expect("failed to open Kitter window");
 }
