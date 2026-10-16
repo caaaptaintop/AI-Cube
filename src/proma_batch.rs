@@ -102,6 +102,7 @@ impl Catalog {
 
 fn protection_reason(copy: &Installation) -> &'static str {
     match copy.status.as_str() {
+        "preset_variant" => "匹配本机预设模板，但与当前应用自带内容不同；保留副本，启停仍受保护",
         "modified" => "副本已修改，保留现有内容",
         "external_link" | "broken_link" => "旧软链接请在用户技能中移除或转换为副本",
         _ if copy.managed => "用户技能使用安装、卸载；启用、停用仅用于 Proma 内置预设",

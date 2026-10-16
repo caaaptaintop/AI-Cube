@@ -633,32 +633,41 @@ mod tests {
     }
 
     #[test]
-    fn same_named_active_and_inactive_proma_copies_do_not_attach_to_codex() {
-        let skill = EffectiveSkill {
-            id: "pdf".into(), name: "pdf".into(), description: "Codex version".into(), when_to_use: None,
-            path: "/global/pdf/SKILL.md".into(), root_path: Some("/global".into()), prompt_path: None,
-            scope: SkillScope::User, visibility: SkillVisibility::Automatic, source: SkillSource::Filesystem,
-        };
-        let estimates = [AgentContextEstimate {
-            agent: AgentKind::Codex, discovered_count: 1, model_visible_count: 1,
-            manual_only_count: 0, name_only_count: 0, conditional_count: 0, estimated_tokens: 1, skills: vec![skill],
-        }];
-        for state in ["active", "inactive"] {
-            let direct = [ProjectSkill { name: "pdf".into(), installations: vec![ProjectSkillInstallation {
-                target: InstallTarget::Proma, path: format!("/native/{state}/pdf").into(),
-                managed: false, source: None, removable: false, toggleable: true, bundled: true, integration: None,
-                state: Some(state.into()), status: Some("unmanaged".into()),
-            }] }];
-            let rows = skill_rows(&estimates, &direct, None, Path::new("/business"));
-            assert_eq!(rows.len(), 2, "independent copies must remain distinct even when names match");
-            assert_ne!(rows[0].key, rows[1].key);
-            assert!(rows.iter().all(|row| row.duplicate_name));
-            let codex = rows.iter().find(|row| row.agents == [AgentKind::Codex]).unwrap();
-            assert!(codex.direct_installations.is_empty());
-            assert_eq!(codex.origins, [SkillOrigin::User]);
-            let proma = rows.iter().find(|row| row.agents == [AgentKind::Proma]).unwrap();
-            assert_eq!(proma.direct_installations.len(), 1);
-            assert_eq!(proma.direct_installations[0].state.as_deref(), Some(state));
+    fn same_named_proma_copies_do_not_attach_to_any_other_agent() {
+        for agent in crate::agents::AGENT_ICON_ORDER.iter().filter_map(|info| AgentKind::from_id(info.id))
+            .filter(|agent| *agent != AgentKind::Proma)
+        {
+            let skill = EffectiveSkill {
+                id: "pdf".into(), name: "pdf".into(), description: "Independent source".into(), when_to_use: None,
+                path: "/global/pdf/SKILL.md".into(), root_path: Some("/global".into()), prompt_path: None,
+                scope: SkillScope::User, visibility: SkillVisibility::Automatic, source: SkillSource::Filesystem,
+            };
+            let estimates = [AgentContextEstimate {
+                agent, discovered_count: 1, model_visible_count: 1,
+                manual_only_count: 0, name_only_count: 0, conditional_count: 0, estimated_tokens: 1, skills: vec![skill],
+            }];
+            for state in ["active", "inactive"] {
+                let direct = [ProjectSkill { name: "pdf".into(), installations: vec![ProjectSkillInstallation {
+                    target: InstallTarget::Proma, path: format!("/native/{state}/pdf").into(),
+                    managed: false, source: None, removable: false, toggleable: true, bundled: true, integration: None,
+                    state: Some(state.into()), status: Some("unmanaged".into()),
+                }] }];
+                let rows = skill_rows(&estimates, &direct, None, Path::new("/business"));
+                assert_eq!(rows.len(), 2, "independent copies must remain distinct even when names match");
+                assert_ne!(rows[0].key, rows[1].key);
+                assert!(rows.iter().all(|row| row.duplicate_name));
+                let independent = rows.iter().find(|row| row.agents == [agent]).unwrap();
+                assert!(independent.direct_installations.is_empty());
+                assert_eq!(independent.origins, [SkillOrigin::User]);
+                let proma = rows.iter().find(|row| row.agents == [AgentKind::Proma]).unwrap();
+                assert_eq!(proma.direct_installations.len(), 1);
+                assert_eq!(proma.direct_installations[0].state.as_deref(), Some(state));
+                assert_eq!(proma.origins, [SkillOrigin::Builtin]);
+                let filtered = skill_rows(&estimates, &direct, Some(agent), Path::new("/business"));
+                assert_eq!(filtered.len(), 1);
+                assert_eq!(filtered[0].agents, [agent]);
+                assert!(filtered[0].direct_installations.is_empty());
+            }
         }
     }
 
@@ -674,13 +683,16 @@ mod tests {
                 source: SkillSource::Plugin { id: "suite".into(), display_name: "Suite".into() },
             }],
         };
-        let estimates = [estimate(AgentKind::Codex), estimate(AgentKind::Proma)];
+        let estimates = crate::agents::AGENT_ICON_ORDER.iter().filter_map(|info| AgentKind::from_id(info.id))
+            .map(estimate).collect::<Vec<_>>();
         let all = plugin_groups(&estimates, None);
-        assert_eq!(all.len(), 2);
-        assert_ne!(all[0].key, all[1].key);
-        let codex = plugin_groups(&estimates, Some(AgentKind::Codex));
-        assert_eq!(codex.len(), 1);
-        assert_eq!(codex[0].agent, AgentKind::Codex);
+        assert_eq!(all.len(), estimates.len());
+        assert_eq!(all.iter().map(|group| &group.key).collect::<HashSet<_>>().len(), estimates.len());
+        for estimate in &estimates {
+            let filtered = plugin_groups(&estimates, Some(estimate.agent));
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].agent, estimate.agent);
+        }
         assert!(skill_rows(&estimates, &[], None, Path::new("/project")).is_empty());
     }
 

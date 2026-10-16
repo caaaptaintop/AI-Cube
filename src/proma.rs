@@ -1054,6 +1054,8 @@ pub struct Installation {
     pub source: Option<PathBuf>,
     pub managed: bool,
     pub removable: bool,
+    /// Display origin, including configured local variants of app-listed presets.
+    /// State-change permission is separately verified by `can_toggle`.
     pub bundled: bool,
     pub integration: Option<String>,
     toggleable: bool,
@@ -1213,6 +1215,14 @@ fn inspect_with_bundles(
     let workspace_signature = workspace.identity()?;
     let recovery_clear = no_pending(&w).is_ok();
     let integration_entries = integration_entry_fingerprints(root);
+    let defaults = root.join("default-skills");
+    let local_presets = if real_directory(&defaults).is_ok() {
+        bundled_entries.keys().filter_map(|name| {
+            let template = defaults.join(name);
+            real_directory(&template).ok()?;
+            Some((name.clone(), skill_entry_fingerprint(&template.join("SKILL.md"))?))
+        }).collect::<BTreeMap<_, _>>()
+    } else { BTreeMap::new() };
     let mut out = vec![];
     for (directory, state) in [("skills", "active"), ("skills-inactive", "inactive")] {
         let parent = w.path.join(directory);
@@ -1261,17 +1271,20 @@ fn inspect_with_bundles(
             let unmarked = fs::symlink_metadata(path.join(MARKER))
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
             let preset = unmarked && real_directory(&path).is_ok();
+            let fingerprint = preset.then(|| skill_entry_fingerprint(&path.join("SKILL.md"))).flatten();
             let integration = (preset
                 && integration_entries.get(&name).is_some_and(|expected| {
-                    skill_entry_fingerprint(&path.join("SKILL.md")).as_ref() == Some(expected)
+                    fingerprint.as_ref() == Some(expected)
                 })).then(|| "Nowledge Mem".to_string());
-            // Match template content, never just a well-known name. Bundled
-            // packages can move intact, but do not gain removal rights.
-            let bundled = preset && integration.is_none()
+            let verified_bundle = preset && integration.is_none()
                 && bundled_entries.get(&name).is_some_and(|fingerprints| {
-                    skill_entry_fingerprint(&path.join("SKILL.md"))
-                        .is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
+                    fingerprint.is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
                 });
+            // A matching configured template explains the display origin, but
+            // only current application bytes authorize state changes.
+            let bundled = verified_bundle || (preset && integration.is_none()
+                && local_presets.get(&name).is_some_and(|expected| fingerprint.as_ref() == Some(expected)));
+            let status = if bundled && !verified_bundle { "preset_variant" } else { status };
             let removable_link = linked && cfg!(unix) && crate::library::validate_name(&name).is_ok()
                 && observed(&path).is_ok();
             let source = found.as_ref().map(|m| m.source.clone()).or_else(|| {
@@ -1295,7 +1308,7 @@ fn inspect_with_bundles(
                 removable: stable && recovery_clear && (matches!(status, "current" | "update_pending") || removable_link),
                 bundled,
                 integration,
-                toggleable: stable && cfg!(unix) && recovery_clear && bundled,
+                toggleable: stable && cfg!(unix) && recovery_clear && verified_bundle,
                 snapshot: None,
             };
             if let Some(mut snapshot) = before {
@@ -1944,6 +1957,88 @@ mod tests {
     }
 
     #[test]
+    fn regression_local_preset_variants_keep_origin_without_gaining_toggle_rights() {
+        for inactive in [false, true] {
+            let (_temp, root, project, bundles) = builtin_fixture();
+            let active = project.join("skills/example");
+            assert!(inspect_with_bundles(&root, &project, &bundles).unwrap()[0].can_toggle());
+            let cached = root.join("default-skills/example");
+            fs::create_dir_all(&cached).unwrap();
+            fs::write(cached.join("SKILL.md"), "locally adapted or older preset").unwrap();
+            fs::copy(cached.join("SKILL.md"), active.join("SKILL.md")).unwrap();
+            let path = if inactive {
+                fs::create_dir(project.join("skills-inactive")).unwrap();
+                let path = project.join("skills-inactive/example");
+                fs::rename(&active, &path).unwrap(); path
+            } else { active };
+            let before = observed(&path).unwrap();
+            let copy = inspect_with_bundles(&root, &project, &bundles).unwrap().remove(0);
+            assert!(copy.bundled, "matching configured preset variants keep their display origin");
+            assert_eq!(copy.status, "preset_variant");
+            assert!(!copy.can_toggle() && !copy.removable);
+            assert!(set_enabled_path_with_bundles(&root, &path, inactive, &bundles).is_err());
+            assert_eq!(observed(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn preset_discovery_follows_app_updates_across_active_and_inactive_workspaces() {
+        let (_temp, root, project, _) = builtin_fixture();
+        let templates = root.join("fixture-app/default-skills");
+        register_test_bundled_templates(&root, &templates);
+        let second = root.join("agent-workspaces/second");
+        fs::create_dir_all(second.join("skills-inactive")).unwrap();
+        fs::write(root.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({
+            "version":2,"workspaces":[
+                {"id":"workspace-1","slug":"pilot","name":"Pilot"},
+                {"id":"workspace-2","slug":"second","name":"Second"}
+            ]
+        })).unwrap()).unwrap();
+        let name = "future-preset";
+        let app = templates.join(name);
+        let cached = root.join("default-skills").join(name);
+        let copies = [project.join("skills").join(name), second.join("skills-inactive").join(name)];
+        for directory in [&app, &cached, &copies[0], &copies[1]] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("SKILL.md"), "new preset version one").unwrap();
+        }
+        let inspect = || [&project, &second].map(|workspace| {
+            inspect_in(&root, workspace).unwrap().into_iter().find(|item| item.name == name).unwrap()
+        });
+        for copy in inspect() {
+            assert!(copy.bundled && copy.can_toggle(), "new app presets require no fixed slug list");
+        }
+        fs::write(app.join("SKILL.md"), "new preset version two").unwrap();
+        for copy in inspect() {
+            assert!(copy.bundled && !copy.can_toggle() && !copy.removable);
+            assert_eq!(copy.status, "preset_variant", "old configured copies retain display origin");
+        }
+        for directory in [&cached, &copies[0], &copies[1]] {
+            fs::copy(app.join("SKILL.md"), directory.join("SKILL.md")).unwrap();
+        }
+        for copy in inspect() {
+            assert!(copy.bundled && copy.can_toggle(), "updated copies are reverified on each scan");
+        }
+        let renamed = templates.join("renamed-preset");
+        fs::rename(&app, &renamed).unwrap();
+        for copy in inspect() {
+            assert!(!copy.bundled && !copy.can_toggle() && !copy.removable,
+                "a removed app entry never grants stale preset or user-uninstall rights");
+            assert!(copy.path.join("SKILL.md").is_file(), "scanning preserves retired copies");
+        }
+        let renamed_copy = second.join("skills-inactive/renamed-preset");
+        fs::create_dir(&renamed_copy).unwrap();
+        fs::copy(renamed.join("SKILL.md"), renamed_copy.join("SKILL.md")).unwrap();
+        let copy = inspect_in(&root, &second).unwrap().into_iter().find(|item| item.name == "renamed-preset").unwrap();
+        assert!(copy.bundled && copy.can_toggle(), "renamed app entries are discovered without a code change");
+        fs::rename(&templates, root.join("unavailable-app-templates")).unwrap();
+        for copy in inspect_in(&root, &second).unwrap() {
+            assert!(!copy.bundled && !copy.can_toggle() && !copy.removable,
+                "missing application evidence does not trust stale cache entries");
+        }
+    }
+
+    #[test]
     fn builtin_toggle_round_trip_preserves_the_entire_directory() {
         use std::os::unix::fs::PermissionsExt;
         let (_temp, root, project, bundles) = builtin_fixture();
@@ -2306,7 +2401,8 @@ mod tests {
         fs::create_dir_all(&cached).unwrap();
         fs::write(cached.join("SKILL.md"), "previous app version").unwrap();
         fs::copy(cached.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
-        assert!(!inspect()[0].bundled);
+        assert!(inspect()[0].bundled);
+        assert_eq!(inspect()[0].status, "preset_variant");
         assert!(!inspect()[0].can_toggle());
         let extra = defaults.join("user-added");
         fs::create_dir_all(&extra).unwrap();
