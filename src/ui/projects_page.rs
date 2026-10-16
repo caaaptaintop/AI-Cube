@@ -657,22 +657,28 @@ impl KitterApp {
             issues.push(format!("{} {unverified}", self.tr("待核验", "unverified")));
         }
         let has_issues = !issues.is_empty();
+        let inactive = copies.iter().all(|copy| copy.state.as_deref() == Some("inactive"));
+        let active_count = copies.iter().filter(|copy| copy.state.as_deref() == Some("active")).count();
         let activation = if copies.len() == 1 {
             state_label(copies[0]).to_string()
-        } else if workspace_count > 1 {
-            if self.uses_english() { format!("{workspace_count} workspaces") }
-            else { format!("{workspace_count} 个工作区") }
-        } else if self.uses_english() {
-            format!("{} copies", copies.len())
+        } else if inactive {
+            self.tr("已停用", "Inactive").to_string()
+        } else if active_count == copies.len() {
+            self.tr("已启用", "Active").to_string()
+        } else if active_count > 0 {
+            format!("{} {active_count}/{}", self.tr("部分启用", "Partly active"), copies.len())
         } else {
-            format!("{} 份副本", copies.len())
+            self.tr("状态未知", "Unknown state").to_string()
         };
         let label = if has_issues {
-            format!("Proma {}", issues.join(" · "))
+            format!("Proma {activation} · {}", issues.join(" · "))
         } else if copies.len() == 1 {
             format!("Proma {activation} · {}", status_label(copies[0]))
+        } else if workspace_count > 1 {
+            if self.uses_english() { format!("Proma {activation} · {workspace_count} workspaces") }
+            else { format!("Proma {activation} · {workspace_count} 个工作区") }
         } else {
-            format!("Proma · {activation}")
+            format!("Proma {activation} · {}", copies.len())
         };
         let details = copies.iter().map(|copy| {
             let reason = match copy.status.as_deref() {
@@ -707,14 +713,14 @@ impl KitterApp {
             .appearance(false).anchor(Anchor::TopLeft)
             .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{key}").into()))
                 .accessibility_label(format!("{name} · {label} · {}", self.tr("查看详情", "View details")))
-                .h(px(20.)).ml(px(8.)).px(px(6.)).rounded(px(7.5)).flex().items_center().gap(px(5.))
-                .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(11.))
-                .text_color(if has_issues { p.warning } else { p.muted })
-                .bg(if has_issues { p.raised } else { rgba(0x00000000) })
+                .h(px(26.)).ml(px(8.)).px(px(8.)).rounded(px(7.5)).flex().items_center().gap(px(5.))
+                .font_family(FONT_UI).font_weight(FontWeight::MEDIUM).text_size(px(12.))
+                .text_color(if has_issues { p.warning } else { p.secondary })
+                .bg(if has_issues || inactive { p.raised } else { rgba(0x00000000) })
                 .hover(move |button| button.bg(p.hover))
                 .styles(|styles| styles.selected(|style| style.bg(p.selected)))
+                .when(inactive, |button| button.child(Self::icon("icons/pause.svg", 12., p.secondary)))
                 .child(label)
-                .when(has_issues, |button| button.child(div().text_color(p.muted).child(format!("· {activation}"))))
                 .child(Self::icon("icons/chevron-down.svg", 10., p.muted)))
             .content(move |_, _, popover_cx| {
                 let workspaces = crate::proma::home().and_then(|root| crate::proma::workspaces(&root).ok()).unwrap_or_default();
@@ -753,6 +759,7 @@ impl KitterApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.palette();
+        let inactive = effective.is_inactive();
         let managed = effective
             .direct_installations
             .iter()
@@ -789,6 +796,7 @@ impl KitterApp {
             .border_color(p.border)
             .flex()
             .items_center()
+            .when(inactive, |row| row.bg(p.raised))
             .hover(move |row| row.bg(p.hover))
             .when(batch_mode && can_select, |row| {
                 row.child(
@@ -820,7 +828,7 @@ impl KitterApp {
             .child(div().size(px(15.)).flex_none().child(Self::icon(
                 "icons/package.svg",
                 15.,
-                p.secondary,
+                if inactive { p.muted } else { p.secondary },
             )))
             .child(
                 div()
@@ -841,6 +849,7 @@ impl KitterApp {
                                     .truncate()
                                     .font_family(MONO)
                                     .text_size(px(13.))
+                                    .text_color(if inactive { p.muted } else { p.text })
                                     .child(effective.name.clone())
                                     .when(!description.is_empty(), |name| {
                                         let tooltip_description = description.clone();
@@ -885,7 +894,7 @@ impl KitterApp {
                     ),
             )
             .child(
-                self.effective_agent_badges(format!("project-{key}"), &effective.agents, cx)
+                self.effective_agent_badges(format!("project-{key}"), &effective.agents, effective.proma_is_inactive(), cx)
                     .ml(px(12.)),
             );
         if batch_mode && can_select {

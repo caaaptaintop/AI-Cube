@@ -51,6 +51,7 @@ pub(super) struct SkillsState {
     pub selection: SkillSelection,
     pub selected_file: PathBuf,
     pub skill_search: Entity<InputState>,
+    pub search_descriptions: bool,
     pub content_snapshot: RefCell<Option<ContentSnapshot>>,
     pub content_scroll: ScrollHandle,
     pub selectable_text_handles: RefCell<BTreeMap<String, TextSelectionHandle>>,

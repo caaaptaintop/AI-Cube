@@ -682,8 +682,9 @@ impl KitterApp {
         cx.subscribe_in(
             &skill_search,
             window,
-            move |_, _, event: &InputEvent, _, cx| {
+            move |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.sync_skill_search_selection(cx);
                     skill_page_body.update(cx, |_, cx| cx.notify());
                 }
             },
@@ -853,6 +854,7 @@ impl KitterApp {
                 selection: SkillSelection::new(selected),
                 selected_file: PathBuf::from("SKILL.md"),
                 skill_search,
+                search_descriptions: false,
                 content_snapshot: RefCell::new(None),
                 content_scroll: ScrollHandle::new(),
                 selectable_text_handles: RefCell::new(BTreeMap::new()),
@@ -1115,6 +1117,7 @@ impl KitterApp {
             .map(|skill| skill_storage_name(skill).to_string())
             .collect::<Vec<_>>();
         self.skills_view.selection.reconcile(&order);
+        self.sync_skill_search_selection(cx);
         cx.notify();
     }
 
@@ -1687,6 +1690,71 @@ mod e2e_tests {
 
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+    }
+
+    #[test]
+    fn skill_search_hides_groups_and_keeps_detail_within_results() {
+        let mut cx = TestAppContext::single();
+        init(&mut cx);
+        let temp = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view({
+            let data = temp.path().join("data");
+            move |window, cx| KitterApp::new_in(data, window, cx)
+        });
+        let group_id = app.update_in(cx, |app, window, cx| {
+            let group = app.model.library.create_group("Documents").unwrap().id;
+            for (name, description) in [("pdf", "PDF editor"), ("kdocs", "Create PDF documents"), ("grill-me", "Interview plans")] {
+                let source = temp.path().join(name);
+                fs::create_dir_all(&source).unwrap();
+                fs::write(source.join("SKILL.md"), format!("---\nname: {name}\ndescription: {description}\n---\n")).unwrap();
+                crate::source::scan_local(&source).unwrap().import_selected(
+                    &mut app.model.library, &std::collections::HashSet::from([name.into()]), None,
+                ).unwrap();
+                app.model.library.assign_group(name, Some(&group)).unwrap();
+            }
+            app.model.library.create_group("Empty").unwrap();
+            app.refresh(cx);
+            app.skills_view.selection.select_one("grill-me".into());
+            app.skills_view.skill_search.update(cx, |input, cx| input.focus(window, cx));
+            group
+        });
+        cx.refresh().unwrap();
+        cx.simulate_input("pdf");
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let group_selector: &'static str = format!("sort-group-{group_id}").leak();
+        assert!(cx.debug_bounds(group_selector).is_none());
+        assert!(cx.debug_bounds("skill-pdf").is_some());
+        assert!(cx.debug_bounds("skill-kdocs").is_none());
+        cx.read_entity(&app, |app, cx| {
+            assert_eq!(app.skills_view.selection.primary(), Some("pdf"));
+            assert_eq!(app.visible_library_skills(cx).len(), 1);
+        });
+        app.update(cx, |app, cx| {
+            app.skills_view.search_descriptions = true;
+            assert_eq!(app.visible_library_skills(cx).len(), 2);
+            app.skills_view.selection.select_one("kdocs".into());
+            app.skills_view.search_descriptions = false;
+            app.sync_skill_search_selection(cx);
+            assert_eq!(app.skills_view.selection.primary(), Some("pdf"));
+        });
+        app.update_in(cx, |app, window, cx| {
+            app.skills_view.skill_search.update(cx, |input, cx| {
+                input.set_value("no-match-fixture", window, cx);
+                cx.emit(super::InputEvent::Change);
+            });
+        });
+        cx.run_until_parked();
+        cx.read_entity(&app, |app, _| assert!(app.skills_view.selection.primary().is_none()));
+        app.update_in(cx, |app, window, cx| {
+            app.skills_view.skill_search.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                cx.emit(super::InputEvent::Change);
+            });
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds(group_selector).is_some());
     }
 
     #[test]
