@@ -603,6 +603,7 @@ impl KitterApp {
         name: &str,
         key: &str,
         installations: &[ProjectSkillInstallation],
+        project: &Path,
         cx: &mut Context<Self>,
     ) -> Option<Popover> {
         let p = self.palette();
@@ -730,6 +731,9 @@ impl KitterApp {
         let close = self.tr("关闭详情", "Close details").to_string();
         let app = cx.entity().downgrade();
         let skill_keys = copies.iter().map(|copy| effective_view::installation_skill_key(copy)).collect::<Vec<_>>();
+        let conversion_paths = copies.iter().filter(|copy| matches!(copy.status.as_deref(), Some("external_link" | "broken_link")))
+            .map(|copy| copy.path.clone()).collect::<Vec<_>>();
+        let project = project.to_path_buf();
         let manage = if preset_only { self.tr("管理预设启停", "Manage preset state") } else { self.tr("管理安装与卸载", "Manage installations") }.to_string();
         let manage_action = if preset_only { if inactive { crate::cross_project::Action::Enable } else { crate::cross_project::Action::Disable } } else { crate::cross_project::Action::Remove };
         let convert = self.tr("转换为副本", "Convert to copies").to_string();
@@ -778,18 +782,18 @@ impl KitterApp {
                         if let Some(entity) = app.upgrade().filter(|_| !integration_only) {
                             controls = controls.child(entity.read(popover_cx).toolbar_text_button("proma-status-manage-workspaces", manage.clone())
                                 .on_click(popover_cx.listener({
-                                    let app = app.clone(); let keys = skill_keys.clone();
+                                    let app = app.clone(); let keys = skill_keys.clone(); let project = project.clone();
                                     move |_, _, window, cx| {
-                                        let _ = app.update(cx, |this, cx| this.open_cross_project(keys.clone(), None, manage_action, Some("proma".into()), window, cx));
+                                        let _ = app.update(cx, |this, cx| this.open_cross_project(keys.clone(), Some(project.clone()), manage_action, Some("proma".into()), window, cx));
                                         cx.emit(DismissEvent);
                                     }
                                 })));
                             if has_links {
                                 controls = controls.child(entity.read(popover_cx).toolbar_text_button("proma-status-convert-links", convert.clone())
                                     .on_click(popover_cx.listener({
-                                        let app = app.clone(); let keys = skill_keys.clone();
+                                        let app = app.clone(); let keys = skill_keys.clone(); let project = project.clone(); let paths = conversion_paths.clone();
                                         move |_, _, window, cx| {
-                                            let _ = app.update(cx, |this, cx| this.open_cross_project(keys.clone(), None, crate::cross_project::Action::Convert, Some("proma".into()), window, cx));
+                                            let _ = app.update(cx, |this, cx| this.open_proma_conversion(keys.clone(), project.clone(), paths.clone(), window, cx));
                                             cx.emit(DismissEvent);
                                         }
                                     })));
@@ -821,7 +825,7 @@ impl KitterApp {
             location_labels.push(self.tr("内置", "Built-in").to_string());
         }
         let locations = location_labels.join(" · ");
-        let proma_status = self.proma_installation_status(&effective.name, &effective.key, &effective.direct_installations, cx);
+        let proma_status = self.proma_installation_status(&effective.name, &effective.key, &effective.direct_installations, open_project, cx);
         let key = effective.key.clone();
         let description = effective.description.clone();
         let installed_for_delete = ProjectSkill {
