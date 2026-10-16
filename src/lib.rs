@@ -1,6 +1,7 @@
 pub mod adoption;
 pub mod agents;
 pub mod config;
+pub mod cross_project;
 mod directory_link;
 pub mod effective_skills;
 pub mod library;
@@ -8,6 +9,7 @@ pub mod model;
 pub mod project;
 pub mod project_discovery;
 pub mod proma;
+pub mod proma_batch;
 pub mod source;
 pub mod tags;
 pub mod text;

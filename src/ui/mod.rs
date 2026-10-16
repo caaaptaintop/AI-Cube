@@ -54,6 +54,7 @@ mod organize_flows;
 mod overlay_actions;
 mod project_actions;
 mod proma_sync;
+mod cross_project_flow;
 mod projects_page;
 mod selectable_text;
 mod selection_actions;
@@ -221,6 +222,7 @@ enum DialogKind {
     Groups,
     DeleteGroup,
     MoveGroup,
+    CrossProject,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -480,6 +482,7 @@ pub struct KitterApp {
     delete_flow: DeleteFlowState,
     tags_flow: TagsFlowState,
     groups_flow: GroupsFlowState,
+    cross_project: cross_project_flow::CrossProjectState,
 }
 
 impl KitterApp {
@@ -672,6 +675,7 @@ impl KitterApp {
             color: initial_palette.on_accent,
             size: 12.,
         });
+        let cross_project = cross_project_flow::CrossProjectState::new(english, window, cx);
         let app = cx.entity();
         let weak_app = app.downgrade();
         let page_body = cx.new(|cx| {
@@ -862,6 +866,7 @@ impl KitterApp {
                 collapsed_groups,
                 collapsed_content_directories: HashSet::new(),
             },
+            cross_project,
             projects_view: ProjectsState {
                 proma_directory_menu: None,
                 selected_skill_source: None,
@@ -957,6 +962,16 @@ impl KitterApp {
                 .into_iter().take(2).collect();
             app.install_flow.selected_targets = HashSet::from([InstallTarget::Codex, InstallTarget::Proma]);
             app.open_dialog(DialogKind::Install, cx);
+        }
+        if cfg!(debug_assertions) && std::env::var("KITTER_PREVIEW_PROMA_BATCH").as_deref() == Ok("1") {
+            let keys = app.model.skills.iter().filter(|skill| matches!(skill.record.name.as_str(), "humanizer-zh" | "pdf" | "writing-plans"))
+                .map(|skill| crate::proma_batch::source_key(&skill.path.join("SKILL.md"))).collect();
+            app.open_proma_batch(keys, None, false, cx);
+        }
+        if cfg!(debug_assertions) && std::env::var("KITTER_PREVIEW_CROSS_PROJECT").as_deref() == Ok("1") {
+            let keys = app.model.skills.iter().filter(|s| matches!(s.record.name.as_str(), "humanizer-zh" | "pdf" | "writing-plans"))
+                .map(|s| crate::proma_batch::source_key(&s.path.join("SKILL.md"))).collect();
+            app.open_cross_project(keys, None, crate::cross_project::Action::Install, None, cx);
         }
         app
     }
@@ -1317,6 +1332,7 @@ impl KitterApp {
         self.projects_view.project_agent_filter.agents.retain(installed);
         self.install_flow.selected_targets.retain(|target| *target == InstallTarget::Universal
             || self.model.installed_agents.iter().any(|agent| agent.owns_target(*target)));
+        self.cross_project_agents_changed();
         self.projects_view.scan_generation = self.projects_view.scan_generation.wrapping_add(1);
         self.projects_view.context_estimate_tasks.borrow_mut().clear();
         self.projects_view.context_estimates.borrow_mut().clear();
@@ -1486,6 +1502,7 @@ impl Render for DialogBody {
             DialogKind::Groups => app.group_management_modal(window, app_cx),
             DialogKind::DeleteGroup => app.group_delete_modal(app_cx),
             DialogKind::MoveGroup => app.move_group_modal(window, app_cx),
+            DialogKind::CrossProject => app.cross_project_modal(window, app_cx),
         })
     }
 }
@@ -1511,6 +1528,13 @@ impl Render for KitterApp {
             .relative()
             .track_focus(&self.shell.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("escape")
+                    && this.shell.dialog_body.as_ref().is_some_and(|body| matches!(body.read(cx).kind, DialogKind::CrossProject))
+                {
+                    this.close_dialog(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key.eq_ignore_ascii_case("escape")
                     && this.skills_view.selection.is_multiple()
                 {
@@ -1621,6 +1645,7 @@ impl Render for KitterApp {
                 DialogKind::Groups => px(420.),
                 DialogKind::DeleteGroup => px(460.),
                 DialogKind::MoveGroup => px(420.),
+                DialogKind::CrossProject => px((f32::from(window.bounds().size.width) - 40.).clamp(300., 980.)),
             };
             root = root.child(
                 div()
@@ -1638,7 +1663,7 @@ impl Render for KitterApp {
                     .child(
                         div()
                             .w(width)
-                            .max_h(if matches!(body.read(cx).kind, DialogKind::Install) {
+                            .max_h(if matches!(body.read(cx).kind, DialogKind::Install | DialogKind::CrossProject) {
                                 px((f32::from(window.bounds().size.height) - 40.).max(300.))
                             } else { px(680.) })
                             .rounded(px(RADIUS_MODAL))
@@ -2612,7 +2637,9 @@ pub fn run() {
         .run(|cx: &mut App| {
             cx.on_action(quit);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            cx.set_app_identity("dev.kitter.app", "Kitter");
+            let preview_id = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_ID").ok()).flatten();
+            let preview_name = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_NAME").ok()).flatten();
+            cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Kitter"));
             gpui_component::init(cx);
             crate::assets::register_fonts(cx).expect("failed to register fonts");
             cx.open_window(

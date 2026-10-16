@@ -150,6 +150,7 @@ impl KitterApp {
             self.tr("移动分组", "Move to group").to_string()
         };
         let delete_menu_color = p.danger;
+        let proma_label = self.tr("跨项目管理", "Manage across projects").to_string();
         let selection_mode = self.skills_view.selection.is_multiple();
         let context_name = storage_name.clone();
         let click_name = storage_name.clone();
@@ -295,6 +296,7 @@ impl KitterApp {
                 let set_tags_app = context_app.clone();
                 let move_app = context_app.clone();
                 let delete_app = context_app.clone();
+                let proma_app = context_app.clone();
                 let mut menu = menu.min_w(px(210.)).item(
                     PopupMenuItem::new(install_label.clone())
                         .icon(Icon::default().path("icons/download.svg"))
@@ -304,6 +306,10 @@ impl KitterApp {
                             });
                         }),
                 );
+                menu = menu.item(PopupMenuItem::new(proma_label.clone())
+                    .on_click(move |_, _, cx| {
+                        let _ = proma_app.update(cx, |this, cx| this.open_library_cross_project(cx));
+                    }));
                 if !multi_selection {
                     let reveal_path = reveal_path.clone();
                     menu = menu.item(
@@ -1701,6 +1707,9 @@ impl KitterApp {
             )
             .child(names)
             .child(self.window_drag_strip("multi-skill-detail-window-drag", 24., cx))
+            .child(div().px(px(24.)).pb(px(16.)).child(self.toolbar_text_button("cross-project-selected-skills", self.tr("跨项目管理", "Manage across projects"))
+                .tooltip({ let tip = self.cross_project_explanation(); move |window, cx| Tooltip::new(tip.clone()).build(window, cx) })
+                .on_click(cx.listener(|this, _, _, cx| this.open_library_cross_project(cx)))))
     }
 
     pub(super) fn skill_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2133,13 +2142,8 @@ impl KitterApp {
                 let project_path = display_path(&path);
                 let installations = self.skill_installations_at(skill, &path, cx);
                 let proma_inactive = effective_view::proma_copies_inactive(&installations);
-                let proma_states = installations.iter()
-                    .filter(|installation| installation.target == InstallTarget::Proma)
-                    .map(|installation| match installation.state.as_deref() {
-                        Some("active") => self.tr("Proma 已启用", "Proma active"),
-                        Some("inactive") => self.tr("Proma 已停用", "Proma inactive"),
-                        _ => self.tr("Proma 状态未知", "Proma unknown state"),
-                    }).collect::<Vec<_>>().join(" / ");
+                let proma_status = self.proma_installation_status(&skill.record.name,
+                    &format!("detail-{}-{index}", skill_storage_name(skill)), &installations, cx);
                 let targets = installations
                     .iter()
                     .map(|installation| installation.target)
@@ -2174,14 +2178,7 @@ impl KitterApp {
                                                 cx,
                                             ),
                                         ))
-                                        .when(!proma_states.is_empty(), |title| {
-                                            title.child(div().ml(px(8.)).px(px(8.)).h(px(26.)).rounded(px(7.5))
-                                                .flex_none().flex().items_center().gap(px(5.))
-                                                .text_size(px(12.)).font_weight(FontWeight::MEDIUM)
-                                                .text_color(p.secondary)
-                                                .when(proma_inactive, |status| status.bg(p.raised).child(Self::icon("icons/pause.svg", 12., p.secondary)))
-                                                .child(proma_states.clone()))
-                                        }),
+                                        .children(proma_status),
                                 )
                                 .child(
                                     div()

@@ -1069,6 +1069,21 @@ impl KitterApp {
         )
     }
 
+    pub(super) fn toolbar_text_button(
+        &self, id: impl Into<ElementId>, label: impl Into<SharedString>,
+    ) -> gpui_base::Button {
+        let p = self.palette();
+        let label = label.into();
+        gpui_base::Button::new(id).accessibility_label(label.clone())
+            .h(px(CONTROL_HEIGHT)).flex_shrink_0().px(px(8.)).rounded(px(RADIUS_CONTROL))
+            .border_0().bg(rgba(0x00000000)).text_color(p.text)
+            .font_family(FONT_UI).font_weight(FontWeight::NORMAL).text_size(px(12.))
+            .flex().items_center().justify_center()
+            .hover(move |button| button.bg(p.hover)).active(move |button| button.bg(p.selected))
+            .styles(|styles| styles.disabled(|style| style.bg(rgba(0x00000000)).text_color(p.muted)))
+            .child(div().line_height(relative(1.5)).child(label))
+    }
+
     pub(super) fn dropdown_button(
         &self,
         id: &'static str,
@@ -1119,6 +1134,7 @@ impl KitterApp {
             self.tr("检查更新", "Check for updates"),
             self.tr("标签管理", "Manage tags"),
             self.tr("分组管理", "Manage groups"),
+            self.tr("跨项目管理", "Manage across projects"),
         ];
         Popover::new("skills-manage-menu")
             .appearance(false)
@@ -1173,7 +1189,8 @@ impl KitterApp {
                                 let _ = item_app.update(cx, |this, cx| match index {
                                     0 => this.check_all_updates(cx),
                                     1 => this.open_tag_dialog(TagScope::Skills, cx),
-                                    _ => this.open_group_dialog(cx),
+                                    2 => this.open_group_dialog(cx),
+                                    _ => this.open_library_cross_project(cx),
                                 });
                                 cx.emit(DismissEvent);
                             })),

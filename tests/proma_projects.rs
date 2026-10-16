@@ -199,7 +199,17 @@ fn isolated_proma_scope_excludes_unrelated_agent_globals() {
     fs::create_dir(&local_codex).unwrap();
     fs::write(local_codex.join("SKILL.md"), "---\nname: local-codex\ndescription: Local Agent installation\n---\n").unwrap();
     let local = inspect(&workspace);
-    assert_eq!(local["agents"].as_array().unwrap().iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["proma"]);
+    let agents = local["agents"].as_array().unwrap();
+    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["codex", "proma"]);
+    assert!(agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="local-codex"));
+    fs::remove_file(local_codex.join("SKILL.md")).unwrap();
+    fs::remove_dir(&local_codex).unwrap();
+    let isolated_again = inspect(&workspace);
+    let agents = isolated_again["agents"].as_array().unwrap();
+    assert_eq!(agents.iter().map(|e| e["agent"].as_str().unwrap()).collect::<Vec<_>>(), ["proma"]);
+    assert!(!agents.iter().flat_map(|e| e["skills"].as_array().unwrap()).any(|s| s["name"]=="foreign-codex-global"));
+    fs::create_dir(&local_codex).unwrap();
+    fs::write(local_codex.join("SKILL.md"), "---\nname: local-codex\ndescription: Local Agent installation\n---\n").unwrap();
     fs::write(root.join("codex/.codex-global-state.json"), serde_json::to_vec(&json!({
         "local-projects":{"shared":{"name":"Shared","rootPaths":[workspace]}}
     })).unwrap()).unwrap();

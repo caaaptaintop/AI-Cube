@@ -8,6 +8,7 @@ impl KitterApp {
     }
 
     pub(super) fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.cross_project_busy() { return; }
         if self
             .shell
             .dialog_body

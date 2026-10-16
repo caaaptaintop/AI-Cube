@@ -16,7 +16,7 @@ use crate::effective_skills::AgentKind;
 pub struct ProjectEntry {
     pub path: PathBuf,
     pub name: String,
-    /// Agents whose project catalogs explicitly contain this directory.
+    /// Agents associated by a native catalog or explicit project installation.
     pub agents: Vec<AgentKind>,
     /// Native Skill roots remain separate from the Finder display identity.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -130,7 +130,13 @@ fn discover_catalogs(codex: Option<&Path>, proma: Option<&Path>, previous: &[Pro
     if failure.is_some() {
         for entry in &mut entries { entry.archived = false; }
     }
-    Ok(all_projects(&[], &entries, &BTreeSet::new(), &BTreeSet::new()))
+    let mut merged = all_projects(&[], &entries, &BTreeSet::new(), &BTreeSet::new());
+    for entry in &mut merged {
+        for agent in local_installation_agents(&entry.path) {
+            if !entry.agents.contains(&agent) { entry.agents.push(agent); }
+        }
+    }
+    Ok(merged)
 }
 
 pub fn discover_codex_projects(home: &Path) -> Result<Vec<ProjectEntry>> {
@@ -239,10 +245,24 @@ pub fn agents_for_project(
     }
     let identity = project_identity(path, discovered);
     let entry = discovered.iter().find(|entry| path_identity(&entry.path) == identity);
+    let local_agents = local_installation_agents(&identity);
     agents.iter().copied().filter(|info| {
         entry.is_none_or(|entry| entry.agents.is_empty()
             || entry.agents.iter().any(|agent| agent.id() == info.id))
+            || local_agents.iter().any(|agent| agent.id() == info.id)
     }).collect()
+}
+
+fn local_installation_agents(project: &Path) -> Vec<AgentKind> {
+    use crate::agents::{self, installation_root};
+    if dirs::home_dir().is_some_and(|home| path_identity(&home) == path_identity(project)) { return Vec::new(); }
+    let targets = agents::PROJECT_INSTALL_TARGETS.iter().copied().filter(|target| {
+        std::fs::read_dir(installation_root(project, *target)).into_iter().flatten().flatten()
+            .any(|entry| entry.path().join("SKILL.md").is_file())
+    }).collect::<Vec<_>>();
+    agents::AGENT_ICON_ORDER.iter().filter(|agent| !agent.global_only && targets.iter().any(|target| {
+        agent.owns_target(*target) || (*target == crate::InstallTarget::Universal && agent.shared_agents)
+    })).filter_map(|agent| AgentKind::from_id(agent.id)).collect()
 }
 
 /// A Finder project is one row, even when an Agent stores Skills elsewhere.
@@ -321,6 +341,24 @@ pub fn all_projects(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn explicit_local_installs_extend_agent_scope_without_unrelated_global_agents() {
+        let temp = tempfile::tempdir().unwrap(); let project = temp.path().join("business");
+        std::fs::create_dir_all(project.join("skills/plain")).unwrap();
+        std::fs::write(project.join("skills/plain/SKILL.md"), "ordinary business content").unwrap();
+        let entries = vec![ProjectEntry { path:project.clone(), name:"Business".into(), agents:vec![AgentKind::Proma],
+            proma_workspaces:vec![], archived:false, hidden:false, retained:false }];
+        let agents = crate::agents::AGENT_ICON_ORDER.iter().filter(|a| ["codex","cursor","grok","proma"].contains(&a.id)).copied().collect::<Vec<_>>();
+        assert_eq!(agents_for_project(&project, &agents, &entries).iter().map(|a| a.id).collect::<Vec<_>>(), vec!["proma"]);
+        std::fs::create_dir_all(project.join(".grok/skills/example")).unwrap();
+        std::fs::write(project.join(".grok/skills/example/SKILL.md"), "explicit Grok install").unwrap();
+        let scope = agents_for_project(&project, &agents, &entries);
+        assert!(scope.iter().any(|a| a.id == "grok")); assert!(scope.iter().any(|a| a.id == "proma"));
+        assert!(!scope.iter().any(|a| a.id == "codex" || a.id == "cursor"));
+        std::fs::remove_file(project.join(".grok/skills/example/SKILL.md")).unwrap();
+        assert!(!agents_for_project(&project, &agents, &entries).iter().any(|a| a.id == "grok"));
+    }
 
     #[test]
     fn project_agent_scope_follows_catalog_aliases_and_preserves_global_inspection() {
