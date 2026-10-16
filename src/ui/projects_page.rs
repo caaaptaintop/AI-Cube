@@ -18,9 +18,9 @@ fn selected_project_skills(
 impl KitterApp {
     fn project_batch_action_label(&self, action: ProjectBatchAction) -> &'static str {
         match action {
-            ProjectBatchAction::Remove => self.tr("移除安装", "Remove installs"),
-            ProjectBatchAction::DisableProma => self.tr("停用 Proma", "Disable Proma"),
-            ProjectBatchAction::EnableProma => self.tr("启用 Proma", "Enable Proma"),
+            ProjectBatchAction::Remove => self.tr("卸载用户技能", "Uninstall user skills"),
+            ProjectBatchAction::DisableProma => self.tr("停用内置预设", "Disable built-in presets"),
+            ProjectBatchAction::EnableProma => self.tr("启用内置预设", "Enable built-in presets"),
         }
     }
 
@@ -28,7 +28,7 @@ impl KitterApp {
         match self.projects_view.batch_action {
             ProjectBatchAction::Remove => {
                 if row.direct_installations.iter().any(|item| item.bundled) {
-                    self.tr("Proma 内置预设可停用，请切换到“停用 Proma”", "Switch to Disable Proma to deactivate built-in presets")
+                    self.tr("Proma 内置预设可停用，请切换到“停用内置预设”", "Switch to Disable built-in presets to deactivate them")
                 } else if row.direct_installations.is_empty() {
                     self.tr("此项来自全局、父目录或系统；此项目没有可移除的安装", "Inherited or system skill; no removable installation in this project")
                 } else {
@@ -43,12 +43,12 @@ impl KitterApp {
                     self.tr("此项目没有该技能的 Proma 副本；全局和系统来源不受此操作影响", "No Proma copy in this project; inherited and system sources are unaffected")
                 } else if proma.iter().any(|item| item.toggleable) {
                     if action == ProjectBatchAction::DisableProma {
-                        self.tr("Proma 副本已停用；切换到“启用 Proma”可恢复", "Already inactive; switch to Enable Proma to restore")
+                        self.tr("Proma 内置预设已停用；切换到“启用内置预设”可恢复", "Already inactive; switch to Enable built-in presets to restore")
                     } else {
-                        self.tr("Proma 副本已启用；切换到“停用 Proma”可停用", "Already active; switch to Disable Proma to deactivate")
+                        self.tr("Proma 内置预设已启用；切换到“停用内置预设”可停用", "Already active; switch to Disable built-in presets to deactivate")
                     }
                 } else {
-                    self.tr("只支持已核验的内置预设和完好的 Kitter 受管副本；此副本受保护", "Only verified built-in presets and intact Kitter-managed copies can be changed")
+                    self.tr("启停仅用于已核验的 Proma 内置预设；用户技能请安装或卸载", "Only verified Proma built-in presets can change state; install or uninstall user skills")
                 }
             }
         }.to_string()
@@ -95,13 +95,13 @@ impl KitterApp {
         let enabled = self.projects_view.batch_action == ProjectBatchAction::EnableProma;
         let action = self.tr(if enabled { "启用" } else { "停用" }, if enabled { "Enable" } else { "Disable" }).to_string();
         let has_selection = !selected.is_empty();
-        let title = if self.uses_english() { format!("{action} {} skills in Proma", selected.len()) }
-            else { format!("在 Proma 中{action} {} 个技能", selected.len()) };
+        let title = if self.uses_english() { format!("{action} {} built-in presets in Proma", selected.len()) }
+            else { format!("在 Proma 中{action} {} 个内置预设", selected.len()) };
         let description = self.tr(
-            if enabled { "将以下工作区副本移回 skills。全局及系统来源保持不变。" }
-            else { "将以下工作区副本移到 skills-inactive，保留文件，可随时重新启用。全局及系统来源保持不变。" },
-            if enabled { "Move these workspace copies back to skills. Global and system sources remain unchanged." }
-            else { "Move these workspace copies to skills-inactive. Files are retained and can be enabled again. Global and system sources remain unchanged." }
+            if enabled { "启用以下工作区的 Proma 内置预设，将保留的预设文件移回启用目录。" }
+            else { "停用以下工作区的 Proma 内置预设，保留文件，可随时重新启用。用户技能使用卸载管理。" },
+            if enabled { "Enable these Proma built-in presets by restoring their retained files to skills." }
+            else { "Disable these Proma built-in presets while retaining their files. Use uninstall for user skills." }
         ).to_string();
         let cancel = self.tr("取消", "Cancel").to_string();
         Popover::new("project-proma-state-confirmation").appearance(false).anchor(Anchor::TopRight)
@@ -570,11 +570,11 @@ impl KitterApp {
             let explanation = self.cross_project_explanation();
             controls = controls.child(self.toolbar_text_button("project-cross-project", self.tr("跨项目管理", "Manage across projects"))
                 .tooltip(move |window, cx| Tooltip::new(explanation.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     let action = match action { ProjectBatchAction::Remove => crate::cross_project::Action::Remove,
                         ProjectBatchAction::EnableProma => crate::cross_project::Action::Enable,
                         ProjectBatchAction::DisableProma => crate::cross_project::Action::Disable };
-                    this.open_cross_project(keys.clone(), Some(project.clone()), action, None, cx);
+                    this.open_cross_project(keys.clone(), Some(project.clone()), action, None, window, cx);
                 })));
         }
         controls.child(
@@ -624,9 +624,15 @@ impl KitterApp {
             Some("update_pending") => 1,
             _ => 2,
         });
+        let preset_only = copies.iter().all(|copy| copy.bundled);
+        let integration_only = copies.iter().all(|copy| copy.integration.is_some());
+        let has_links = copies.iter().any(|copy| matches!(copy.status.as_deref(), Some("external_link" | "broken_link")));
         let state_label = |copy: &ProjectSkillInstallation| match copy.state.as_deref() {
-            Some("active") => self.tr("已启用", "Active"),
-            Some("inactive") => self.tr("已停用", "Inactive"),
+            _ if copy.status.as_deref() == Some("broken_link") => self.tr("待清理", "Needs cleanup"),
+            Some("active") if copy.bundled => self.tr("已启用", "Active"),
+            Some("inactive") if copy.bundled => self.tr("已停用", "Inactive"),
+            Some("active") => self.tr("已安装", "Installed"),
+            Some("inactive") => self.tr("旧停用副本", "Legacy inactive copy"),
             _ => self.tr("状态未知", "Unknown state"),
         };
         let status_label = |copy: &ProjectSkillInstallation| match copy.status.as_deref() {
@@ -635,7 +641,8 @@ impl KitterApp {
             Some("current") => self.tr("最新", "Current").to_string(),
             Some("update_pending") => self.tr("待同步", "Update pending").to_string(),
             Some("modified") => self.tr("副本已修改", "Modified").to_string(),
-            Some("external_link") => self.tr("外部链接", "External link").to_string(),
+            Some("external_link") => self.tr("软链接安装", "Link installation").to_string(),
+            Some("broken_link") => self.tr("失效链接", "Broken link").to_string(),
             Some("unmanaged") => self.tr("未托管", "Unmanaged").to_string(),
             _ => self.tr("待核验", "Unverified").to_string(),
         };
@@ -657,7 +664,7 @@ impl KitterApp {
             .filter(|copy| {
                 !copy.bundled && copy.integration.is_none() && !matches!(
                     copy.status.as_deref(),
-                    Some("current" | "modified" | "update_pending" | "external_link" | "unmanaged")
+                    Some("current" | "modified" | "update_pending" | "external_link" | "broken_link" | "unmanaged")
                 )
             })
             .count();
@@ -670,11 +677,11 @@ impl KitterApp {
         let activation = if copies.len() == 1 {
             state_label(copies[0]).to_string()
         } else if inactive {
-            self.tr("已停用", "Inactive").to_string()
+            if preset_only { self.tr("已停用", "Inactive") } else { self.tr("旧停用副本", "Legacy inactive copies") }.to_string()
         } else if active_count == copies.len() {
-            self.tr("已启用", "Active").to_string()
+            if preset_only { self.tr("已启用", "Active") } else { self.tr("已安装", "Installed") }.to_string()
         } else if active_count > 0 {
-            format!("{} {active_count}/{}", self.tr("部分启用", "Partly active"), copies.len())
+            format!("{} {active_count}/{}", if preset_only { self.tr("部分启用", "Partly active") } else { self.tr("部分位于启用目录", "Partly in active directory") }, copies.len())
         } else {
             self.tr("状态未知", "Unknown state").to_string()
         };
@@ -694,9 +701,10 @@ impl KitterApp {
                 _ if copy.integration.is_some() => self.tr("此副本由集成维护，不参与本地技能自动同步。", "Managed by an integration; excluded from local skill auto-sync."),
                 Some("modified") => self.tr("副本已自行修改，现有内容已保留；自动同步不会覆盖。", "This copy has local changes. Its contents are preserved and auto-sync will not overwrite them."),
                 Some("update_pending") => self.tr("副本与来源不同。已登记的本地技能会在内容稳定后自动同步；同步遇到冲突时保留现有副本。", "This copy differs from its source. Registered local skills sync after edits settle; conflicts preserve the existing copy."),
-                Some("external_link") => self.tr("此目录是外部链接，不参与实体镜像自动同步。", "This directory is an external link; excluded from mirror auto-sync."),
+                Some("external_link") => self.tr("这是旧软链接安装。可以仅移除链接，保留源文件；来源已在 Kitter 收录时可转换为工作区副本。", "This is a legacy link. Remove only the link, or convert it to a workspace copy when its source is registered in Kitter."),
+                Some("broken_link") => self.tr("链接目标已不存在，可以清理工作区里的链接入口。", "The link target is missing. Remove the broken link from this workspace."),
                 Some("unmanaged") => self.tr("此副本未由 Kitter 托管，不参与本地技能自动同步。", "This copy is not managed by Kitter; excluded from local skill auto-sync."),
-                Some("current") if copy.state.as_deref() == Some("inactive") => self.tr("副本与来源一致，文件保留在停用目录。", "Matches its source and remains in the inactive directory."),
+                Some("current") if copy.state.as_deref() == Some("inactive") => self.tr("这是以前保留在停用目录的用户副本。可卸载，或从 Kitter 重新安装；用户技能不再提供启停。", "This legacy user copy remains in the inactive directory. Uninstall it or reinstall it from Kitter; user skills no longer have state toggles."),
                 Some("current") => self.tr("副本与来源一致。", "This copy matches its source."),
                 _ => self.tr("尚未核验副本状态，现有内容已保留。", "Copy status is unverified; its existing contents are preserved."),
             };
@@ -714,12 +722,14 @@ impl KitterApp {
         } else {
             format!("此项目关联的 {workspace_count} 个 Proma 工作区")
         };
-        let separate_states = self.tr("启停状态分别作用于各工作区。", "Activation applies separately in each workspace.").to_string();
+        let separate_states = self.tr("安装、卸载和预设启停分别作用于所选工作区。", "Installations, uninstalls and preset state changes apply to selected workspaces.").to_string();
         let workspace_label = self.tr("工作区", "Workspace").to_string();
         let close = self.tr("关闭详情", "Close details").to_string();
         let app = cx.entity().downgrade();
         let skill_keys = copies.iter().map(|copy| effective_view::installation_skill_key(copy)).collect::<Vec<_>>();
-        let manage = self.tr("跨项目管理", "Manage across projects").to_string();
+        let manage = if preset_only { self.tr("管理预设启停", "Manage preset state") } else { self.tr("管理安装与卸载", "Manage installations") }.to_string();
+        let manage_action = if preset_only { if inactive { crate::cross_project::Action::Enable } else { crate::cross_project::Action::Disable } } else { crate::cross_project::Action::Remove };
+        let convert = self.tr("转换为副本", "Convert to copies").to_string();
         Some(Popover::new(ElementId::Name(format!("proma-status-{key}").into()))
             .appearance(false).anchor(Anchor::TopLeft)
             .trigger(gpui_base::Button::new(ElementId::Name(format!("proma-status-trigger-{key}").into()))
@@ -760,15 +770,30 @@ impl KitterApp {
                     .child(div().text_size(px(11.)).text_color(p.muted).child(scope.clone()))
                     .when(multiple, |panel| panel.child(div().text_size(px(11.)).text_color(p.secondary).child(separate_states.clone())))
                     .child(list)
-                    .child(Button::new("proma-status-manage-workspaces").small().label(manage.clone())
-                        .on_click(popover_cx.listener({
-                            let app = app.clone();
-                            let keys = skill_keys.clone();
-                            move |_, _, _, cx| {
-                                let _ = app.update(cx, |this, cx| this.open_proma_batch(keys.clone(), None, inactive, cx));
-                                cx.emit(DismissEvent);
+                    .child({
+                        let mut controls = div().flex().items_center().gap(px(5.));
+                        if let Some(entity) = app.upgrade().filter(|_| !integration_only) {
+                            controls = controls.child(entity.read(popover_cx).toolbar_text_button("proma-status-manage-workspaces", manage.clone())
+                                .on_click(popover_cx.listener({
+                                    let app = app.clone(); let keys = skill_keys.clone();
+                                    move |_, _, window, cx| {
+                                        let _ = app.update(cx, |this, cx| this.open_cross_project(keys.clone(), None, manage_action, Some("proma".into()), window, cx));
+                                        cx.emit(DismissEvent);
+                                    }
+                                })));
+                            if has_links {
+                                controls = controls.child(entity.read(popover_cx).toolbar_text_button("proma-status-convert-links", convert.clone())
+                                    .on_click(popover_cx.listener({
+                                        let app = app.clone(); let keys = skill_keys.clone();
+                                        move |_, _, window, cx| {
+                                            let _ = app.update(cx, |this, cx| this.open_cross_project(keys.clone(), None, crate::cross_project::Action::Convert, Some("proma".into()), window, cx));
+                                            cx.emit(DismissEvent);
+                                        }
+                                    })));
                             }
-                        })))
+                        }
+                        controls
+                    })
             }))
     }
 

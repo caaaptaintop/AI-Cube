@@ -1185,12 +1185,12 @@ impl KitterApp {
                             .text_size(px(13.))
                             .hover(move |row| row.bg(p.hover))
                             .child(label)
-                            .on_click(popover_cx.listener(move |_, _, _, cx| {
+                            .on_click(popover_cx.listener(move |_, _, window, cx| {
                                 let _ = item_app.update(cx, |this, cx| match index {
                                     0 => this.check_all_updates(cx),
                                     1 => this.open_tag_dialog(TagScope::Skills, cx),
                                     2 => this.open_group_dialog(cx),
-                                    _ => this.open_library_cross_project(cx),
+                                    _ => this.open_library_cross_project(window, cx),
                                 });
                                 cx.emit(DismissEvent);
                             })),

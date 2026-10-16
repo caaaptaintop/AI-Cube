@@ -723,6 +723,7 @@ impl KitterApp {
                 let deletes_files = kinds
                     .iter()
                     .any(|kind| matches!(kind, project::RemovalKind::SourceFiles));
+                let links_only = !kinds.is_empty() && kinds.iter().all(|kind| matches!(kind, project::RemovalKind::ExternalLink { .. }));
                 let external_sources = unique_external_sources(&kinds);
                 let message = if *batch && global_scope {
                     self.tr(
@@ -774,38 +775,38 @@ impl KitterApp {
                 (
                     if *batch && global_scope {
                         self.tr(
-                            "从用户级目录移除所选技能？",
-                            "Remove selected skills from user-level locations?",
+                            "从用户级目录卸载所选技能？",
+                            "Uninstall selected skills from user-level locations?",
                         )
                         .to_string()
                     } else if *batch {
                         self.tr(
-                            "从此项目移除所选技能？",
-                            "Remove selected skills from this project?",
+                            "从此项目卸载所选技能？",
+                            "Uninstall selected skills from this project?",
                         )
                         .to_string()
                     } else if global_scope && self.uses_english() {
-                        format!("Remove “{}” from user-level locations?", skills[0].name)
+                        format!("Uninstall “{}” from user-level locations?", skills[0].name)
                     } else if global_scope {
-                        format!("从用户级目录中移除「{}」？", skills[0].name)
+                        format!("从用户级目录中卸载「{}」？", skills[0].name)
                     } else if self.uses_english() {
-                        format!("Remove “{}” from this project?", skills[0].name)
+                        format!("Uninstall “{}” from this project?", skills[0].name)
                     } else {
-                        format!("从这个项目中移除「{}」？", skills[0].name)
+                        format!("从这个项目中卸载「{}」？", skills[0].name)
                     },
                     message.to_string(),
                     (!*batch && !external_sources.is_empty()).then(|| external_sources.join("\n")),
-                    if *batch {
-                        self.tr("移除", "Remove")
+                    if links_only {
+                        self.tr("仅移除链接", "Remove links only")
                     } else if deletes_files {
                         self.tr("删除", "Delete")
                     } else {
-                        self.tr("移除", "Remove")
+                        self.tr("卸载", "Uninstall")
                     },
                     if global_scope {
-                        self.tr("已从用户级目录中移除", "Removed from user-level locations")
+                        self.tr("已从用户级目录中卸载", "Uninstalled from user-level locations")
                     } else {
-                        self.tr("已从项目中移除", "Removed from project")
+                        self.tr("已从项目中卸载", "Uninstalled from project")
                     },
                 )
             }
@@ -877,7 +878,7 @@ impl KitterApp {
                     .mb(px(6.))
                     .text_size(px(13.))
                     .text_color(p.secondary)
-                    .child(self.tr("选择要移除的位置", "Choose installations to remove")),
+                    .child(self.tr("选择要卸载的位置", "Choose installations to uninstall")),
             );
             for skill in skills {
                 if *batch || skills.len() > 1 {

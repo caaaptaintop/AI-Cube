@@ -58,7 +58,9 @@ impl Catalog {
                     name: copy.name.clone(),
                     source: copy.source.clone().unwrap_or_else(|| copy.path.clone()),
                     provider: if copy.managed { "managed" } else if copy.bundled { "builtin" }
-                        else if copy.integration.is_some() { "integration" } else { "unmanaged" },
+                        else if copy.integration.is_some() { "integration" }
+                        else if copy.status == "broken_link" { "broken-link" }
+                        else if copy.status == "external_link" { "link" } else { "unmanaged" },
                 });
             }
             let identities = installations.iter().map(|copy| (copy.path.clone(), installation_key(copy))).collect();
@@ -101,7 +103,8 @@ impl Catalog {
 fn protection_reason(copy: &Installation) -> &'static str {
     match copy.status.as_str() {
         "modified" => "副本已修改，保留现有内容",
-        "external_link" => "外部链接，不支持实体副本启停",
+        "external_link" | "broken_link" => "旧软链接请在用户技能中移除或转换为副本",
+        _ if copy.managed => "用户技能使用安装、卸载；启用、停用仅用于 Proma 内置预设",
         _ if copy.integration.is_some() => "由集成维护，不支持在此启停",
         "unmanaged" if !copy.bundled => "未托管副本，无法核验来源",
         _ => "副本受保护或工作区有待恢复操作，请检查后刷新",
@@ -217,10 +220,15 @@ mod tests {
             Self { _temp: temp, root, source, workspaces }
         }
         fn install(&self, workspace: usize, name: &str) {
-            proma::apply_plan(&proma::plan_install(&self.root, &self.workspaces[workspace], &self.source.join(name), name).unwrap()).unwrap();
+            let template = self.root.join("fixture-app/default-skills").join(name);
+            let copy = self.workspaces[workspace].join("skills").join(name);
+            fs::create_dir_all(&template).unwrap(); fs::create_dir_all(&copy).unwrap();
+            fs::copy(self.source.join(name).join("SKILL.md"), template.join("SKILL.md")).unwrap();
+            fs::copy(template.join("SKILL.md"), copy.join("SKILL.md")).unwrap();
+            proma::register_test_bundled_templates(&self.root, &self.root.join("fixture-app/default-skills"));
         }
         fn skills(&self, names: &[&str]) -> BTreeSet<String> {
-            names.iter().map(|name| source_key(&self.source.join(name).join("SKILL.md"))).collect()
+            names.iter().map(|name| format!("proma:builtin:{name}")).collect()
         }
         fn plan(&self, names: &[&str], enabled: bool) -> Plan {
             Catalog::scan(&self.root).unwrap().plan(&self.skills(names), &BTreeSet::from(["a".into(), "b".into()]), enabled)
@@ -258,7 +266,7 @@ mod tests {
         f.install(0, "alpha");
         let other = f.source.join("other-alpha");
         fs::create_dir(&other).unwrap();
-        fs::copy(f.source.join("alpha/SKILL.md"), other.join("SKILL.md")).unwrap();
+        fs::write(other.join("SKILL.md"), "---\nname: alpha\ndescription: Other source\n---\nIndependent user skill.\n").unwrap();
         proma::apply_plan(&proma::plan_install(&f.root, &f.workspaces[1], &other, "alpha").unwrap()).unwrap();
         let unmanaged = f.workspaces[2].join("skills/alpha");
         fs::create_dir_all(&unmanaged).unwrap();
@@ -306,14 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn changed_workspace_identity_or_source_is_rejected() {
+    fn changed_workspace_identity_or_preset_content_is_rejected() {
         let f = Fixture::new();
         for i in 0..2 { f.install(i, "alpha"); }
         let plan = f.plan(&["alpha"], false);
-        let marker_path = f.workspaces[0].join("skills/alpha/.kitter-proma.json");
-        let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-        marker["source"] = serde_json::json!(f.source.join("beta"));
-        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::write(f.workspaces[0].join("skills/alpha/SKILL.md"), "modified preset").unwrap();
         let index_path = f.root.join("agent-workspaces.json");
         let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
         index["workspaces"][1]["id"] = serde_json::json!("replaced-b");
@@ -330,7 +335,8 @@ mod tests {
         let path = f.workspaces[0].join("skills/alpha/SKILL.md");
         fs::write(&path, "keep modified copy").unwrap();
         fs::write(f.workspaces[1].join("skills"), "invalid directory").unwrap();
-        let plan = f.plan(&["alpha"], false);
+        let plan = Catalog::scan(&f.root).unwrap().plan(&BTreeSet::from([source_key(&path)]),
+            &BTreeSet::from(["a".into(), "b".into()]), false);
         assert_eq!(plan.count(Disposition::Protected), 1);
         assert_eq!(plan.count(Disposition::Unavailable), 1);
         assert_eq!(plan.execute().changed(), 0);
@@ -343,7 +349,7 @@ mod tests {
         f.install(0, "alpha");
         let copy = f.workspaces[0].join("skills-inactive/alpha");
         fs::create_dir_all(&copy).unwrap();
-        for name in ["SKILL.md", ".kitter-proma.json"] {
+        for name in ["SKILL.md"] {
             fs::copy(f.workspaces[0].join("skills/alpha").join(name), copy.join(name)).unwrap();
         }
         let plan = f.plan(&["alpha"], false);
@@ -352,16 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn source_replaced_after_batch_preflight_is_rejected_inside_write_lock() {
+    fn preset_modified_after_batch_preflight_is_rejected_inside_write_lock() {
         let f = Fixture::new();
         f.install(0, "alpha");
         let plan = f.plan(&["alpha"], false);
-        let marker_path = f.workspaces[0].join("skills/alpha/.kitter-proma.json");
-        let other = f.source.join("beta");
+        let preset_path = f.workspaces[0].join("skills/alpha/SKILL.md");
         proma::BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
-            let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-            marker["source"] = serde_json::json!(other);
-            fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            fs::write(preset_path, "keep concurrent edit").unwrap();
         })));
         let result = plan.execute();
         assert_eq!((result.changed(), result.failed()), (0, 1));
@@ -375,14 +378,10 @@ mod tests {
         f.install(0, "alpha");
         let plan = f.plan(&["alpha"], false);
         let index_path = f.root.join("agent-workspaces.json");
-        let marker_path = f.workspaces[0].join("skills/alpha/.kitter-proma.json");
         proma::BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
             let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
             index["workspaces"][0]["id"] = serde_json::json!("replaced-a");
             fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
-            let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
-            marker["workspace_id"] = serde_json::json!("replaced-a");
-            fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
         })));
         let result = plan.execute();
         assert_eq!((result.changed(), result.failed()), (0, 1));
@@ -391,31 +390,28 @@ mod tests {
     }
 
     #[test]
-    fn source_link_retargeted_after_batch_preflight_is_rejected_inside_write_lock() {
+    fn user_copies_cannot_be_toggled_or_moved_into_inactive() {
         let f = Fixture::new();
-        f.install(0, "alpha");
-        let plan = f.plan(&["alpha"], false);
-        let source = f.source.clone();
-        proma::BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(source.join("alpha"), source.join("alpha-original")).unwrap();
-            std::os::unix::fs::symlink(source.join("beta"), source.join("alpha")).unwrap();
-        })));
-        let result = plan.execute();
-        assert_eq!((result.changed(), result.failed()), (0, 1));
-        assert!(f.workspaces[0].join("skills/alpha/SKILL.md").is_file());
-        assert!(!f.workspaces[0].join("skills-inactive").exists());
+        for workspace in &f.workspaces[..2] {
+            proma::apply_plan(&proma::plan_install(&f.root, workspace, &f.source.join("alpha"), "alpha").unwrap()).unwrap();
+        }
+        let catalog = Catalog::scan(&f.root).unwrap();
+        let keys = BTreeSet::from([source_key(&f.source.join("alpha/SKILL.md"))]);
+        let plan = catalog.plan(&keys, &BTreeSet::from(["a".into(), "b".into()]), false);
+        assert_eq!(plan.count(Disposition::Protected), 2);
+        assert_eq!(plan.execute().changed(), 0);
+        for workspace in &f.workspaces[..2] {
+            assert!(workspace.join("skills/alpha/SKILL.md").is_file());
+            assert!(!workspace.join("skills-inactive").exists());
+        }
     }
 
     #[test]
-    fn unreadable_source_after_batch_preflight_is_rejected_without_creating_destination() {
-        let f = Fixture::new();
-        f.install(0, "alpha");
+    fn lost_preset_template_after_preview_is_rejected_inside_write_lock() {
+        let f = Fixture::new(); f.install(0, "alpha");
         let plan = f.plan(&["alpha"], false);
-        let source = f.source.clone();
-        proma::BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
-            fs::rename(source.join("alpha"), source.join("alpha-original")).unwrap();
-            std::os::unix::fs::symlink(source.join("missing"), source.join("alpha")).unwrap();
-        })));
+        let template = f.root.join("fixture-app/default-skills/alpha/SKILL.md");
+        proma::BEFORE_TOGGLE_LOCK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || { fs::remove_file(template).unwrap(); })));
         let result = plan.execute();
         assert_eq!((result.changed(), result.failed()), (0, 1));
         assert!(f.workspaces[0].join("skills/alpha/SKILL.md").is_file());

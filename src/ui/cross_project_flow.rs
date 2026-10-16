@@ -16,6 +16,7 @@ pub(super) struct CrossProjectState {
     skill_scroll: ScrollHandle,
     project_scroll: ScrollHandle,
     action: Action,
+    preset_mode: bool,
     loading: bool,
     planning: bool,
     busy: bool,
@@ -29,6 +30,16 @@ fn toggle_visible<T: Ord + Clone>(selected: &mut BTreeSet<T>, visible: &[T]) {
     if !visible.is_empty() && visible.iter().all(|key| selected.contains(key)) {
         selected.retain(|key| !visible.contains(key));
     } else { selected.extend(visible.iter().cloned()); }
+}
+
+fn skill_matches_action(catalog: &Catalog, skill: &Skill, preset_mode: bool, action: Action) -> bool {
+    if skill.is_preset() != preset_mode { return false; }
+    if skill.provider == "library" && skill.install_name.is_none() { return false; }
+    if action == Action::Install { return skill.install_name.is_some(); }
+    if action != Action::Convert { return true; }
+    catalog.proma.iter().flat_map(|p| &p.workspaces).any(|w| w.installations.iter().any(|copy| {
+        matches!(copy.status.as_str(), "external_link" | "broken_link") && w.identities.get(&copy.path) == Some(&skill.key)
+    }))
 }
 
 impl CrossProjectState {
@@ -46,7 +57,7 @@ impl CrossProjectState {
         }
         Self { catalog: None, plan: None, result: None, skills: BTreeSet::new(), agents: BTreeSet::new(), projects: BTreeSet::new(),
             workspaces: BTreeSet::new(), collapsed: BTreeSet::new(), skill_search, project_search,
-            skill_scroll: ScrollHandle::new(), project_scroll: ScrollHandle::new(), action: Action::Install,
+            skill_scroll: ScrollHandle::new(), project_scroll: ScrollHandle::new(), action: Action::Install, preset_mode: false,
             loading: false, planning: false, busy: false, reviewed: false, generation: 0, plan_generation: 0, error: None }
     }
 }
@@ -66,23 +77,23 @@ impl KitterApp {
     }
 
     pub(super) fn cross_project_explanation(&self) -> String {
-        self.tr("将所选技能批量安装到多个项目，或移除项目安装。Proma 还支持跨工作区启用、停用已有副本，停用后保留文件。",
-            "Install selected skills across projects or remove project installations. Proma also supports enabling and disabling existing workspace copies; inactive files are retained.").to_string()
+        self.tr("用户技能安装到项目，或从项目卸载；Proma 内置预设单独启停。旧软链接可移除，或转换为工作区副本。",
+            "Install or uninstall user skills across projects. Manage Proma built-in presets separately; remove legacy links or convert them to workspace copies.").to_string()
     }
 
-    pub(super) fn open_library_cross_project(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_library_cross_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.selected_skill_keys();
         let keys = self.model.skills.iter().filter(|s| selected.iter().any(|key| key == skill_storage_name(s)))
             .map(|s| crate::proma_batch::source_key(&s.path.join("SKILL.md"))).collect();
-        self.open_cross_project(keys, None, Action::Install, None, cx);
+        self.open_cross_project(keys, None, Action::Install, None, window, cx);
     }
 
-    pub(super) fn open_proma_batch(&mut self, keys: Vec<String>, project: Option<PathBuf>, enabled: bool, cx: &mut Context<Self>) {
-        self.open_cross_project(keys, project, if enabled { Action::Enable } else { Action::Disable }, Some("proma".into()), cx);
-    }
-
-    pub(super) fn open_cross_project(&mut self, keys: Vec<String>, project: Option<PathBuf>, action: Action, agent: Option<String>, cx: &mut Context<Self>) {
+    pub(super) fn open_cross_project(&mut self, keys: Vec<String>, project: Option<PathBuf>, action: Action, agent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if self.cross_project.busy { return; }
+        self.cross_project.skill_search.update(cx, |input, cx| input.set_value("", window, cx));
+        self.cross_project.project_search.update(cx, |input, cx| input.set_value("", window, cx));
+        self.cross_project.skill_scroll.set_offset(point(px(0.), px(0.)));
+        self.cross_project.project_scroll.set_offset(point(px(0.), px(0.)));
         self.cross_project.skills = keys.into_iter().collect();
         self.cross_project.agents = agent.into_iter().collect();
         if self.cross_project.agents.is_empty() && let Some(path) = &project {
@@ -96,6 +107,7 @@ impl KitterApp {
         self.cross_project.workspaces.clear();
         self.cross_project.collapsed.clear();
         self.cross_project.action = action;
+        self.cross_project.preset_mode = action.is_state();
         self.cross_project.reviewed = false;
         self.cross_project.result = None;
         self.open_dialog(DialogKind::CrossProject, cx);
@@ -134,7 +146,9 @@ impl KitterApp {
                         }
                     }
                 }
-                this.cross_project.skills.retain(|key| catalog.skills.iter().any(|s| &s.key == key));
+                let preset_mode = this.cross_project.preset_mode;
+                let action = this.cross_project.action;
+                this.cross_project.skills.retain(|key| catalog.skills.iter().any(|s| &s.key == key && skill_matches_action(&catalog, s, preset_mode, action)));
                 this.cross_project.agents.retain(|id| catalog.installed_agents.iter().any(|a| a.id == id && !a.global_only));
                 this.cross_project.projects.retain(|path| catalog.projects.iter().any(|p| &p.path == path));
                 this.cross_project.workspaces.retain(|id| catalog.proma.as_ref().is_some_and(|p| p.workspaces.iter().any(|w| &w.workspace.id == id)));
@@ -192,8 +206,44 @@ impl KitterApp {
     }
 
     fn cross_project_verb(&self, action: Action) -> &'static str {
-        match action { Action::Install => self.tr("安装", "Install"), Action::Remove => self.tr("移除安装", "Remove"),
-            Action::Enable => self.tr("启用", "Enable"), Action::Disable => self.tr("停用", "Disable") }
+        match action { Action::Install => self.tr("安装到项目", "Install to projects"), Action::Remove => self.tr("从项目卸载", "Uninstall from projects"),
+            Action::Convert => self.tr("转换为副本", "Convert to copies"),
+            Action::Enable => self.tr("启用预设", "Enable presets"), Action::Disable => self.tr("停用预设", "Disable presets") }
+    }
+
+    fn cross_project_action_hint(&self, action: Action) -> &'static str {
+        match action {
+            Action::Install => self.tr("从 Kitter 安装所选用户技能。Proma 新副本安装后默认可用，旧停用副本会明确列为重新安装。", "Install user skills from Kitter. New Proma copies are active; legacy inactive copies are reviewed as reinstalls."),
+            Action::Remove => self.tr("移除所选项目的用户技能安装。实体副本会卸载；软链接仅移除链接，Kitter 技能源及本机配置保留。", "Uninstall selected project copies, or remove only their links. Kitter sources and local settings are retained."),
+            Action::Convert => self.tr("仅用于 Proma 旧软链接。来源已在 Kitter 收录且匹配时，替换为工作区副本；未收录或失效链接可先移除。", "For legacy Proma links only. Replace links to matching Kitter sources with workspace copies; unregistered or broken links can be removed."),
+            Action::Enable => self.tr("仅启用已核验的 Proma 内置预设。用户技能请在“用户技能”中安装；集成项由提供方维护。", "Enable verified Proma built-in presets. Install user skills in User skills; integrations remain provider-managed."),
+            Action::Disable => self.tr("仅停用 Proma 内置预设，保留文件以便恢复。用户技能请使用卸载。", "Disable Proma built-in presets while retaining their files. Uninstall user skills instead."),
+        }
+    }
+
+    fn cross_project_operation_label(&self, item: &crate::cross_project::Item, action: Action) -> &'static str {
+        match item.operation_kind(action) {
+            "remove_link" => self.tr("仅移除链接", "Remove link only"),
+            "remove_copy" => self.tr("卸载工作区副本", "Uninstall workspace copy"),
+            "convert_link" => self.tr("旧链接转换为副本", "Convert legacy link to copy"),
+            "reinstall_copy" => self.tr("重新安装旧停用副本", "Reinstall legacy inactive copy"),
+            "install_copy" => self.tr("安装工作区副本", "Install workspace copy"),
+            "install_link" => self.tr("安装项目链接", "Install project link"),
+            "enable_preset" => self.tr("启用内置预设", "Enable built-in preset"),
+            "disable_preset" => self.tr("停用内置预设", "Disable built-in preset"),
+            _ => self.cross_project_verb(action),
+        }
+    }
+
+    fn cross_project_summary(&self, plan: &Plan) -> String {
+        let mut parts = vec![if self.uses_english() { format!("{} to change", plan.count(Disposition::Change)) }
+            else { format!("待处理 {} 处", plan.count(Disposition::Change)) }];
+        for (kind, label) in [(Disposition::Unchanged, self.tr("无需变更", "unchanged")),
+            (Disposition::Missing, self.tr("无对应安装", "no installation")), (Disposition::Protected, self.tr("受保护", "protected")),
+            (Disposition::Unavailable, self.tr("无法扫描", "unavailable"))] {
+            let count = plan.count(kind); if count > 0 { parts.push(format!("{label} {count}")); }
+        }
+        parts.join(" · ")
     }
 
     fn cross_project_status(&self, disposition: Disposition, action: Action) -> String {
@@ -216,7 +266,9 @@ impl KitterApp {
     fn cross_project_skill_keys(&self, cx: &App) -> Vec<String> {
         let state = &self.cross_project;
         let query = state.skill_search.read(cx).value().trim().to_lowercase();
-        let mut skills = state.catalog.iter().flat_map(|c| &c.skills).filter(|s| query.is_empty() || s.name.to_lowercase().contains(&query)).collect::<Vec<_>>();
+        let mut skills = state.catalog.iter().flat_map(|c| &c.skills)
+            .filter(|s| state.catalog.as_ref().is_some_and(|c| skill_matches_action(c, s, state.preset_mode, state.action)))
+            .filter(|s| query.is_empty() || s.name.to_lowercase().contains(&query)).collect::<Vec<_>>();
         skills.sort_by_key(|s| (!state.skills.contains(&s.key), s.name.to_lowercase(), s.key.clone()));
         skills.into_iter().map(|s| s.key.clone()).collect()
     }
@@ -241,7 +293,8 @@ impl KitterApp {
                 let Some(skill) = catalog.skills.iter().find(|s| &s.key == key) else { continue; };
                 let checked = state.skills.contains(key); let key = key.clone();
                 let provider = match skill.provider { "library" | "managed" => self.tr("技能库", "Library"), "builtin" => self.tr("Proma 内置预设", "Proma built-in"),
-                    "integration" => self.tr("Proma 集成", "Proma integration"), _ => self.tr("项目来源", "Project source") };
+                    "integration" => self.tr("集成维护", "Provider-managed"), "link" => self.tr("未纳管链接", "Unregistered link"),
+                    "broken-link" => self.tr("失效链接", "Broken link"), _ => self.tr("项目来源", "Project source") };
                 let source = format!("{provider} · {}", display_path(&skill.source));
                 let tip = source.clone();
                 list = list.child(gpui_base::Button::new(ElementId::Name(format!("cross-project-skill-{index}").into()))
@@ -359,13 +412,16 @@ impl KitterApp {
     fn cross_project_items(&self, plan: &Plan, result: Option<&BatchResult>) -> impl IntoElement {
         let p = self.palette();
         let mut list = div().id("cross-project-impact-list").max_h(px(340.)).overflow_y_scroll();
-        for (index, item) in plan.items.iter().enumerate() {
+        let mut items = plan.items.iter().enumerate().collect::<Vec<_>>();
+        items.sort_by_key(|(_, item)| item.disposition != Disposition::Change);
+        for (index, item) in items {
             let outcome = result.and_then(|r| r.outcomes.get(index));
             let status = outcome.map(|o| if o.error.is_some() { self.tr("失败", "Failed").into() } else if o.changed { self.tr("成功", "Succeeded").into() }
                 else { self.cross_project_status(if item.disposition == Disposition::Change { Disposition::Unchanged } else { item.disposition }, plan.action) }).unwrap_or_else(|| self.cross_project_status(item.disposition, plan.action));
             let agents = item.affected_agents.iter().map(|a| a.name).collect::<Vec<_>>().join("、");
             let other_agents = item.affected_agents.iter().any(|a| !self.cross_project.agents.contains(a.id));
             let reason = outcome.and_then(|o| o.error.clone()).or(item.reason.clone());
+            let operation = self.cross_project_operation_label(item, plan.action);
             let path_tip = display_path(&item.path);
             list = list.child(div().py(px(8.)).border_b_1().border_color(p.border)
                 .child(div().flex().items_center().gap(px(8.)).text_size(px(12.))
@@ -373,6 +429,7 @@ impl KitterApp {
                     .child(div().text_color(if outcome.is_some_and(|o| o.error.is_some()) { p.danger } else { p.secondary }).child(status)))
                 .child(div().mt(px(3.)).text_size(px(11.)).text_color(if other_agents { p.warning } else { p.secondary })
                     .child(format!("{}：{agents}{}", self.tr("影响 Agent", "Affected agents"), if other_agents { self.tr("（包含共享目录使用者）", " (includes shared readers)") } else { "" })))
+                .when(item.disposition == Disposition::Change, |d| d.child(div().mt(px(3.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(p.text).child(operation)))
                 .child(div().id(ElementId::Name(format!("cross-project-path-{index}").into())).mt(px(3.)).truncate().font_family(MONO).text_size(px(10.)).text_color(p.muted)
                     .child(display_path(&item.path)).tooltip(move |window, cx| Tooltip::new(path_tip.clone()).build(window, cx)))
                 .when(reason.is_some(), |d| d.child(div().mt(px(3.)).text_size(px(11.)).text_color(p.muted).child(reason.unwrap_or_default()))));
@@ -395,24 +452,55 @@ impl KitterApp {
         } else if state.reviewed {
             if let Some(plan) = &state.plan {
                 content = content.child(div().mb(px(10.)).p(px(10.)).rounded(px(10.)).bg(p.raised).text_size(px(12.))
-                    .child(if self.uses_english() { format!("{} to change · {} unchanged · {} missing · {} protected", plan.count(Disposition::Change), plan.count(Disposition::Unchanged), plan.count(Disposition::Missing), plan.count(Disposition::Protected)) }
-                        else { format!("将{} {} 份 · 无需变更 {} · 未安装 {} · 受保护 {}", self.cross_project_verb(state.action), plan.count(Disposition::Change), plan.count(Disposition::Unchanged), plan.count(Disposition::Missing), plan.count(Disposition::Protected)) }))
+                    .child(self.cross_project_summary(plan)))
                     .child(div().mb(px(6.)).text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(self.tr("实际影响清单", "Actual impact")))
                     .child(self.cross_project_items(plan, None));
             }
         } else {
-            let mut actions = div().flex().items_center().gap(px(5.));
-            for (index, action) in [Action::Install, Action::Remove, Action::Enable, Action::Disable].into_iter().enumerate() {
-                let supported = !action.is_state() || action.supported(&state.agents);
-                actions = actions.child(self.toolbar_text_button(["cross-project-install", "cross-project-remove", "cross-project-enable", "cross-project-disable"][index], self.cross_project_verb(action))
-                    .debug_selector(move || ["cross-project-install", "cross-project-remove", "cross-project-enable", "cross-project-disable"][index].into())
-                    .bg(if state.action == action { p.selected } else { rgba(0x00000000) }).disabled(busy || !supported)
-                    .tooltip(move |window, cx| Tooltip::new(if action.is_state() { "启用、停用目前仅支持 Proma 已有副本；混选其他 Agent 时不可用" } else { "选择 Agent 与项目后，先查看实际影响清单" }).build(window, cx))
-                    .on_click(cx.listener(move |this, _, _, cx| { this.cross_project.action = action; this.update_cross_project_plan(cx); })));
+            let mut modes = div().flex().items_center().gap(px(5.)).mb(px(8.));
+            for (preset, id, label) in [(false, "cross-project-users", self.tr("用户技能", "User skills")), (true, "cross-project-presets", self.tr("Proma 预设", "Proma presets"))] {
+                let tip = if preset { self.tr("内置预设通过启用、停用管理；集成项保留提供方管理", "Enable or disable built-in presets; integrations remain provider-managed") }
+                    else { self.tr("用户技能通过安装、卸载管理；旧软链接可以移除或转换为副本", "Install or uninstall user skills; remove legacy links or convert them to copies") };
+                modes = modes.child(self.toolbar_text_button(id, label).debug_selector(move || id.into())
+                    .bg(if state.preset_mode == preset { p.selected } else { rgba(0x00000000) }).disabled(busy)
+                    .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.cross_project.preset_mode == preset { return; }
+                        this.cross_project.preset_mode = preset;
+                        this.cross_project.skills.clear(); this.cross_project.result = None;
+                        this.cross_project.action = if preset { Action::Enable } else { Action::Install };
+                        if preset { this.cross_project.agents = BTreeSet::from(["proma".into()]); }
+                        this.cross_project.skill_scroll.set_offset(point(px(0.), px(0.)));
+                        this.update_cross_project_plan(cx);
+                    })));
             }
-            content = content.child(actions).child(div().mt(px(8.)).text_size(px(11.)).text_color(p.muted)
-                .child(self.tr("Agent · 已安装的在前，灰色项不可选 · 启停仅支持 Proma", "Agents · installed first, grey items unavailable · state changes require Proma")));
+            let mut actions = div().flex().items_center().gap(px(5.));
+            let available_actions = if state.preset_mode { vec![Action::Enable, Action::Disable] }
+                else if state.agents.contains("proma") { vec![Action::Install, Action::Remove, Action::Convert] }
+                else { vec![Action::Install, Action::Remove] };
+            for action in available_actions {
+                let id = match action { Action::Install => "cross-project-install", Action::Remove => "cross-project-remove", Action::Convert => "cross-project-convert", Action::Enable => "cross-project-enable", Action::Disable => "cross-project-disable" };
+                let supported = !(action.is_state() || action == Action::Convert) || action.supported(&state.agents);
+                let hint = self.cross_project_action_hint(action);
+                actions = actions.child(self.toolbar_text_button(id, self.cross_project_verb(action))
+                    .debug_selector(move || id.into())
+                    .bg(if state.action == action { p.selected } else { rgba(0x00000000) }).disabled(busy || !supported)
+                    .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cross_project.action = action;
+                        if let Some(catalog) = &this.cross_project.catalog {
+                            let preset = this.cross_project.preset_mode;
+                            this.cross_project.skills.retain(|key| catalog.skills.iter().any(|s| &s.key == key && skill_matches_action(catalog, s, preset, action)));
+                        }
+                        this.update_cross_project_plan(cx);
+                    })));
+            }
+            content = content.child(modes).child(actions)
+                .child(div().mt(px(5.)).text_size(px(11.)).text_color(p.secondary).child(self.cross_project_action_hint(state.action)))
+                .child(div().mt(px(8.)).text_size(px(11.)).text_color(p.muted)
+                    .child(self.tr("Agent · 已安装的在前，灰色项不可选", "Agents · installed first, grey items unavailable")));
             let mut agents = crate::agents::AGENT_ICON_ORDER.to_vec();
+            if state.preset_mode { agents.retain(|a| a.id == "proma"); }
             agents.sort_by_key(|a| crate::agents::display_sort_key(a.name, self.model.installed_agents.contains(a)));
             let mut agent_picker = div().mt(px(5.)).flex().flex_wrap().gap(px(4.));
             for agent in agents {
@@ -436,16 +524,15 @@ impl KitterApp {
                 .child(div().mt(px(8.)).mb(px(8.)).text_size(px(11.)).text_color(p.secondary)
                     .child(self.tr("项目勾选作用于普通 Agent；Proma 请在项目下单独勾选工作区。全局继承项在全局页面管理。", "Project selections apply to other agents; select Proma workspace children separately. Manage inherited global installs in the global view.")))
                 .child(div().flex().gap(px(12.))
-                    .child(self.cross_project_skills_picker((f32::from(window.bounds().size.height) - 520.).clamp(135., 260.), cx))
-                    .child(self.cross_project_projects_picker((f32::from(window.bounds().size.height) - 520.).clamp(135., 260.), cx)));
+                    .child(self.cross_project_skills_picker((f32::from(window.bounds().size.height) - 565.).clamp(110., 240.), cx))
+                    .child(self.cross_project_projects_picker((f32::from(window.bounds().size.height) - 565.).clamp(110., 240.), cx)));
             if let Some(error) = &state.error {
                 content = content.child(div().mt(px(8.)).text_size(px(12.)).text_color(p.warning)
                     .child(if state.agents.is_empty() { self.tr("请选择至少一个已安装的 Agent", "Select at least one installed agent").to_string() } else { error.clone() }));
             }
             if let Some(plan) = &state.plan {
                 content = content.child(div().mt(px(10.)).p(px(10.)).rounded(px(10.)).bg(p.raised).text_size(px(12.))
-                    .child(if self.uses_english() { format!("{} to change · {} unchanged · {} missing · {} protected · {} unavailable", plan.count(Disposition::Change), plan.count(Disposition::Unchanged), plan.count(Disposition::Missing), plan.count(Disposition::Protected), plan.count(Disposition::Unavailable)) }
-                        else { format!("待{} {} 份 · 无需变更 {} · 未安装 {} · 受保护 {} · 无法扫描 {}", self.cross_project_verb(state.action), plan.count(Disposition::Change), plan.count(Disposition::Unchanged), plan.count(Disposition::Missing), plan.count(Disposition::Protected), plan.count(Disposition::Unavailable)) }));
+                    .child(self.cross_project_summary(plan)));
             }
         }
         let retry = state.result.as_ref().is_some_and(|r| r.failed() > 0);
@@ -455,7 +542,11 @@ impl KitterApp {
             else if state.loading || state.planning { self.tr("正在计算…", "Calculating…").to_string() }
             else if retry { if self.uses_english() { format!("Retry {count} failed") } else { format!("仅重试失败 {count} 份") } }
             else if state.result.is_some() { self.tr("已完成", "Done").into() }
-            else if !state.reviewed { self.tr("预览更改", "Review changes").into() }
+            else if !state.reviewed {
+                let action = match state.action { Action::Install => self.tr("预览安装", "Review installation"), Action::Remove => self.tr("预览卸载", "Review uninstall"),
+                    Action::Convert => self.tr("预览转换", "Review conversion"), Action::Enable => self.tr("预览启用", "Review enabling"), Action::Disable => self.tr("预览停用", "Review disabling") };
+                if self.uses_english() { format!("{action} · {count}") } else { format!("{action} · {count} 处") }
+            }
             else if self.uses_english() { format!("{} {count} installations", self.cross_project_verb(state.action)) }
             else { format!("确认{} {count} 份", self.cross_project_verb(state.action)) };
         div().bg(background).text_color(p.text).font_family(FONT_UI)
@@ -509,6 +600,10 @@ mod tests {
             {"id":"a","slug":"a","name":"Workspace A","projectRootPath":project}
         ]})).unwrap()).unwrap();
         crate::proma::apply_plan(&crate::proma::plan_install(&proma, &proma.join("agent-workspaces/a"), &source, "alpha").unwrap()).unwrap();
+        let template = proma.join("fixture-app/default-skills/preset");
+        let preset = proma.join("agent-workspaces/a/skills/preset");
+        for path in [&template, &preset] { fs::create_dir_all(path).unwrap(); fs::write(path.join("SKILL.md"), "---\nname: preset\ndescription: Built-in\n---\nPreset\n").unwrap(); }
+        crate::proma::register_test_bundled_templates(&proma, template.parent().unwrap());
         let installed = crate::agents::AGENT_ICON_ORDER.iter().filter(|a| ["codex","proma"].contains(&a.id)).copied().collect::<Vec<_>>();
         let skill = Skill { key: crate::proma_batch::source_key(&source.join("SKILL.md")), name:"alpha".into(), source:source.clone(), provider:"library", install_name:Some("alpha".into()) };
         let entry = crate::project_discovery::ProjectEntry { path:project.clone(), name:"Project A".into(), agents:vec![], proma_workspaces:vec![], archived:false, hidden:false, retained:false };
@@ -529,9 +624,9 @@ mod tests {
             assert!(app.cross_project.workspaces.is_empty());
             assert!(!app.cross_project.reviewed);
         });
-        // A mixed selection cannot activate the Proma-only operation.
-        let button = cx.debug_bounds("cross-project-enable").unwrap();
-        cx.simulate_click(button.center(), Modifiers::none());
+        // User installations have no state toggle, even when Proma is selected.
+        assert!(cx.debug_bounds("cross-project-enable").is_none());
+        assert!(cx.debug_bounds("cross-project-disable").is_none());
         cx.read_entity(&app, |app, _| assert_eq!(app.cross_project.action, Action::Install));
         // First click only reveals the frozen impact list.
         let button = cx.debug_bounds("cross-project-execute").unwrap();
@@ -546,10 +641,20 @@ mod tests {
         assert!(project.join(".codex/skills/alpha").is_symlink());
         assert!(proma.join("agent-workspaces/a/skills/alpha").exists());
         assert!(source.join("SKILL.md").is_file());
+        app.update_in(cx, |app, _, cx| { app.cross_project.result = None; app.cross_project.reviewed = false; app.notify_dialog(cx); });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let tab = cx.debug_bounds("cross-project-presets").unwrap(); cx.simulate_click(tab.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.read_entity(&app, |app, _| {
+            assert!(app.cross_project.preset_mode); assert_eq!(app.cross_project.agents, BTreeSet::from(["proma".into()]));
+            assert!(app.cross_project.skills.is_empty());
+        });
+        assert!(cx.debug_bounds("cross-project-install").is_none());
+        assert!(cx.debug_bounds("cross-project-enable").is_some());
         app.update_in(cx, |app, _, cx| {
-            app.cross_project.agents = BTreeSet::from(["proma".into()]);
+            app.cross_project.skills = BTreeSet::from(["proma:builtin:preset".into()]);
             app.cross_project.workspaces = BTreeSet::from(["a".into()]);
-            app.cross_project.action = Action::Disable; app.cross_project.result = None;
+            app.cross_project.action = Action::Disable;
             app.update_cross_project_plan(cx);
         });
         cx.run_until_parked(); cx.refresh().unwrap();
@@ -558,6 +663,7 @@ mod tests {
         let button = cx.debug_bounds("cross-project-execute").unwrap(); cx.simulate_click(button.center(), Modifiers::none());
         cx.run_until_parked(); cx.refresh().unwrap();
         cx.read_entity(&app, |app, _| { let r=app.cross_project.result.as_ref().unwrap(); assert_eq!((r.changed(),r.failed()),(1,0)); });
-        assert!(proma.join("agent-workspaces/a/skills-inactive/alpha/SKILL.md").is_file());
+        assert!(proma.join("agent-workspaces/a/skills-inactive/preset/SKILL.md").is_file());
+        assert!(proma.join("agent-workspaces/a/skills/alpha/SKILL.md").is_file());
     }
 }

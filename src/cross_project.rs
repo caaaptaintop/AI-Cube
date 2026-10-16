@@ -4,12 +4,12 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action { Install, Remove, Enable, Disable }
+pub enum Action { Install, Remove, Convert, Enable, Disable }
 
 impl Action {
     pub fn is_state(self) -> bool { matches!(self, Self::Enable | Self::Disable) }
     pub fn supported(self, agents: &BTreeSet<String>) -> bool {
-        !agents.is_empty() && (!self.is_state() || agents.iter().all(|id| id == "proma"))
+        !agents.is_empty() && (!(self.is_state() || self == Self::Convert) || agents.iter().all(|id| id == "proma"))
     }
 }
 
@@ -21,6 +21,10 @@ pub struct Skill {
     pub provider: &'static str,
     /// Only library skills may be newly installed. Other entries are inspectable.
     pub install_name: Option<String>,
+}
+
+impl Skill {
+    pub fn is_preset(&self) -> bool { matches!(self.provider, "builtin" | "integration") }
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +122,7 @@ impl Catalog {
     }
 
     pub fn plan(&self, action: Action, skills: &BTreeSet<String>, selected_agents: &BTreeSet<String>, projects: &BTreeSet<PathBuf>, workspaces: &BTreeSet<String>) -> Result<Plan> {
-        ensure!(action.supported(selected_agents), "启用、停用目前仅支持 Proma；请选择支持的操作或仅选择 Proma");
+        ensure!(action.supported(selected_agents), "预设启停和软链接转换仅支持 Proma，请仅选择 Proma");
         let selected = self.installed_agents.iter().filter(|a| selected_agents.contains(a.id)).copied().collect::<Vec<_>>();
         ensure!(selected.len() == selected_agents.len() && selected.iter().all(|a| !a.global_only), "Agent 未安装或不支持项目技能，请重新选择");
         let mut items = Vec::new();
@@ -175,15 +179,56 @@ impl Catalog {
                                 if let Some(copy) = &first.installation { item.path = copy.path.clone(); }
                                 item.operation = Some(Operation::Toggle(plan));
                             } else { item.disposition = Disposition::Missing; }
-                        } else if copies.len() > 1 { item.block(Disposition::Protected, "工作区存在重复副本，请先检查"); }
+                        } else if skill.is_preset() { item.block(Disposition::Protected, "内置预设仅支持启用、停用；集成项由提供方维护"); }
+                        else if copies.len() > 1 { item.block(Disposition::Protected, "工作区存在重复副本，请先检查"); }
                         else if let Some(copy) = copies.first() {
                             item.path = copy.path.clone();
-                            if action == Action::Install { item.disposition = Disposition::Unchanged; }
+                            if let Err(error) = proma::validate_previewed_installation(&catalog.root, w, copy) {
+                                item.block(Disposition::Protected, &format!("{error:#}"));
+                                items.push(item);
+                                continue;
+                            }
+                            let linked = matches!(copy.status.as_str(), "external_link" | "broken_link");
+                            if linked && action == Action::Remove {
+                                match proma::plan_remove_link(&catalog.root, &w.path, &copy.path) {
+                                    Ok(plan) if plan.workspace == *w => {
+                                        item.operation = Some(Operation::RemovePromaLink(plan)); item.disposition = Disposition::Change;
+                                        item.reason = Some("仅移除所选工作区的软链接，链接指向的源文件保留".into());
+                                    }
+                                    Ok(_) => item.block(Disposition::Protected, "工作区身份与扫描记录不一致，请刷新"),
+                                    Err(error) => item.block(Disposition::Protected, &format!("{error:#}")),
+                                }
+                            } else if action == Action::Convert || (action == Action::Install && copy.state == "inactive" && copy.managed && copy.removable) {
+                                if action == Action::Convert && !linked {
+                                    item.disposition = Disposition::Unchanged; item.reason = Some("已是实体副本，无需转换".into());
+                                } else if skill.install_name.is_none() {
+                                    item.block(Disposition::Protected, "请先将链接来源纳入 Kitter 技能库，再转换为副本");
+                                } else {
+                                    match proma::plan_install(&catalog.root, &w.path, &skill.source, &copy.name) {
+                                        Ok(plan) if plan.workspace != *w => item.block(Disposition::Protected, "工作区身份与扫描记录不一致，请刷新"),
+                                        Ok(plan) if matches!(plan.action.as_str(), "migrate" | "reinstall") => {
+                                            item.reason = Some(if linked && copy.state == "inactive" { "移除旧停用目录中的链接，在启用目录安装实体副本；源文件保留" }
+                                                else if linked { "将旧软链接替换为工作区实体副本，源文件保留" } else { "移除旧停用副本，从 Kitter 重新安装到启用目录" }.into());
+                                            item.operation = Some(Operation::InstallProma(plan)); item.disposition = Disposition::Change;
+                                        }
+                                        Ok(_) => item.block(Disposition::Protected, "安装位置已变化，请刷新后重新预览"),
+                                        Err(error) => item.block(Disposition::Protected, &format!("{error:#}")),
+                                    }
+                                }
+                            } else if linked {
+                                item.block(Disposition::Protected, "这是旧软链接安装，请选择“转换为副本”或“从项目卸载”");
+                            } else if action == Action::Install { item.disposition = Disposition::Unchanged; }
                             else if copy.managed && copy.removable && skill.install_name.is_some() {
                                 item.operation = Some(Operation::RemoveProma { root: catalog.root.clone(), workspace: w.clone(), copy: (*copy).clone() });
                                 item.disposition = Disposition::Change;
+                                item.reason = Some("卸载此工作区的用户技能副本，Kitter 技能源与本机配置保留".into());
                             } else { item.block(Disposition::Protected, "内置、集成、未托管或已修改的副本保留"); }
-                        } else if action == Action::Remove { item.disposition = Disposition::Missing; }
+                            if item.disposition == Disposition::Change
+                                && let Err(error) = proma::validate_previewed_installation(&catalog.root, w, copy)
+                            {
+                                item.block(Disposition::Protected, &format!("{error:#}"));
+                            }
+                        } else if matches!(action, Action::Remove | Action::Convert) { item.disposition = Disposition::Missing; }
                         else if skill.install_name.is_none() { item.block(Disposition::Protected, "请先将技能纳入技能库，再安装到其他项目"); }
                         else {
                             match proma::plan_install(&catalog.root, &w.path, &skill.source, skill.install_name.as_deref().unwrap()) {
@@ -233,6 +278,7 @@ enum Operation {
     Link { logical: PathBuf, expected: Option<directory_link::DirectoryLink>, identity: Option<String> },
     InstallProma(proma::InstallPlan),
     RemoveProma { root: PathBuf, workspace: proma::Workspace, copy: proma::Installation },
+    RemovePromaLink(proma::LinkRemovalPlan),
     Toggle(proma_batch::Plan),
 }
 
@@ -257,8 +303,23 @@ impl Item {
             Some(Operation::Link { .. }) => ("link", None),
             Some(Operation::InstallProma(plan)) => ("proma-install", Some(&plan.workspace.id)),
             Some(Operation::RemoveProma { workspace, .. }) => ("proma-remove", Some(&workspace.id)),
+            Some(Operation::RemovePromaLink(plan)) => ("proma-link-remove", Some(&plan.workspace.id)),
             Some(Operation::Toggle(plan)) => ("proma-toggle", plan.items.first().map(|i| i.workspace.id.as_str())),
             None => ("protected", None),
+        }
+    }
+    pub fn operation_kind(&self, action: Action) -> &'static str {
+        match &self.operation {
+            Some(Operation::RemovePromaLink(_)) => "remove_link",
+            Some(Operation::RemoveProma { .. }) => "remove_copy",
+            Some(Operation::InstallProma(plan)) if plan.action == "migrate" => "convert_link",
+            Some(Operation::InstallProma(plan)) if plan.action == "reinstall" => "reinstall_copy",
+            Some(Operation::InstallProma(_)) => "install_copy",
+            Some(Operation::Link { .. }) if action == Action::Remove => "remove_link",
+            Some(Operation::Link { .. }) => "install_link",
+            Some(Operation::Toggle(_)) if action == Action::Enable => "enable_preset",
+            Some(Operation::Toggle(_)) => "disable_preset",
+            None => "none",
         }
     }
     fn new(skill: &Skill, location: &str, project: &Path, target: InstallTarget, logical: PathBuf, catalog: &Catalog) -> Self {
@@ -311,13 +372,14 @@ impl Item {
 
     fn apply(&self, action: Action) -> Result<bool> {
         if self.disposition != Disposition::Change { return Ok(false); }
-        ensure!(self.skill.install_name.is_none() || self.skill.source.join("SKILL.md").canonicalize()? == Path::new(self.skill.key.strip_prefix("file:").context("技能源身份无效")?), "技能源实际位置已变化，请刷新后检查");
+        ensure!(matches!(self.operation, Some(Operation::RemovePromaLink(_))) || self.skill.install_name.is_none() || self.skill.source.join("SKILL.md").canonicalize()? == Path::new(self.skill.key.strip_prefix("file:").context("技能源身份无效")?), "技能源实际位置已变化，请刷新后检查");
         match self.operation.as_ref().context("缺少预览操作")? {
             Operation::InstallProma(plan) => { proma::apply_plan(plan)?; }
             Operation::RemoveProma { root, workspace, copy } => {
                 let file = Path::new(self.skill.key.strip_prefix("file:").context("缺少受管来源")?);
                 proma::uninstall_previewed_in(root, workspace, copy, file)?;
             }
+            Operation::RemovePromaLink(plan) => { proma::apply_remove_link(plan)?; }
             Operation::Toggle(plan) => {
                 let result = plan.execute();
                 if let Some(error) = result.outcomes.iter().find_map(|o| o.error.as_ref()) { bail!("{error}"); }
@@ -662,5 +724,124 @@ mod tests {
         assert!(catalog.projects.iter().find(|p| p.path == f.projects[0].path).unwrap().is_active());
         f.projects[1].retained = true;
         assert!(f.catalog().projects.iter().find(|p| p.path == f.projects[1].path).unwrap().is_active());
+    }
+
+    #[test]
+    fn lifecycle_user_copy_is_uninstalled_or_reinstalled_never_toggled() {
+        let f = Fixture::new();
+        assert_eq!(f.plan(&f.catalog(), Action::Install, &["proma"], &["a"]).execute().changed(), 1);
+        let plan = f.plan(&f.catalog(), Action::Disable, &["proma"], &["a"]);
+        assert_eq!(plan.count(Disposition::Protected), 1); assert_eq!(plan.execute().changed(), 0);
+        let active = f.root.join("agent-workspaces/a/skills/alpha");
+        let inactive = f.root.join("agent-workspaces/a/skills-inactive/alpha");
+        fs::create_dir_all(inactive.parent().unwrap()).unwrap(); fs::rename(&active, &inactive).unwrap();
+        let plan = f.plan(&f.catalog(), Action::Install, &["proma"], &["a"]);
+        assert_eq!(plan.items[0].operation_kind(Action::Install), "reinstall_copy");
+        let result = plan.execute(); assert_eq!((result.changed(), result.failed()), (1, 0));
+        assert!(active.join("SKILL.md").is_file()); assert!(!inactive.exists());
+        assert_eq!(f.plan(&f.catalog(), Action::Remove, &["proma"], &["a"]).execute().changed(), 1);
+        assert!(!active.exists()); assert!(f.source.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn lifecycle_proma_legacy_link_converts_only_after_explicit_review() {
+        let f = Fixture::new(); let link = f.root.join("agent-workspaces/a/skills/alpha");
+        fs::create_dir(link.parent().unwrap()).unwrap(); symlink(&f.source, &link).unwrap();
+        let install = f.plan(&f.catalog(), Action::Install, &["proma"], &["a"]);
+        assert_eq!(install.count(Disposition::Protected), 1); assert!(link.is_symlink());
+        let convert = f.plan(&f.catalog(), Action::Convert, &["proma"], &["a"]);
+        assert_eq!(convert.count(Disposition::Change), 1);
+        assert_eq!(convert.items[0].operation_kind(Action::Convert), "convert_link");
+        assert!(link.is_symlink());
+        let result = convert.execute(); assert_eq!((result.changed(), result.failed()), (1, 0));
+        assert!(!link.is_symlink()); assert!(link.join(".kitter-proma.json").is_file());
+        assert_eq!(fs::read_to_string(f.source.join("SKILL.md")).unwrap(), "---\nname: alpha\ndescription: Test\n---\nKeep source\n");
+    }
+
+    #[test]
+    fn lifecycle_unknown_and_broken_proma_links_can_be_removed_without_sources() {
+        let f = Fixture::new(); let directory = f.root.join("agent-workspaces/a/skills"); fs::create_dir(&directory).unwrap();
+        let outside = f.base.join("outside/other"); fs::create_dir_all(&outside).unwrap(); fs::write(outside.join("SKILL.md"), "keep outside source").unwrap();
+        symlink(&outside, directory.join("unknown")).unwrap(); symlink(f.base.join("missing"), directory.join("broken")).unwrap();
+        let catalog = f.catalog();
+        let keys = catalog.skills.iter().filter(|s| ["unknown", "broken"].contains(&s.name.as_str())).map(|s| s.key.clone()).collect();
+        let remove = catalog.plan(Action::Remove, &keys, &BTreeSet::from(["proma".into()]), &BTreeSet::new(), &BTreeSet::from(["a".into()])).unwrap();
+        assert_eq!(remove.count(Disposition::Change), 2);
+        assert!(remove.items.iter().all(|item| item.operation_kind(Action::Remove) == "remove_link"));
+        let result = remove.execute(); assert_eq!((result.changed(), result.failed()), (2, 0));
+        assert!(directory.join("unknown").symlink_metadata().is_err()); assert!(directory.join("broken").symlink_metadata().is_err());
+        assert_eq!(fs::read_to_string(outside.join("SKILL.md")).unwrap(), "keep outside source");
+    }
+
+    #[test]
+    fn lifecycle_link_conversion_requires_registered_same_source_and_frozen_target() {
+        let f = Fixture::new(); let link = f.root.join("agent-workspaces/a/skills/alpha"); fs::create_dir(link.parent().unwrap()).unwrap(); symlink(&f.source, &link).unwrap();
+        let convert = f.plan(&f.catalog(), Action::Convert, &["proma"], &["a"]);
+        let outside = f.base.join("outside"); fs::create_dir(&outside).unwrap(); fs::write(outside.join("SKILL.md"), "keep outside").unwrap();
+        fs::remove_file(&link).unwrap(); symlink(&outside, &link).unwrap();
+        let result = convert.execute(); assert_eq!((result.changed(), result.failed()), (0, 1));
+        assert!(link.is_symlink()); assert_eq!(fs::read_to_string(outside.join("SKILL.md")).unwrap(), "keep outside");
+        let catalog = f.catalog(); let unknown = catalog.skills.iter().find(|s| s.key == proma_batch::source_key(&outside.join("SKILL.md"))).unwrap();
+        assert!(unknown.install_name.is_none());
+        let plan = catalog.plan(Action::Convert, &BTreeSet::from([unknown.key.clone()]), &BTreeSet::from(["proma".into()]), &BTreeSet::new(), &BTreeSet::from(["a".into()])).unwrap();
+        assert_eq!(plan.count(Disposition::Protected), 1); assert!(link.is_symlink());
+    }
+
+    #[test]
+    fn lifecycle_same_name_builtin_and_library_user_skill_have_separate_actions() {
+        let f = Fixture::new(); let template = f.root.join("fixture-app/default-skills/alpha"); let preset = f.root.join("agent-workspaces/a/skills/alpha");
+        for p in [&template, &preset] { fs::create_dir_all(p).unwrap(); fs::write(p.join("SKILL.md"), "---\nname: alpha\ndescription: Built-in\n---\nPreset\n").unwrap(); }
+        proma::register_test_bundled_templates(&f.root, template.parent().unwrap());
+        let catalog = f.catalog(); assert_eq!(catalog.skills.iter().filter(|s| s.name == "alpha").count(), 2);
+        let keys = BTreeSet::from(["proma:builtin:alpha".into()]);
+        for action in [Action::Install, Action::Remove, Action::Convert] {
+            let plan = catalog.plan(action, &keys, &BTreeSet::from(["proma".into()]), &BTreeSet::new(), &BTreeSet::from(["a".into()])).unwrap();
+            assert_eq!(plan.count(Disposition::Protected), 1);
+        }
+        let plan = catalog.plan(Action::Disable, &keys, &BTreeSet::from(["proma".into()]), &BTreeSet::new(), &BTreeSet::from(["a".into()])).unwrap();
+        assert_eq!(plan.execute().changed(), 1);
+        assert!(!preset.exists()); assert!(f.root.join("agent-workspaces/a/skills-inactive/alpha/SKILL.md").is_file());
+        assert!(f.source.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn lifecycle_scanned_links_cannot_adopt_new_targets_before_preview() {
+        for broken in [false, true] {
+            let f = Fixture::new(); let link = f.root.join("agent-workspaces/a/skills/alpha");
+            fs::create_dir(link.parent().unwrap()).unwrap();
+            let first = if broken { f.base.join("missing-first") } else { f.source.clone() };
+            symlink(&first, &link).unwrap();
+            let catalog = f.catalog();
+            let key = catalog.proma.as_ref().unwrap().workspaces.iter().find(|w| w.workspace.id == "a").unwrap().identities[&link].clone();
+            let replacement = f.base.join("replacement");
+            if !broken { fs::create_dir(&replacement).unwrap(); fs::write(replacement.join("SKILL.md"), "keep replacement").unwrap(); }
+            fs::remove_file(&link).unwrap(); symlink(&replacement, &link).unwrap();
+            let plan = catalog.plan(Action::Remove, &BTreeSet::from([key]), &BTreeSet::from(["proma".into()]),
+                &BTreeSet::new(), &BTreeSet::from(["a".into()])).unwrap();
+            assert_eq!(plan.count(Disposition::Protected), 1);
+            assert_eq!(plan.execute().changed(), 0); assert_eq!(fs::read_link(&link).unwrap(), replacement);
+            assert!(f.source.join("SKILL.md").is_file());
+        }
+    }
+
+    #[test]
+    fn lifecycle_uninstall_refuses_same_source_objects_replaced_after_preview() {
+        for replace in ["copy", "parent", "workspace", "update"] {
+            let f = Fixture::new(); f.plan(&f.catalog(), Action::Install, &["proma"], &["a"]).execute();
+            let plan = f.plan(&f.catalog(), Action::Remove, &["proma"], &["a"]);
+            let workspace = f.root.join("agent-workspaces/a"); let parent = workspace.join("skills"); let copy = parent.join("alpha");
+            let replaced = match replace { "workspace" => &workspace, "parent" => &parent, _ => &copy };
+            if replace == "update" {
+                fs::write(f.source.join("SKILL.md"), "---\nname: alpha\ndescription: Updated\n---\nNew source version\n").unwrap();
+                proma::apply_plan(&proma::plan_install(&f.root, &workspace, &f.source, "alpha").unwrap()).unwrap();
+            } else {
+                let original = f.base.join("preserved-original"); fs::rename(replaced, &original).unwrap();
+                fs::create_dir_all(&copy).unwrap();
+                let old_copy = match replace { "workspace" => original.join("skills/alpha"), "parent" => original.join("alpha"), _ => original.clone() };
+                for name in ["SKILL.md", ".kitter-proma.json"] { fs::copy(old_copy.join(name), copy.join(name)).unwrap(); }
+            }
+            let result = plan.execute(); assert_eq!((result.changed(), result.failed()), (0, 1), "{replace}");
+            assert!(copy.join("SKILL.md").is_file()); assert!(f.source.join("SKILL.md").is_file());
+        }
     }
 }

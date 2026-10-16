@@ -307,8 +307,8 @@ impl KitterApp {
                         }),
                 );
                 menu = menu.item(PopupMenuItem::new(proma_label.clone())
-                    .on_click(move |_, _, cx| {
-                        let _ = proma_app.update(cx, |this, cx| this.open_library_cross_project(cx));
+                    .on_click(move |_, window, cx| {
+                        let _ = proma_app.update(cx, |this, cx| this.open_library_cross_project(window, cx));
                     }));
                 if !multi_selection {
                     let reveal_path = reveal_path.clone();
@@ -1709,7 +1709,7 @@ impl KitterApp {
             .child(self.window_drag_strip("multi-skill-detail-window-drag", 24., cx))
             .child(div().px(px(24.)).pb(px(16.)).child(self.toolbar_text_button("cross-project-selected-skills", self.tr("跨项目管理", "Manage across projects"))
                 .tooltip({ let tip = self.cross_project_explanation(); move |window, cx| Tooltip::new(tip.clone()).build(window, cx) })
-                .on_click(cx.listener(|this, _, _, cx| this.open_library_cross_project(cx)))))
+                .on_click(cx.listener(|this, _, window, cx| this.open_library_cross_project(window, cx)))))
     }
 
     pub(super) fn skill_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {

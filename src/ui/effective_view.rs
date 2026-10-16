@@ -172,7 +172,7 @@ impl EffectiveSkillRow {
                 self.direct_installations.iter().filter(|item| {
                     item.target == InstallTarget::Proma
                         && item.state.as_deref() == Some(state)
-                        && item.toggleable
+                        && item.toggleable && item.bundled
                 }).cloned().collect()
             }
         }
@@ -531,11 +531,8 @@ mod tests {
                     assert_eq!(row.key, installation_skill_key(&mirror));
                     let action = if state == "active" { ProjectBatchAction::DisableProma } else { ProjectBatchAction::EnableProma };
                     let targets = row.batch_installations(action);
-                    assert_eq!(targets.len(), usize::from(status != "modified"));
-                    if let Some(target) = targets.first() {
-                        assert_eq!(target.target, InstallTarget::Proma);
-                        assert_eq!(target.path, copy, "toggling must target the physical copy, never its origin");
-                    }
+                    assert!(targets.is_empty(), "user copies are installed/uninstalled, never toggled");
+                    assert_eq!(row.removable_installations().len(), 1 + usize::from(status != "modified"));
                     for agent in [AgentKind::Codex, AgentKind::Proma] {
                         let filtered = skill_rows(&estimates, &direct, Some(agent), temp.path());
                         assert_eq!(filtered.len(), 1);
