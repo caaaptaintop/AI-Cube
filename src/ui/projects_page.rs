@@ -637,6 +637,7 @@ impl KitterApp {
             _ => self.tr("状态未知", "Unknown state"),
         };
         let status_label = |copy: &ProjectSkillInstallation| match copy.status.as_deref() {
+            Some("integration_variant") => format!("{} · {}", copy.integration.as_deref().unwrap_or_default(), self.tr("本机适配", "Locally adapted")),
             Some("preset_variant") => self.tr("预设副本 · 有差异", "Preset copy · differs").to_string(),
             _ if copy.bundled => self.tr("预设副本", "Bundled copy").to_string(),
             _ if copy.integration.is_some() => copy.integration.clone().unwrap_or_default(),
@@ -700,6 +701,7 @@ impl KitterApp {
         };
         let details = copies.iter().map(|copy| {
             let reason = match copy.status.as_deref() {
+                Some("integration_variant") => self.tr("此集成副本包含本机适配，现有内容已保留并由集成维护；不参与 Kitter 自动同步，不在此启停或卸载。服务是否可用请在 Proma 中确认。", "This integration copy has local adaptations. Its contents are preserved and maintained by the integration; excluded from Kitter auto-sync, state changes and uninstall here. Check service availability in Proma."),
                 Some("preset_variant") => self.tr("匹配本机 Proma 预设模板，但与当前应用自带内容不同。已归为内置预设并保留本机内容；启停仍受保护。", "Matches a configured Proma preset template but differs from the current app. Shown as a built-in preset while preserving local content; state changes remain protected."),
                 _ if copy.bundled => self.tr("Proma 内置预设，可在批量管理中启用或停用。", "Proma preset; enable or disable it in batch management."),
                 _ if copy.integration.is_some() => self.tr("此副本由集成维护，不参与本地技能自动同步。", "Managed by an integration; excluded from local skill auto-sync."),
