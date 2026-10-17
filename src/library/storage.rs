@@ -91,6 +91,10 @@ fn real_path(path: &Path, allow_missing: bool) -> Result<PathBuf> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows prefix (including \\?\C:) is not yet its root directory.
+        // Wait for RootDir before asking the filesystem about it.
+        #[cfg(windows)]
+        if matches!(component, Component::Prefix(_)) { continue; }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if !metadata.is_dir() || directory_link::inspect(&current)?.is_some() {
@@ -675,6 +679,22 @@ pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_windows_drive_and_verbatim_paths_validate_complete_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().canonicalize().unwrap();
+        let plain = PathBuf::from(canonical.to_str().unwrap().trim_start_matches(r"\\?\"));
+        for path in [&canonical, &plain] {
+            assert!(path.is_absolute());
+            assert_eq!(real_path(path, false).unwrap(), *path);
+            let missing = path.join("missing");
+            assert_eq!(real_path(&missing, true).unwrap(), missing);
+            assert!(real_path(&missing, false).is_err());
+            assert_eq!(real_path(path.ancestors().last().unwrap(), false).unwrap(), path.ancestors().last().unwrap());
+        }
+    }
 
     #[cfg(windows)]
     #[test]
