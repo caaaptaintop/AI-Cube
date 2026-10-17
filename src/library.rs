@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::{
+    package_fs::FileLock,
     AppConfig, SkillGroup, SkillOrigin, SkillRecord, SkillSource, SkillSourceRecord, SkillSummary,
     TriggerMode, config, trigger::TriggerSource,
 };
@@ -78,25 +79,25 @@ pub struct SkillLibrary {
     proma_sync_warnings: Vec<String>,
 }
 
-fn lock_registry_file(path: &Path) -> Result<fs::File> {
+fn lock_registry_file(path: &Path) -> Result<FileLock> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600).custom_flags(libc::O_NOFOLLOW); }
     let lock = options.open(path)?;
     lock.try_lock().map_err(|_| anyhow::anyhow!("存储正被其他操作使用，请稍后重试"))?;
-    Ok(lock)
+    Ok(FileLock::from_locked(lock))
 }
 
 // This sibling lock protects root creation and rename until registry.lock can
 // be acquired. A startup must not recreate the old root during a data move.
-fn storage_parent_lock(data_dir: &Path) -> Result<fs::File> {
+fn storage_parent_lock(data_dir: &Path) -> Result<FileLock> {
     let parent = data_dir.parent().context("应用数据目录缺少父目录")?;
     fs::create_dir_all(parent)?;
     lock_registry_file(&parent.join(".pleat-storage-root.lock"))
 }
 
-fn registry_file_lock(data_dir: &Path) -> Result<fs::File> {
+fn registry_file_lock(data_dir: &Path) -> Result<FileLock> {
     fs::create_dir_all(data_dir)?;
     lock_registry_file(&data_dir.join("registry.lock"))
 }
@@ -298,7 +299,7 @@ impl SkillLibrary {
         Ok(())
     }
 
-    fn write_lock(&self) -> Result<fs::File> {
+    fn write_lock(&self) -> Result<FileLock> {
         let _parent_lock = storage_parent_lock(&self.data_dir)?;
         let lock = registry_file_lock(&self.data_dir)?;
         self.verify_disk_revisions()?;

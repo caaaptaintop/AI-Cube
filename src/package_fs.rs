@@ -23,6 +23,30 @@ pub(crate) struct Directory {
     path: std::path::PathBuf,
 }
 
+pub(crate) struct FileLock {
+    file: fs::File,
+    owner: u32,
+}
+
+impl FileLock {
+    pub(crate) fn from_locked(file: fs::File) -> Self {
+        Self { file, owner: std::process::id() }
+    }
+}
+
+impl std::ops::Deref for FileLock {
+    type Target = fs::File;
+    fn deref(&self) -> &Self::Target { &self.file }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Closing alone can leave a fork-inherited description holding flock.
+        // Only the acquiring process ends this guard's lock ownership.
+        if self.owner == std::process::id() { let _ = self.file.unlock(); }
+    }
+}
+
 pub(crate) fn is_not_found(error: &anyhow::Error) -> bool {
     #[cfg(unix)]
     if error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) {
@@ -134,7 +158,7 @@ impl Directory {
         Ok(())
     }
 
-    pub(crate) fn lock(&self, name: &Path) -> Result<fs::File> {
+    pub(crate) fn lock(&self, name: &Path) -> Result<FileLock> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -142,7 +166,7 @@ impl Directory {
             let file: fs::File = rustix::fs::openat(&parent, name.as_str(), OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::from_raw_mode(0o600))?.into();
             if !file.metadata()?.is_file() { bail!("Proma 工作区锁不是普通文件"); }
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { bail!("Proma 工作区已有写操作，请稍后重试"); }
-            Ok(file)
+            Ok(FileLock::from_locked(file))
         }
         #[cfg(not(unix))]
         { let _ = name; bail!("此平台尚未支持 Proma 受管写入") }
