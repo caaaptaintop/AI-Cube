@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Kitter</string>
+	<string>Pleat</string>
 	<key>CFBundleExecutable</key>
 	<string>Kitter</string>
 	<key>CFBundleIconFile</key>
@@ -11,7 +11,7 @@
 	<key>CFBundleIdentifier</key>
 	<string>dev.kitter.app</string>
 	<key>CFBundleName</key>
-	<string>Kitter</string>
+	<string>Pleat</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

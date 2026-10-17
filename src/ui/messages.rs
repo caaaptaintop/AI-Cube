@@ -72,7 +72,7 @@ const MESSAGES: &[(&str, &str)] = &[
     ),
     (
         "Kitter 内置 Skill 会随 Kitter 自动更新",
-        "This built-in skill updates with Kitter",
+        "This built-in skill updates with Pleat",
     ),
     (
         "Kitter 内置 Skill 不能删除",
@@ -112,7 +112,7 @@ const MESSAGES: &[(&str, &str)] = &[
 
 pub(super) fn error_message(message: &str, english: bool) -> String {
     if let Some((zh, en)) = MESSAGES.iter().find(|(zh, _)| *zh == message.trim()) {
-        return if english { *en } else { *zh }.into();
+        return if english { *en } else { *zh }.replace("Kitter", "Pleat");
     }
     // Keep paths, command output, and implementation details in diagnostics.
     eprintln!("Kitter: {message}");
@@ -196,6 +196,7 @@ mod tests {
 
     #[test]
     fn diagnostics_do_not_leak_into_ui_errors() {
+        assert_eq!(error_message("Kitter 内置 Skill 不能删除", false), "Pleat 内置 Skill 不能删除");
         assert_eq!(
             error_message("Kitter 内置 Skill 不能删除", true),
             "This built-in skill cannot be deleted"

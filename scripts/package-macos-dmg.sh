@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 <Kitter.app> <background.png> <output.dmg>" >&2
+  echo "Usage: $0 <Pleat.app> <background.png> <output.dmg>" >&2
   exit 2
 fi
 
@@ -22,7 +22,7 @@ uvx --from "dmgbuild==1.6.7" dmgbuild \
   -s "$settings_path" \
   -D "app=${app_path}" \
   -D "background=${background_path}" \
-  "Kitter Installer" \
+  "Pleat Installer" \
   "$output_path"
 
 hdiutil verify "$output_path"
@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 hdiutil attach -readonly -nobrowse -mountpoint "$mount_root" "$output_path" >/dev/null
-codesign --verify --deep --strict --verbose=2 "$mount_root/Kitter.app"
+codesign --verify --deep --strict --verbose=2 "$mount_root/Pleat.app"
 uv run --no-project --with "dmgbuild==1.6.7" python - "$mount_root" "$settings_path" <<'PYTHON'
 import pathlib
 import runpy

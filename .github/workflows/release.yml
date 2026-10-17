@@ -40,7 +40,7 @@ jobs:
         run: just release
       - name: Verify binary architectures
         run: |
-          lipo target/release/Kitter.app/Contents/MacOS/Kitter -verify_arch "$KITTER_ARCH"
+          lipo target/release/Pleat.app/Contents/MacOS/Kitter -verify_arch "$KITTER_ARCH"
           lipo target/release/kitter -verify_arch "$KITTER_ARCH"
           target/release/kitter --help
       - name: Package standalone CLI
@@ -57,7 +57,7 @@ jobs:
         with:
           name: release-macos-${{ matrix.arch }}
           path: |
-            target/release/Kitter-*-macos-${{ matrix.arch }}.dmg
+            target/release/Pleat-*-macos-${{ matrix.arch }}.dmg
             target/release/Kitter-*-cli-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
@@ -88,14 +88,14 @@ jobs:
         shell: bash
         run: |
           crate_version="${GITHUB_REF_NAME#v}"
-          package_dir="target/release/kitter-desktop-linux-x86_64/Kitter"
-          archive="target/release/Kitter-${crate_version}-desktop-linux-x86_64.tar.gz"
+          package_dir="target/release/kitter-desktop-linux-x86_64/Pleat"
+          archive="target/release/Pleat-${crate_version}-desktop-linux-x86_64.tar.gz"
           mkdir -p "$package_dir"
-          cp target/release/kitter-desktop "$package_dir/Kitter"
-          cp assets/app-icon.png "$package_dir/Kitter.png"
+          cp target/release/kitter-desktop "$package_dir/Pleat"
+          cp assets/app-icon.png "$package_dir/Pleat.png"
           cp README.md README.zh-CN.md LICENSE THIRD_PARTY_LICENSES.md "$package_dir/"
-          chmod +x "$package_dir/Kitter"
-          tar -czf "$archive" -C "$(dirname "$package_dir")" Kitter
+          chmod +x "$package_dir/Pleat"
+          tar -czf "$archive" -C "$(dirname "$package_dir")" Pleat
           tar -tzf "$archive"
       - name: Package standalone CLI
         shell: bash
@@ -111,7 +111,7 @@ jobs:
         with:
           name: release-linux-x86-64
           path: |
-            target/release/Kitter-*-desktop-linux-x86_64.tar.gz
+            target/release/Pleat-*-desktop-linux-x86_64.tar.gz
             target/release/Kitter-*-cli-linux-x86_64.tar.gz
           if-no-files-found: error
 
@@ -136,13 +136,13 @@ jobs:
         shell: pwsh
         run: |
           $crateVersion = ($env:GITHUB_REF_NAME).TrimStart('v')
-          $desktopExe = "target/release/Kitter-$crateVersion-desktop-windows-x86_64.exe"
+          $desktopExe = "target/release/Pleat-$crateVersion-desktop-windows-x86_64.exe"
           Copy-Item target/release/kitter-desktop.exe $desktopExe
           if (-not (Test-Path $desktopExe)) {
             throw "Desktop executable was not created"
           }
           $versionInfo = (Get-Item $desktopExe).VersionInfo
-          if ($versionInfo.ProductName -ne "Kitter" -or $versionInfo.FileDescription -ne "Kitter") {
+          if ($versionInfo.ProductName -ne "Pleat" -or $versionInfo.FileDescription -ne "Pleat") {
             throw "Desktop executable is missing Windows application resources"
           }
       - name: Package standalone CLI
@@ -161,7 +161,7 @@ jobs:
         with:
           name: release-windows-x86-64
           path: |
-            target/release/Kitter-*-desktop-windows-x86_64.exe
+            target/release/Pleat-*-desktop-windows-x86_64.exe
             target/release/Kitter-*-cli-windows-x86_64.zip
           if-no-files-found: error
 
@@ -186,4 +186,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
-            --title "Kitter $GITHUB_REF_NAME"
+            --title "Pleat $GITHUB_REF_NAME"

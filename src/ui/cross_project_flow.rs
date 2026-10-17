@@ -248,9 +248,9 @@ impl KitterApp {
 
     fn cross_project_action_hint(&self, action: Action) -> &'static str {
         match action {
-            Action::Install => self.tr("从 Kitter 安装所选用户技能。Proma 新副本安装后默认可用，旧停用副本会明确列为重新安装。", "Install user skills from Kitter. New Proma copies are active; legacy inactive copies are reviewed as reinstalls."),
-            Action::Remove => self.tr("移除所选项目的用户技能安装。实体副本会卸载；软链接仅移除链接，Kitter 技能源及本机配置保留。", "Uninstall selected project copies, or remove only their links. Kitter sources and local settings are retained."),
-            Action::Convert => self.tr("仅用于 Proma 旧软链接。来源已在 Kitter 收录且匹配时，替换为工作区副本；未收录或失效链接可先移除。", "For legacy Proma links only. Replace links to matching Kitter sources with workspace copies; unregistered or broken links can be removed."),
+            Action::Install => self.tr("从 Pleat 安装所选用户技能。Proma 新副本安装后默认可用，旧停用副本会明确列为重新安装。", "Install user skills from Pleat. New Proma copies are active; legacy inactive copies are reviewed as reinstalls."),
+            Action::Remove => self.tr("移除所选项目的用户技能安装。实体副本会卸载；软链接仅移除链接，Pleat 技能源及本机配置保留。", "Uninstall selected project copies, or remove only their links. Pleat sources and local settings are retained."),
+            Action::Convert => self.tr("仅用于 Proma 旧软链接。来源已在 Pleat 收录且匹配时，替换为工作区副本；未收录或失效链接可先移除。", "For legacy Proma links only. Replace links to matching Pleat sources with workspace copies; unregistered or broken links can be removed."),
             Action::Enable => self.tr("仅启用已核验的 Proma 内置预设。用户技能请在“用户技能”中安装；集成项由提供方维护。", "Enable verified Proma built-in presets. Install user skills in User skills; integrations remain provider-managed."),
             Action::Disable => self.tr("仅停用 Proma 内置预设，保留文件以便恢复。用户技能请使用卸载。", "Disable Proma built-in presets while retaining their files. Uninstall user skills instead."),
         }
@@ -601,7 +601,7 @@ impl KitterApp {
                     .child(self.toolbar_text_button("cross-project-refresh", self.tr("刷新", "Refresh")).disabled(busy).on_click(cx.listener(|this, _, _, cx| this.load_cross_project(cx))))
                     .child(self.toolbar_text_button("cross-project-close", self.tr("关闭", "Close")).disabled(state.busy).on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx)))))
                 .child(div().mt(px(7.)).text_size(px(12.)).text_color(p.secondary).child(if state.conversion_paths.is_some() {
-                    self.tr("仅转换下列工作区中的所选软链接，Kitter 技能源与本机资料保留。确认后执行。", "Convert only the selected links in the workspaces below. Keep Kitter sources and local data; apply after confirmation.").to_string()
+                    self.tr("仅转换下列工作区中的所选软链接，Pleat 技能源与本机资料保留。确认后执行。", "Convert only the selected links in the workspaces below. Keep Pleat sources and local data; apply after confirmation.").to_string()
                 } else { self.cross_project_explanation() })))
             .child(content)
             .child(div().px(px(20.)).py(px(12.)).border_t_1().border_color(p.border).flex().items_center().gap(px(7.))

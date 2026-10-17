@@ -2693,7 +2693,7 @@ pub fn run() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         let preview_id = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_ID").ok()).flatten();
         let preview_name = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_NAME").ok()).flatten();
-        cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Kitter"));
+        cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Pleat"));
         gpui_component::init(cx);
         crate::assets::register_fonts(cx).expect("failed to register fonts");
         open_main_window(cx);
@@ -2709,7 +2709,7 @@ fn open_main_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("Kitter".into()),
+                title: Some("Pleat".into()),
                 appears_transparent: cfg!(target_os = "macos"),
                 traffic_light_position: cfg!(target_os = "macos")
                     .then(|| point(px(16.), px(17.))),

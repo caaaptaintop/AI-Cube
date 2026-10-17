@@ -687,12 +687,12 @@ impl KitterApp {
                         format!("删除 {} 个技能？", labels.len())
                     },
                     (if linked_count == skills.len() {
-                        self.tr("仅移除 Kitter 托管与安装链接，原始源目录保留。", "Remove Kitter entries and installation links. Original source folders are kept.")
+                        self.tr("仅移除 Pleat 托管与安装链接，原始源目录保留。", "Remove Pleat entries and installation links. Original source folders are kept.")
                     } else if linked_count > 0 {
                         self.tr("托管副本与安装将被删除；链接来源的原始目录保留。", "Managed copies and installations will be removed. Linked source folders are kept.")
                     } else { self.tr(
-                        "这会从 Kitter 中删除这些技能，同时移除它们在项目中的安装。以下位置的文件也会被删除，且无法恢复：",
-                        "This removes these skills from Kitter and from projects where they are installed. Files at these locations will also be deleted and cannot be restored:",
+                        "这会从 Pleat 中删除这些技能，同时移除它们在项目中的安装。以下位置的文件也会被删除，且无法恢复：",
+                        "This removes these skills from Pleat and from projects where they are installed. Files at these locations will also be deleted and cannot be restored:",
                     ) })
                     .to_string(),
                     Some(
@@ -762,13 +762,13 @@ impl KitterApp {
                 } else {
                     if global_scope {
                         self.tr(
-                            "只会移除选中的用户级安装。Kitter 中保存的技能不会被删除，你之后仍可以再次安装。",
-                            "Only the selected user-level installations will be removed. The skill saved in Kitter will remain available to install again.",
+                            "只会移除选中的用户级安装。Pleat 中保存的技能不会被删除，你之后仍可以再次安装。",
+                            "Only the selected user-level installations will be removed. The skill saved in Pleat will remain available to install again.",
                         )
                     } else {
                         self.tr(
-                            "只会移除这个项目中的安装。Kitter 中保存的技能不会被删除，你之后仍可以再次安装。",
-                            "Only the project installations will be removed. The skill saved in Kitter will remain available to install again.",
+                            "只会移除这个项目中的安装。Pleat 中保存的技能不会被删除，你之后仍可以再次安装。",
+                            "Only the project installations will be removed. The skill saved in Pleat will remain available to install again.",
                         )
                     }
                 };

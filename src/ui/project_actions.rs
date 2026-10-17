@@ -100,7 +100,7 @@ impl KitterApp {
         self.projects_view.batch_filter = None;
         self.sync_project_select(window, cx);
         let message = match action {
-            ProjectVisibilityAction::Hide => self.tr("已在 Kitter 中隐藏，可从“已归档／隐藏”恢复", "Hidden in Kitter; restore from Archived / hidden"),
+            ProjectVisibilityAction::Hide => self.tr("已在 Pleat 中隐藏，可从“已归档／隐藏”恢复", "Hidden in Pleat; restore from Archived / hidden"),
             ProjectVisibilityAction::Restore => self.tr("已恢复到活跃项目", "Restored to active projects"),
             ProjectVisibilityAction::FollowAgent => self.tr("已恢复跟随 Agent 归档状态", "Now following Agent archive status"),
         };

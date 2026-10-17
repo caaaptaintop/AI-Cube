@@ -1727,7 +1727,7 @@ impl KitterApp {
                 .justify_center()
                 .text_color(p.muted)
                 .child(if searching { self.tr("没有匹配的技能", "No matching skills") } else { self.tr(
-                    "添加第一个技能开始使用 Kitter",
+                    "添加第一个技能开始使用 Pleat",
                     "Add your first skill to get started",
                 ) })
                 .child(self.window_drag_strip("empty-skill-detail-window-drag", 24., cx));

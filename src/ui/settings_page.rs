@@ -102,8 +102,8 @@ impl KitterApp {
                 row(
                     self.tr("语言", "Language"),
                     self.tr(
-                        "选择 Kitter 界面的显示语言。",
-                        "Choose the language used by Kitter.",
+                        "选择 Pleat 界面的显示语言。",
+                        "Choose the language used by Pleat.",
                     ),
                 )
                 .child(language_control),
@@ -162,8 +162,8 @@ impl KitterApp {
                 row(
                     self.tr("技能存放位置", "Skills location"),
                     self.tr(
-                        "Kitter 用来保存所有技能的文件夹。",
-                        "The folder where Kitter keeps all skills.",
+                        "Pleat 用来保存所有技能的文件夹。",
+                        "The folder where Pleat keeps all skills.",
                     ),
                 )
                 .child(
@@ -203,6 +203,29 @@ impl KitterApp {
                 ),
             );
 
+        let about_group = div()
+            .w_full()
+            .rounded(px(RADIUS_CARD))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .p(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(14.))
+            .child(img("brand/pleat-icon.png").size(px(72.)).flex_none())
+            .child(
+                div()
+                    .flex_1()
+                    .child(div().text_size(px(20.)).font_weight(FontWeight::MEDIUM).child("Pleat"))
+                    .child(div().mt(px(2.)).text_size(px(12.)).text_color(p.secondary)
+                        .child(format!("{} · {}", self.tr("版本", "Version"), env!("CARGO_PKG_VERSION"))))
+                    .child(div().mt(px(8.)).text_size(px(12.)).text_color(p.muted)
+                        .child(self.tr("基于 Kitter · Apache-2.0 · 感谢 Kitter 贡献者", "Based on Kitter · Apache-2.0 · Kitter contributors")))
+                    .child(div().mt(px(2.)).text_size(px(12.)).text_color(p.muted)
+                        .child("what1f/kitter")),
+            );
+
         div()
             .relative()
             .flex_1()
@@ -240,7 +263,10 @@ impl KitterApp {
                             .font_weight(FontWeight::MEDIUM)
                             .child(self.tr("技能库", "Skill library")),
                     )
-                    .child(library_group),
+                    .child(library_group)
+                    .child(div().mt(px(28.)).mb(px(10.)).text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM).child(self.tr("关于 Pleat", "About Pleat")))
+                    .child(about_group),
             )
             .child(self.window_drag_strip("settings-window-drag", 20., cx))
     }

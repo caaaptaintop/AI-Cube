@@ -1,3 +1,13 @@
+# Pleat
+
+<img src="./assets/app-icon.png" width="128" height="128" alt="Pleat">
+
+Pleat is a skill management app based on [Kitter](https://github.com/what1f/kitter), maintained in `caaaptaintop/AI-Cube`. The desktop display name and icon are Pleat; the `kitter` CLI, application identity and existing data paths remain compatible.
+
+See [brand assets and reproducible exports](assets/brand/README.md). Build the local macOS candidate with `just package`; this brand candidate has not been publicly released. The upstream Kitter documentation and download links below are retained for reference.
+
+## Upstream Kitter documentation
+
 <p align="center">
   <img src="./assets/readme/hero.en.png" width="100%" alt="Kitter — one skill library where every project gets only what it needs">
 </p>
