@@ -1849,6 +1849,9 @@ mod e2e_tests {
             app.open_install_dialog(window, cx);
         });
         cx.refresh().unwrap();
+        let scope = cx.debug_bounds("install-scope-projects").unwrap();
+        cx.simulate_click(scope.center(), Modifiers::none());
+        cx.refresh().unwrap();
         let picker = cx.debug_bounds("install-project-select").unwrap();
         cx.simulate_click(picker.center(), Modifiers::none());
         cx.run_until_parked();
@@ -1904,6 +1907,9 @@ mod e2e_tests {
             app.open_install_dialog(window, cx);
             app.install_flow.selected_projects.clear();
         });
+        cx.refresh().unwrap();
+        let scope = cx.debug_bounds("install-scope-projects").unwrap();
+        cx.simulate_click(scope.center(), Modifiers::none());
         cx.refresh().unwrap();
         let picker = cx.debug_bounds("install-project-select").unwrap();
         cx.simulate_click(picker.center(), Modifiers::none());
