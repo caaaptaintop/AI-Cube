@@ -701,16 +701,16 @@ impl KitterApp {
         };
         let details = copies.iter().map(|copy| {
             let reason = match copy.status.as_deref() {
-                Some("integration_variant") => self.tr("此集成副本包含本机适配，现有内容已保留并由集成维护；不参与 Kitter 自动同步，不在此启停或卸载。服务是否可用请在 Proma 中确认。", "This integration copy has local adaptations. Its contents are preserved and maintained by the integration; excluded from Kitter auto-sync, state changes and uninstall here. Check service availability in Proma."),
+                Some("integration_variant") => self.tr("此集成副本包含本机适配，现有内容已保留并由集成维护；不参与 Pleat 自动同步，不在此启停或卸载。服务是否可用请在 Proma 中确认。", "This integration copy has local adaptations. Its contents are preserved and maintained by the integration; excluded from Pleat auto-sync, state changes and uninstall here. Check service availability in Proma."),
                 Some("preset_variant") => self.tr("匹配本机 Proma 预设模板，但与当前应用自带内容不同。已归为内置预设并保留本机内容；启停仍受保护。", "Matches a configured Proma preset template but differs from the current app. Shown as a built-in preset while preserving local content; state changes remain protected."),
                 _ if copy.bundled => self.tr("Proma 内置预设，可在批量管理中启用或停用。", "Proma preset; enable or disable it in batch management."),
                 _ if copy.integration.is_some() => self.tr("此副本由集成维护，不参与本地技能自动同步。", "Managed by an integration; excluded from local skill auto-sync."),
                 Some("modified") => self.tr("副本已自行修改，现有内容已保留；自动同步不会覆盖。", "This copy has local changes. Its contents are preserved and auto-sync will not overwrite them."),
                 Some("update_pending") => self.tr("副本与来源不同。已登记的本地技能会在内容稳定后自动同步；同步遇到冲突时保留现有副本。", "This copy differs from its source. Registered local skills sync after edits settle; conflicts preserve the existing copy."),
-                Some("external_link") => self.tr("这是旧软链接安装。可以仅移除链接，保留源文件；来源已在 Kitter 收录时可转换为工作区副本。", "This is a legacy link. Remove only the link, or convert it to a workspace copy when its source is registered in Kitter."),
+                Some("external_link") => self.tr("这是旧软链接安装。可以仅移除链接，保留源文件；来源已在 Pleat 收录时可转换为工作区副本。", "This is a legacy link. Remove only the link, or convert it to a workspace copy when its source is registered in Pleat."),
                 Some("broken_link") => self.tr("链接目标已不存在，可以清理工作区里的链接入口。", "The link target is missing. Remove the broken link from this workspace."),
-                Some("unmanaged") => self.tr("此副本未由 Kitter 托管，不参与本地技能自动同步。", "This copy is not managed by Kitter; excluded from local skill auto-sync."),
-                Some("current") if copy.state.as_deref() == Some("inactive") => self.tr("这是以前保留在停用目录的用户副本。可卸载，或从 Kitter 重新安装；用户技能不再提供启停。", "This legacy user copy remains in the inactive directory. Uninstall it or reinstall it from Kitter; user skills no longer have state toggles."),
+                Some("unmanaged") => self.tr("此副本未由 Pleat 托管，不参与本地技能自动同步。", "This copy is not managed by Pleat; excluded from local skill auto-sync."),
+                Some("current") if copy.state.as_deref() == Some("inactive") => self.tr("这是以前保留在停用目录的用户副本。可卸载，或从 Pleat 重新安装；用户技能不再提供启停。", "This legacy user copy remains in the inactive directory. Uninstall it or reinstall it from Pleat; user skills no longer have state toggles."),
                 Some("current") => self.tr("副本与来源一致。", "This copy matches its source."),
                 _ => self.tr("尚未核验副本状态，现有内容已保留。", "Copy status is unverified; its existing contents are preserved."),
             };
@@ -1174,7 +1174,7 @@ impl KitterApp {
         let help = [
             self.tr("项目列表显示", "Project visibility"),
             self.tr("活跃项目：默认显示；任一关联 Agent 活跃就保留。", "Active: shown by default while any associated Agent is active."),
-            self.tr("已归档／隐藏：关联 Agent 均已归档，或你手动隐藏。", "Archived / hidden: every associated Agent explicitly archived it, or you hid it in Kitter."),
+            self.tr("已归档／隐藏：关联 Agent 均已归档，或你手动隐藏。", "Archived / hidden: every associated Agent explicitly archived it, or you hid it in Pleat."),
             self.tr("全部项目：同时查看以上两类。", "All: show both groups together."),
             self.tr("右键可隐藏；在归档／隐藏列表中可恢复到活跃项目。", "Right-click to hide; restore from the Archived / hidden list."),
             self.tr("目录、技能和安装记录均保留。状态不明或读取失败不会自动归档；Codex 项目可手动隐藏。", "Folders, skills and installation records are retained. Unknown states or scan failures never trigger archival; Codex projects can be hidden manually."),
@@ -1343,7 +1343,7 @@ impl KitterApp {
             .to_string();
             let visibility_action = if inactive { ProjectVisibilityAction::Restore } else { ProjectVisibilityAction::Hide };
             let remove_label = if inactive { self.tr("恢复到活跃项目", "Restore to active projects") }
-                else { self.tr("在 Kitter 中隐藏", "Hide in Kitter") }.to_string();
+                else { self.tr("在 Pleat 中隐藏", "Hide in Pleat") }.to_string();
             let follow_label = self.tr("跟随 Agent 归档状态", "Follow Agent archive status").to_string();
             let follow_app = project_context_app.clone();
             let follow_path = path.clone();
@@ -1603,7 +1603,7 @@ impl KitterApp {
             let is_global = self.projects_view.global_project_view;
             let inactive_entry = all_projects.iter().find(|entry| entry.path == *open_project && !entry.is_active());
             let visibility_notice = inactive_entry.map(|entry| if entry.hidden {
-                self.tr("已在 Kitter 中隐藏 · 文件和技能均保留", "Hidden in Kitter · files and skills are retained")
+                self.tr("已在 Pleat 中隐藏 · 文件和技能均保留", "Hidden in Pleat · files and skills are retained")
             } else {
                 self.tr("已在 Agent 中归档 · 文件和技能均保留", "Archived in Agent · files and skills are retained")
             });
@@ -1903,8 +1903,8 @@ impl KitterApp {
                         .line_height(relative(1.55))
                         .text_color(p.muted)
                         .child(self.tr(
-                            "Kitter 会读取项目里的技能，并让你管理它们的安装边界。",
-                            "Kitter reads the skills in a project and lets you manage where they are installed.",
+                            "Pleat 会读取项目里的技能，并让你管理它们的安装边界。",
+                            "Pleat reads the skills in a project and lets you manage where they are installed.",
                         )),
                 )
                 .child(

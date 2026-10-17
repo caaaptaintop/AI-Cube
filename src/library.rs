@@ -20,6 +20,9 @@ use crate::{
     TriggerMode, config, trigger::TriggerSource,
 };
 
+pub(crate) mod storage;
+pub use storage::{StorageAction, StoragePlan};
+
 pub const KITTER_SKILL_STORAGE: &str = "_kitter-builtin";
 const KITTER_SKILL_NAME: &str = "kitter";
 const KITTER_SKILL_MD: &str = include_str!("../resources/skills/kitter/SKILL.md");
@@ -31,6 +34,8 @@ const KITTER_INSTALL_CLI_MD: &str =
 thread_local! {
     static BEFORE_UPDATE_COMMIT: RefCell<Option<fn(&Path, &Path, &Path)>> = RefCell::new(None);
     static AFTER_CONFIG_READ: RefCell<Option<fn(&Path)>> = RefCell::new(None);
+    static BEFORE_STORAGE_OPEN_READ: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static AFTER_STORAGE_OPEN_READ: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -73,14 +78,48 @@ pub struct SkillLibrary {
     proma_sync_warnings: Vec<String>,
 }
 
+fn lock_registry_file(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600).custom_flags(libc::O_NOFOLLOW); }
+    let lock = options.open(path)?;
+    lock.try_lock().map_err(|_| anyhow::anyhow!("存储正被其他操作使用，请稍后重试"))?;
+    Ok(lock)
+}
+
+// This sibling lock protects root creation and rename until registry.lock can
+// be acquired. A startup must not recreate the old root during a data move.
+fn storage_parent_lock(data_dir: &Path) -> Result<fs::File> {
+    let parent = data_dir.parent().context("应用数据目录缺少父目录")?;
+    fs::create_dir_all(parent)?;
+    lock_registry_file(&parent.join(".pleat-storage-root.lock"))
+}
+
+fn registry_file_lock(data_dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(data_dir)?;
+    lock_registry_file(&data_dir.join("registry.lock"))
+}
+
 impl SkillLibrary {
     pub fn open() -> Result<Self> {
+        if std::env::var_os("KITTER_HOME").is_none() {
+            config::validate_app_data_roots(&config::preferred_app_data_dir(), &config::legacy_app_data_dir())?;
+        }
         Self::open_in(config::app_data_dir())
     }
 
     pub fn open_in(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
+        storage::ensure_no_pending(&data_dir)?;
+        let _parent_lock = storage_parent_lock(&data_dir)?;
+        let startup_lock = registry_file_lock(&data_dir)?;
+        storage::ensure_no_pending(&data_dir)?;
+        #[cfg(test)]
+        BEFORE_STORAGE_OPEN_READ.with(|hook| { if let Some(callback) = hook.borrow_mut().take() { callback(); } });
         let config_bytes = read_optional(&data_dir.join("config.json"))?;
+        #[cfg(test)]
+        AFTER_STORAGE_OPEN_READ.with(|hook| { if let Some(callback) = hook.borrow_mut().take() { callback(); } });
         #[cfg(test)]
         AFTER_CONFIG_READ.with(|hook| {
             if let Some(callback) = hook.borrow_mut().take() { callback(&data_dir); }
@@ -89,6 +128,11 @@ impl SkillLibrary {
             Some(bytes) => serde_json::from_slice(bytes).context("配置格式无效")?,
             None => AppConfig { library_dir: data_dir.join("skills"), ..AppConfig::default() },
         };
+        // A transaction may have begun while the configuration was read.
+        storage::ensure_no_pending(&data_dir)?;
+        if !config.library_dir.exists() && data_dir.join(".pleat-storage-recovery").symlink_metadata().is_ok() {
+            bail!("技能库缺失且存在存储恢复材料，未新建空库；请检查 {}", data_dir.join(".pleat-storage-recovery").display());
+        }
         fs::create_dir_all(&config.library_dir)?;
         ensure_builtin_skill(&config.library_dir)?;
         let path = data_dir.join("registry.json");
@@ -233,7 +277,7 @@ impl SkillLibrary {
             proma_sync_warnings: Vec::new(),
         };
         if changed {
-            library.save()?;
+            library.save_locked(&startup_lock)?;
         }
         Ok(library)
     }
@@ -244,6 +288,7 @@ impl SkillLibrary {
     }
 
     fn verify_disk_revisions(&self) -> Result<()> {
+        storage::ensure_no_pending(&self.data_dir)?;
         let paths = [self.data_dir.join("config.json"), self.data_dir.join("registry.json")];
         for (path, expected) in paths.iter().zip(self.disk_revisions.lock().map_err(|_| anyhow::anyhow!("登记版本锁不可用"))?.iter()) {
             if file_revision(path)? != *expected {
@@ -254,13 +299,8 @@ impl SkillLibrary {
     }
 
     fn write_lock(&self) -> Result<fs::File> {
-        fs::create_dir_all(&self.data_dir)?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW); }
-        let lock = options.open(self.data_dir.join("registry.lock"))?;
-        lock.try_lock().map_err(|_| anyhow::anyhow!("另一个 Kitter 写操作正在进行，请稍后重试"))?;
+        let _parent_lock = storage_parent_lock(&self.data_dir)?;
+        let lock = registry_file_lock(&self.data_dir)?;
         self.verify_disk_revisions()?;
         Ok(lock)
     }

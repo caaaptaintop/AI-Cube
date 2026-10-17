@@ -1,3 +1,13 @@
+# Pleat
+
+<img src="./assets/app-icon.png" width="128" height="128" alt="Pleat">
+
+Pleat 是基于 [Kitter](https://github.com/what1f/kitter) 的技能管理应用，维护于 `caaaptaintop/AI-Cube`。桌面显示名称和图标采用 Pleat；`kitter` CLI、应用技术标识及原有数据路径继续兼容。
+
+[品牌母版与可复现导出](assets/brand/README.md)。本机 macOS 候选通过 `just package` 构建，此品牌候选尚未公开发布。以下保留上游 Kitter 使用文档及下载链接作为参考。
+
+## 上游 Kitter 文档
+
 <p align="center">
   <img src="./assets/readme/hero.zh-CN.png" width="100%" alt="Kitter：一套 Skill 仓库，让每个项目只获得自己需要的 Skill">
 </p>

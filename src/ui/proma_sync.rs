@@ -10,10 +10,17 @@ impl KitterApp {
             loop {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
                 let Ok(sources) =
-                    this.update(cx, |this, _| this.model.library.local_source_paths())
+                    this.update(cx, |this, cx| {
+                        if this.shell.dialog_body.as_ref().is_some_and(|body| matches!(body.read(cx).kind, DialogKind::Storage)) {
+                            return None;
+                        }
+                        this.model.proma_sync_running = true;
+                        Some(this.model.library.local_source_paths())
+                    })
                 else {
                     break;
                 };
+                let Some(sources) = sources else { continue; };
                 let root = root.clone();
                 let (returned_sync, report) = cx
                     .background_executor()
@@ -30,6 +37,7 @@ impl KitterApp {
                 sync = returned_sync;
                 if this
                     .update(cx, |this, cx| {
+                        this.model.proma_sync_running = false;
                         let changed =
                             report.updated > 0 || this.model.proma_sync_warnings != report.warnings;
                         this.model.proma_sync_warnings = report.warnings;

@@ -28,6 +28,7 @@ pub(super) struct AppModel {
     pub updating_skill: Option<String>,
     pub proma_sync_task: Option<gpui::Task<()>>,
     pub proma_sync_warnings: Vec<String>,
+    pub proma_sync_running: bool,
 }
 
 pub(super) struct ShellState {

@@ -4,8 +4,8 @@ fn main() {
     #[cfg(target_os = "windows")]
     winresource::WindowsResource::new()
         .set_icon("assets/app-icon.ico")
-        .set("ProductName", "Kitter")
-        .set("FileDescription", "Kitter")
+        .set("ProductName", "Pleat")
+        .set("FileDescription", "Pleat")
         .set("LegalCopyright", "Copyright Kitter contributors")
         .compile()
         .expect("failed to embed Windows application resources");

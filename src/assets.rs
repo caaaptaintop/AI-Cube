@@ -7,6 +7,10 @@ pub struct Assets;
 
 const ICONS: &[(&str, &[u8])] = &[
     (
+        "brand/pleat-icon.png",
+        include_bytes!("../assets/app-icon.png"),
+    ),
+    (
         "icons/provider-proma-black.png",
         include_bytes!("../assets/icons/provider-proma-black.png"),
     ),

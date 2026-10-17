@@ -75,6 +75,14 @@ pub(crate) fn rename_exclusive(source: &Path, destination: &Path) -> Result<()> 
 }
 
 impl Directory {
+    /// Flush directory entries on Unix using the already verified descriptor.
+    /// Windows storage files are flushed individually before atomic replacement.
+    pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(unix)]
+        self.file.sync_all()?;
+        Ok(())
+    }
+
     /// Resolve every absolute component without following directory links.
     /// Proma writes retain these descriptors throughout a transaction.
     pub(crate) fn open_anchored(path: &Path) -> Result<Self> {

@@ -589,9 +589,9 @@ impl KitterApp {
                             .line_height(relative(1.5))
                             .text_color(p.muted)
                             .child(if self.add_flow.kind == AddKind::Existing {
-                                self.tr("扫描指定目录下所有技能并托管到 Kitter。", "Scan all skills in the selected directory and adopt them into Kitter.")
+                                self.tr("扫描指定目录下所有技能并托管到 Pleat。", "Scan all skills in the selected directory and adopt them into Pleat.")
                             } else {
-                                self.tr("选择来源并粘贴地址，Kitter 会自动识别其中可用的技能。", "Choose a source and paste its address. Kitter will find the available skills.")
+                                self.tr("选择来源并粘贴地址，Pleat 会自动识别其中可用的技能。", "Choose a source and paste its address. Pleat will find the available skills.")
                             }),
                     )
                     .child(form)

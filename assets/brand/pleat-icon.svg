@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Pleat</title>
+  <desc id="desc">Two graphite folded planes separated by ivory negative space, on an ivory rounded tile. Reconstructed from the selected left-hand Pleat reference.</desc>
+  <defs>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#fcf9f1"/>
+      <stop offset="1" stop-color="#f4efe3"/>
+    </linearGradient>
+    <linearGradient id="graphite-back" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3d3f40"/>
+      <stop offset="1" stop-color="#303233"/>
+    </linearGradient>
+    <linearGradient id="graphite-front" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b3d3e"/>
+      <stop offset="1" stop-color="#2f3132"/>
+    </linearGradient>
+    <filter id="tile-shadow" x="-15%" y="-15%" width="130%" height="140%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#4e4735" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+  <!-- Separate, editable tile and two closed Bezier paths. No embedded bitmap. -->
+  <rect id="ivory-tile" x="100" y="100" width="824" height="824" rx="194" fill="url(#ivory)" stroke="#ebe5d8" stroke-width="2" filter="url(#tile-shadow)"/>
+  <!-- Coordinates follow the 441 x 450 left reference tile, excluding its labels. -->
+  <g id="folded-planes" transform="translate(100 100) scale(1.8684807256 1.8311111111)">
+    <path id="back-plane" fill="url(#graphite-back)" d="M95 170 C95 157 101 149 112 143 L246 78 C258 72 267 78 267 91 L267 151 Q267 156 262 158 L196 191 C178 199 171 211 171 229 L171 354 Q171 363 163 358 L106 326 Q95 320 95 306 Z"/>
+    <path id="front-plane" fill="url(#graphite-front)" d="M188 233 C188 218 194 208 208 201 L333 145 Q351 137 351 154 L351 296 C351 311 345 317 333 323 L204 382 Q188 391 188 373 Z"/>
+  </g>
+</svg>

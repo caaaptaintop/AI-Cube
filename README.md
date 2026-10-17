@@ -1,3 +1,13 @@
+# Pleat
+
+<img src="./assets/app-icon.png" width="128" height="128" alt="Pleat">
+
+Pleat is a skill management app based on [Kitter](https://github.com/what1f/kitter), maintained in `caaaptaintop/AI-Cube`. The desktop display name and icon are Pleat; the `kitter` CLI, application identity and existing data paths remain compatible.
+
+See [brand assets and reproducible exports](assets/brand/README.md). Build the local macOS candidate with `just package`; this brand candidate has not been publicly released. The upstream Kitter documentation and download links below are retained for reference.
+
+## Upstream Kitter documentation
+
 <p align="center">
   <img src="./assets/readme/hero.en.png" width="100%" alt="Kitter — one skill library where every project gets only what it needs">
 </p>
@@ -124,15 +134,17 @@ cargo run --release --locked --features desktop --bin kitter-desktop
 
 ## Local data
 
-Kitter stores configuration and source records in the operating system's application-data directory. Skill contents live in the library directory:
+Pleat stores configuration and source records in the operating system's application-data directory. New installations use these default skill libraries:
 
 | Platform | Default skill library |
 | --- | --- |
-| macOS | `~/Library/Application Support/Kitter/skills` |
-| Windows | `%LOCALAPPDATA%\Kitter\skills` |
-| Linux | `$XDG_DATA_HOME/Kitter/skills` or `~/.local/share/Kitter/skills` |
+| macOS | `~/Library/Application Support/Pleat/skills` |
+| Windows | `%LOCALAPPDATA%\Pleat\skills` |
+| Linux | `$XDG_DATA_HOME/Pleat/skills` or `~/.local/share/Pleat/skills` |
 
-View or change the location with `kitter library` and `kitter library --set /absolute/path`.
+Existing Kitter data stays in place until an explicit migration. In Settings → Advanced storage settings, preview moving the library, using an existing library, or moving the Kitter data root to its sibling Pleat folder. Moves retain an old-path compatibility link for installed skills and local runtimes; cross-volume moves and occupied targets are refused. An interrupted metadata transaction blocks reopening until its saved recovery material is resolved.
+
+`kitter library` shows the current library; `kitter library --set /absolute/path` switches to an existing nonempty library using the same transaction checks. To move into an empty folder, use the desktop's “Move current library” action. `KITTER_HOME` remains an explicit application-data override.
 
 ## Contributing
 

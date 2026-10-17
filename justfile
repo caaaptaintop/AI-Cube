@@ -2,12 +2,11 @@ set shell := ["zsh", "-cu"]
 
 root := justfile_directory()
 release_dir := root + "/target/release"
-app_dir := release_dir + "/Kitter.app"
-icon_source := root + "/assets/macos/app-icon.png"
+app_dir := release_dir + "/Pleat.app"
 dmg_background := root + "/assets/dmg/background.png"
 version := `sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1`
 architecture := `uname -m`
-dmg := release_dir + "/Kitter-" + version + "-macos-" + architecture + ".dmg"
+dmg := release_dir + "/Pleat-" + version + "-macos-" + architecture + ".dmg"
 
 default:
     @just --list
@@ -18,28 +17,21 @@ check:
 build:
     cargo build --release --locked --features desktop --bin kitter-desktop --bin kitter
 
-# Regenerate the committed macOS icon with Apple's standalone Icon Composer.
+# Regenerate all production icons from the editable Pleat vector master.
+brand-icons:
+    python3 "{{root}}/scripts/export-brand-assets.py"
+
 macos-icon:
     "{{root}}/scripts/export-macos-icon.sh"
 
 app: build
     rm -rf "{{app_dir}}"
-    rm -rf "{{release_dir}}/logo.iconset"
-    mkdir -p "{{app_dir}}/Contents/MacOS" "{{app_dir}}/Contents/Resources" "{{release_dir}}/logo.iconset"
-    sips -z 16 16 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_16x16.png"
-    sips -z 32 32 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_16x16@2x.png"
-    sips -z 32 32 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_32x32.png"
-    sips -z 64 64 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_32x32@2x.png"
-    sips -z 128 128 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_128x128.png"
-    sips -z 256 256 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_128x128@2x.png"
-    sips -z 256 256 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_256x256.png"
-    sips -z 512 512 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_256x256@2x.png"
-    sips -z 512 512 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_512x512.png"
-    sips -z 1024 1024 "{{icon_source}}" --out "{{release_dir}}/logo.iconset/icon_512x512@2x.png"
-    iconutil -c icns "{{release_dir}}/logo.iconset" -o "{{app_dir}}/Contents/Resources/logo.icns"
+    mkdir -p "{{app_dir}}/Contents/MacOS" "{{app_dir}}/Contents/Resources"
+    cp "{{root}}/assets/macos/app-icon.icns" "{{app_dir}}/Contents/Resources/logo.icns"
     cp "{{release_dir}}/kitter-desktop" "{{app_dir}}/Contents/MacOS/Kitter"
     cp "{{root}}/resources/Info.plist" "{{app_dir}}/Contents/Info.plist"
     cp "{{root}}/LICENSE" "{{root}}/THIRD_PARTY_LICENSES.md" "{{app_dir}}/Contents/Resources/"
+    cp "{{root}}/assets/brand/README.md" "{{app_dir}}/Contents/Resources/BRANDING.md"
     plutil -replace CFBundleShortVersionString -string "{{version}}" "{{app_dir}}/Contents/Info.plist"
     plutil -replace CFBundleVersion -string "{{version}}" "{{app_dir}}/Contents/Info.plist"
     chmod +x "{{app_dir}}/Contents/MacOS/Kitter"

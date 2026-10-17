@@ -32,9 +32,9 @@ fn crash_dialog_message(language: kitter::config::Language) -> &'static str {
     let uses_chinese = language == Language::ZhCn
         || (language == Language::System && Language::system() == Language::ZhCn);
     if uses_chinese {
-        "Kitter 遇到问题。请重新打开后再试。"
+        "Pleat 遇到问题。请重新打开后再试。"
     } else {
-        "Kitter encountered a problem. Please reopen it and try again."
+        "Pleat encountered a problem. Please reopen it and try again."
     }
 }
 
@@ -56,7 +56,7 @@ fn show_windows_error(message: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let caption = "Kitter"
+    let caption = "Pleat"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -81,10 +81,10 @@ mod tests {
         let chinese = super::crash_dialog_message(Language::ZhCn);
         let english = super::crash_dialog_message(Language::En);
 
-        assert_eq!(chinese, "Kitter 遇到问题。请重新打开后再试。");
+        assert_eq!(chinese, "Pleat 遇到问题。请重新打开后再试。");
         assert_eq!(
             english,
-            "Kitter encountered a problem. Please reopen it and try again."
+            "Pleat encountered a problem. Please reopen it and try again."
         );
         for message in [chinese, english] {
             assert!(!message.contains("crash.log"));

@@ -223,6 +223,7 @@ enum DialogKind {
     DeleteGroup,
     MoveGroup,
     CrossProject,
+    Storage,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -483,10 +484,17 @@ pub struct KitterApp {
     tags_flow: TagsFlowState,
     groups_flow: GroupsFlowState,
     cross_project: cross_project_flow::CrossProjectState,
+    settings_storage: settings_actions::StorageState,
 }
 
 impl KitterApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        if std::env::var_os("KITTER_HOME").is_none() {
+            crate::config::validate_app_data_roots(
+                &crate::config::preferred_app_data_dir(),
+                &crate::config::legacy_app_data_dir(),
+            ).unwrap_or_else(|error| panic!("无法打开 Pleat：{error:#}"));
+        }
         let mut app = Self::new_in(crate::config::app_data_dir(), window, cx);
         {
             app.projects_view.discovered_projects =
@@ -837,6 +845,7 @@ impl KitterApp {
                 updating_skill: None,
                 proma_sync_task: None,
                 proma_sync_warnings: Vec::new(),
+                proma_sync_running: false,
             },
             shell: ShellState {
                 page: if initial_project.is_some() { Page::Projects } else { Page::Skills },
@@ -867,6 +876,7 @@ impl KitterApp {
                 collapsed_content_directories: HashSet::new(),
             },
             cross_project,
+            settings_storage: Default::default(),
             projects_view: ProjectsState {
                 proma_directory_menu: None,
                 selected_skill_source: None,
@@ -1506,6 +1516,7 @@ impl Render for DialogBody {
             DialogKind::DeleteGroup => app.group_delete_modal(app_cx),
             DialogKind::MoveGroup => app.move_group_modal(window, app_cx),
             DialogKind::CrossProject => app.cross_project_modal(window, app_cx),
+            DialogKind::Storage => app.storage_modal(app_cx),
         })
     }
 }
@@ -1532,7 +1543,7 @@ impl Render for KitterApp {
             .track_focus(&self.shell.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key.eq_ignore_ascii_case("escape")
-                    && this.shell.dialog_body.as_ref().is_some_and(|body| matches!(body.read(cx).kind, DialogKind::CrossProject))
+                    && this.shell.dialog_body.as_ref().is_some_and(|body| matches!(body.read(cx).kind, DialogKind::CrossProject | DialogKind::Storage))
                 {
                     this.close_dialog(cx);
                     cx.stop_propagation();
@@ -1648,6 +1659,7 @@ impl Render for KitterApp {
                 DialogKind::Groups => px(420.),
                 DialogKind::DeleteGroup => px(460.),
                 DialogKind::MoveGroup => px(420.),
+                DialogKind::Storage => px(620.),
                 DialogKind::CrossProject => px((f32::from(window.bounds().size.width) - 40.).clamp(300., 980.)),
             };
             root = root.child(
@@ -2693,7 +2705,7 @@ pub fn run() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         let preview_id = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_ID").ok()).flatten();
         let preview_name = cfg!(debug_assertions).then(|| std::env::var("KITTER_PREVIEW_APP_NAME").ok()).flatten();
-        cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Kitter"));
+        cx.set_app_identity(preview_id.as_deref().unwrap_or("dev.kitter.app"), preview_name.as_deref().unwrap_or("Pleat"));
         gpui_component::init(cx);
         crate::assets::register_fonts(cx).expect("failed to register fonts");
         open_main_window(cx);
@@ -2709,7 +2721,7 @@ fn open_main_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("Kitter".into()),
+                title: Some("Pleat".into()),
                 appears_transparent: cfg!(target_os = "macos"),
                 traffic_light_position: cfg!(target_os = "macos")
                     .then(|| point(px(16.), px(17.))),

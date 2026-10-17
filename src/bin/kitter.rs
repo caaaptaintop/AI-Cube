@@ -138,9 +138,9 @@ enum Command {
         #[command(subcommand)]
         action: TagAction,
     },
-    /// Show or change where Kitter stores skills
+    /// Show or switch the skill library
     Library {
-        /// Change the skill library folder
+        /// Switch to an existing nonempty skill library
         #[arg(long, value_name = "PATH")]
         set: Option<PathBuf>,
     },
@@ -1218,9 +1218,10 @@ fn manage_library(library: &mut SkillLibrary, set: Option<PathBuf>) -> Result<()
         if !path.is_absolute() {
             bail!("请使用绝对路径");
         }
-        std::fs::create_dir_all(&path)?;
-        library.config.library_dir = path;
-        library.save()?;
+        if path != library.config.library_dir {
+            let plan = library.plan_storage_change(kitter::library::StorageAction::UseLibrary, &path)?;
+            library.apply_storage_change(&plan)?;
+        }
     }
     println!("{}", library.config.library_dir.display());
     Ok(())
@@ -1555,6 +1556,38 @@ mod tests {
             panic!("expected library command");
         };
         assert_eq!(set.unwrap(), std::path::PathBuf::from("/tmp/skills"));
+    }
+
+    #[test]
+    fn library_set_does_not_reuse_old_origins_for_existing_same_named_skills() {
+        use super::{SkillLibrary, manage_library};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let library = SkillLibrary::open_in(&data).unwrap();
+        let old_skill = library.config.library_dir.join("demo");
+        std::fs::create_dir(&old_skill).unwrap();
+        std::fs::write(old_skill.join("SKILL.md"), "old fixture skill").unwrap();
+        let mut registry: serde_json::Value = serde_json::from_slice(&std::fs::read(data.join("registry.json")).unwrap()).unwrap();
+        registry["skills"]["demo"] = serde_json::to_value(kitter::SkillRecord {
+            name: "demo".into(), storage_name: "demo".into(), description: String::new(),
+            origin: kitter::SkillOrigin::Npx { repository: "fixture/remote".into(), skill: "demo".into(), source_hash: None },
+            update_available: true, group_id: None, last_operated_at: 0,
+        }).unwrap();
+        std::fs::write(data.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
+        let mut library = SkillLibrary::open_in(&data).unwrap();
+        assert!(matches!(library.record_by_storage("demo").unwrap().origin, kitter::SkillOrigin::Npx { .. }));
+        let target = root.join("existing");
+        std::fs::create_dir_all(target.join("demo")).unwrap();
+        std::fs::write(target.join("demo/SKILL.md"), "different target fixture").unwrap();
+        manage_library(&mut library, Some(target.clone())).unwrap();
+        assert!(matches!(library.record_by_storage("demo").unwrap().origin, kitter::SkillOrigin::Unknown));
+        assert_eq!(std::fs::read(old_skill.join("SKILL.md")).unwrap(), b"old fixture skill");
+        let reopened = SkillLibrary::open_in(&data).unwrap();
+        assert!(matches!(reopened.record_by_storage("demo").unwrap().origin, kitter::SkillOrigin::Unknown));
+        assert!(manage_library(&mut library, Some(root.join("empty"))).is_err());
+        assert!(!root.join("empty").exists());
+        assert_eq!(library.config.library_dir, target);
     }
 
     #[test]

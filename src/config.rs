@@ -91,11 +91,50 @@ pub fn app_data_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("KITTER_HOME") {
         return PathBuf::from(path);
     }
+    select_app_data_dir(&preferred_app_data_dir(), &legacy_app_data_dir())
+}
+
+fn os_data_root() -> PathBuf {
     #[cfg(target_os = "windows")]
     let base = dirs::data_local_dir();
     #[cfg(not(target_os = "windows"))]
     let base = dirs::data_dir();
-    base.unwrap_or_else(|| PathBuf::from(".")).join("Kitter")
+    base.unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn preferred_app_data_dir() -> PathBuf {
+    os_data_root().join("Pleat")
+}
+
+pub fn legacy_app_data_dir() -> PathBuf {
+    os_data_root().join("Kitter")
+}
+
+fn has_app_data(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn same_data_root(preferred: &Path, legacy: &Path) -> bool {
+    preferred.canonicalize().ok().is_some_and(|p| legacy.canonicalize().ok() == Some(p))
+}
+
+fn select_app_data_dir(preferred: &Path, legacy: &Path) -> PathBuf {
+    if same_data_root(preferred, legacy) || !has_app_data(legacy) {
+        preferred.to_path_buf()
+    } else {
+        // Existing users retain their configuration until an explicit move.
+        legacy.to_path_buf()
+    }
+}
+
+pub(crate) fn validate_app_data_roots(preferred: &Path, legacy: &Path) -> Result<()> {
+    if has_app_data(preferred) && has_app_data(legacy) && !same_data_root(preferred, legacy) {
+        anyhow::bail!("Pleat 与 Kitter 数据根均有独立数据，请明确选择数据根；未切换或覆盖。可用 KITTER_HOME 指定要打开的数据根");
+    }
+    Ok(())
 }
 
 impl AppConfig {
@@ -220,6 +259,46 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AppConfig, Language};
+
+    #[test]
+    fn storage_roots_preserve_legacy_and_reject_two_active_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let preferred = temp.path().join("Pleat");
+        let legacy = temp.path().join("Kitter");
+        assert_eq!(super::select_app_data_dir(&preferred, &legacy), preferred);
+        assert!(super::validate_app_data_roots(&preferred, &legacy).is_ok());
+        std::fs::create_dir(&legacy).unwrap();
+        assert_eq!(super::select_app_data_dir(&preferred, &legacy), preferred);
+        std::fs::write(legacy.join("config.json"), b"legacy fixture").unwrap();
+        assert_eq!(super::select_app_data_dir(&preferred, &legacy), legacy);
+        std::fs::create_dir(&preferred).unwrap();
+        assert!(super::validate_app_data_roots(&preferred, &legacy).is_ok());
+        std::fs::write(preferred.join("registry.json"), b"different fixture").unwrap();
+        assert_eq!(super::select_app_data_dir(&preferred, &legacy), legacy);
+        assert!(super::validate_app_data_roots(&preferred, &legacy).is_err());
+        assert_eq!(std::fs::read(legacy.join("config.json")).unwrap(), b"legacy fixture");
+    }
+
+    #[test]
+    fn storage_roots_recognize_compatibility_link_as_one_active_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let preferred = temp.path().join("Pleat");
+        let legacy = temp.path().join("Kitter");
+        std::fs::create_dir(&preferred).unwrap();
+        std::fs::write(preferred.join("config.json"), b"fixture").unwrap();
+        crate::directory_link::create(&preferred, &legacy).unwrap();
+        assert_eq!(super::select_app_data_dir(&preferred, &legacy), preferred);
+        assert!(super::validate_app_data_roots(&preferred, &legacy).is_ok());
+    }
+
+    #[test]
+    fn storage_roots_keep_explicit_home_override() {
+        if let Some(explicit) = std::env::var_os("KITTER_HOME") {
+            assert_eq!(super::app_data_dir(), PathBuf::from(explicit));
+        }
+        assert_eq!(super::preferred_app_data_dir().file_name().unwrap(), "Pleat");
+        assert_eq!(super::legacy_app_data_dir().file_name().unwrap(), "Kitter");
+    }
 
     #[test]
     fn hiding_and_reselecting_a_discovered_project_round_trips() {

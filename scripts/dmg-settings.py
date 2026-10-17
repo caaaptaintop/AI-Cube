@@ -5,7 +5,7 @@ format = "UDZO"
 filesystem = "HFS+"
 compression_level = 9
 
-files = [(app_path, "Kitter.app")]
+files = [(app_path, "Pleat.app")]
 symlinks = {"Applications": "/Applications"}
 
 background = background_path
@@ -27,7 +27,7 @@ text_size = 14
 icon_size = 128
 
 icon_locations = {
-    "Kitter.app": (250, 233),
+    "Pleat.app": (250, 233),
     "Applications": (585, 233),
     # Finder can reveal hidden files. Keep support files outside the installer viewport.
     ".background.tiff": (1600, 1200),
