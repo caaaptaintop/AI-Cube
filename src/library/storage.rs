@@ -339,6 +339,8 @@ impl SkillLibrary {
         let lock = data.lock(Path::new("registry.lock"))?;
         #[cfg(not(unix))]
         let lock = super::registry_file_lock(&plan.frozen.data_dir)?;
+        #[allow(unused_mut)]
+        let mut registry_lock = Some(lock);
         if self.plan_storage_change(plan.action, &plan.to)?.frozen != plan.frozen {
             bail!("存储预览已失效，请重新预览");
         }
@@ -374,7 +376,7 @@ impl SkillLibrary {
                 }
                 self.config.library_dir = plan.to.clone();
                 self.registry = registry;
-                self.save_storage(&data, &lock, &recovery)
+                self.save_storage(&data, registry_lock.as_ref().context("登记锁已释放，未提交配置")?, &recovery)
             })();
             if result.is_err() { self.config = config_before; self.registry = registry_before; }
             return result.with_context(|| format!("切换库失败；原配置恢复材料：{}", recovery.display()));
@@ -429,6 +431,11 @@ impl SkillLibrary {
             {
                 bail!("源目录或父目录在迁移前变化，未迁移");
             }
+            // Windows cannot rename a directory with an open file in its tree.
+            // The sibling lock still excludes every startup and new writer;
+            // taking registry.lock above has already drained existing writers.
+            #[cfg(windows)]
+            if plan.action == StorageAction::MoveAppData { drop(registry_lock.take()); }
             move_between(&source_parent, from_name, &target_parent, to_name, &plan.from, &plan.to)
                 .context("排他迁移失败；跨盘或目标冲突时原实体未改变")?;
             moved = true;
@@ -447,9 +454,17 @@ impl SkillLibrary {
                     self.config.library_dir = plan.to.join(relative);
                 }
             } else { self.config.library_dir = plan.to.clone(); }
-            self.save_storage(&data, &lock, &recovery)
+            #[cfg(windows)]
+            if plan.action == StorageAction::MoveAppData {
+                registry_lock = Some(super::registry_file_lock(&self.data_dir)?);
+            }
+            #[cfg(windows)]
+            let data = handle(&self.data_dir)?;
+            self.save_storage(&data, registry_lock.as_ref().context("登记锁已释放，未提交配置")?, &recovery)
         })();
         if let Err(error) = result {
+            #[cfg(windows)]
+            if plan.action == StorageAction::MoveAppData { drop(registry_lock.take()); }
             self.config = config_before;
             self.registry = registry_before;
             self.data_dir = data_before;
@@ -653,6 +668,24 @@ fn remove_alias(parent: &Directory, name: &Path, path: &Path) -> Result<()> {
     { let _ = (parent, name); directory_link::remove(path, directory_link::inspect(path)?.context("兼容入口缺失")?).map_err(Into::into) }
 }
 
+fn storage_path_spelling(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsString, os::windows::ffi::{OsStrExt, OsStringExt}, path::Prefix};
+        if matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimDisk(_))) {
+            let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            return PathBuf::from(OsString::from_wide(&wide[4..]));
+        }
+    }
+    path.to_path_buf()
+}
+
+fn alias_target_matches(actual: &Path, recorded: &Path) -> bool {
+    // junction strips the Win32 verbatim drive prefix. Normalize only that
+    // spelling; the root and individual source identities are still checked.
+    storage_path_spelling(actual) == storage_path_spelling(recorded)
+}
+
 /// Resolve only identities listed by a controlled migration. An arbitrary
 /// symlink to a source is deliberately insufficient to inherit marker rights.
 pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
@@ -663,13 +696,15 @@ pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
             let canonical = ancestor.canonicalize().ok()?;
             let records = match migrations(&canonical) { Ok(records) => records, Err(_) => continue };
             for record in records.moves.iter().rev() {
-                let Ok(relative) = source.strip_prefix(&record.from) else { continue; };
+                let source_spelling = storage_path_spelling(source);
+                let from_spelling = storage_path_spelling(&record.from);
+                let Ok(relative) = source_spelling.strip_prefix(&from_spelling) else { continue; };
                 let Some(expected) = record.sources.get(relative) else { continue; };
-                if directory_link::inspect(&record.from).ok().flatten().is_none_or(|link| link.target != record.to) { continue; }
+                if directory_link::inspect(&record.from).ok().flatten().is_none_or(|link| !alias_target_matches(&link.target, &record.to)) { continue; }
                 let mut branch = visited.clone();
                 let Some(root) = resolve(&record.to, &mut branch) else { continue; };
-                if canonical != root || identity(&root).ok().as_ref() != Some(&record.identity) { continue; }
-                let target = root.join(relative);
+                if !alias_target_matches(&canonical, &root) || identity(&root).ok().as_ref() != Some(&record.identity) { continue; }
+                let target = canonical.join(relative);
                 if real_path(&target, false).is_ok() && identity(&target).ok().as_ref() == Some(expected) {
                     return Some(target);
                 }
@@ -686,6 +721,31 @@ pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_alias_spelling_only_normalizes_verbatim_drive_prefixes() {
+        assert!(alias_target_matches(Path::new(r"C:\library"), Path::new(r"\\?\C:\library")));
+        assert!(alias_target_matches(Path::new(r"\\?\C:\library"), Path::new(r"C:\library")));
+        assert!(!alias_target_matches(Path::new(r"C:\other"), Path::new(r"\\?\C:\library")));
+        assert!(!alias_target_matches(Path::new(r"\\.\C:\library"), Path::new(r"\\?\C:\library")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn storage_windows_plain_records_resolve_canonical_source_paths() {
+        let (temp, mut library) = fixture();
+        library.config.library_dir = storage_path_spelling(&library.config.library_dir);
+        library.save().unwrap();
+        let source = library.config.library_dir.join("demo");
+        let canonical_source = source.canonicalize().unwrap();
+        let target = storage_path_spelling(&root(&temp).join("moved"));
+        let plan = library.plan_storage_change(StorageAction::MoveLibrary, &target).unwrap();
+        library.apply_storage_change(&plan).unwrap();
+        let expected = target.join("demo").canonicalize().unwrap();
+        assert_eq!(migrated_source(&source), Some(expected.clone()));
+        assert_eq!(migrated_source(&canonical_source), Some(expected));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1052,6 +1112,16 @@ mod tests {
                 let target = root(&temp).join("Pleat");
                 if empty_target { fs::create_dir(&target).unwrap(); }
                 let plan = library.plan_storage_change(StorageAction::MoveAppData, &target).unwrap();
+                #[cfg(windows)]
+                {
+                    let old_root = old_data.clone();
+                    let new_root = target.clone();
+                    BEFORE_STORAGE_SAVE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                        assert!(super::super::storage_parent_lock(&old_root).is_err());
+                        assert!(super::super::registry_file_lock(&new_root).is_err());
+                        Ok(())
+                    })));
+                }
                 library.apply_storage_change(&plan).unwrap();
                 assert_eq!(library.data_dir(), target);
                 assert_eq!(identity(&target).unwrap(), data_id);
@@ -1077,7 +1147,8 @@ mod tests {
         let target_id = identity(&target).unwrap();
         let plan = library.plan_storage_change(StorageAction::MoveAppData, &target).unwrap();
         fail_save();
-        assert!(library.apply_storage_change(&plan).is_err());
+        let error = library.apply_storage_change(&plan).unwrap_err();
+        assert!(format!("{error:#}").contains("fixture: registry save failed"), "{error:#}");
         assert_eq!(library.data_dir(), old_data);
         assert_eq!(library.config.library_dir, old_library);
         assert_eq!(saved(&library), before);
