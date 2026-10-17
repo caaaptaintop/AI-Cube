@@ -1136,7 +1136,7 @@ fn skill_entry_fingerprint(path: &Path) -> Option<[u8; 32]> {
     skill_entry_bytes(path).map(|bytes| Sha256::digest(&bytes).into())
 }
 
-fn integration_entry_fingerprints(root: &Path) -> BTreeMap<String, [u8; 32]> {
+fn integration_entry_templates(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let defaults = root.join("default-skills");
     let mut entries = BTreeMap::new();
     if real_directory(&defaults).is_err() { return entries; }
@@ -1147,10 +1147,49 @@ fn integration_entry_fingerprints(root: &Path) -> BTreeMap<String, [u8; 32]> {
         // Recognize the configured Proma integration templates, not arbitrary
         // same-name project skills. The workspace entry must also match below.
         if String::from_utf8_lossy(&bytes).contains("Nowledge Mem") {
-            entries.insert(name.into(), Sha256::digest(&bytes).into());
+            entries.insert(name.into(), bytes);
         }
     }
     entries
+}
+
+// Display origin only: local commands and added notes may differ, but the
+// configured integration's name, purpose and existing prose must remain.
+fn integration_identity(bytes: &[u8], name: &str) -> Option<(String, Vec<String>)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" { return None; }
+    let header = lines.by_ref().take_while(|line| line.trim() != "---").collect::<Vec<_>>().join("\n");
+    let metadata: serde_yaml::Value = serde_yaml::from_str(&header).ok()?;
+    if metadata.get("name")?.as_str()? != name { return None; }
+    let description = metadata.get("description")?.as_str()?.trim();
+    if description.is_empty() { return None; }
+    let mut fence = None;
+    let prose = lines.filter_map(|line| {
+        let line = line.trim();
+        let delimiter = *line.as_bytes().first()?;
+        let width = line.bytes().take_while(|byte| *byte == delimiter).count();
+        if let Some((opening, minimum)) = fence {
+            if delimiter == opening && width >= minimum && line[width..].trim().is_empty() {
+                fence = None;
+            }
+            None
+        } else if matches!(delimiter, b'`' | b'~') && width >= 3
+            && !(delimiter == b'`' && line[width..].contains('`'))
+        {
+            fence = Some((delimiter, width));
+            None
+        } else { Some(line.to_string()) }
+    }).collect::<Vec<_>>();
+    prose.iter().any(|line| line.contains("Nowledge Mem"))
+        .then(|| (description.to_string(), prose))
+}
+
+fn matches_integration_variant(template: &[u8], entry: &[u8], name: &str) -> bool {
+    let Some((expected, prose)) = integration_identity(template, name) else { return false; };
+    let Some((actual, local_prose)) = integration_identity(entry, name) else { return false; };
+    let mut local = local_prose.iter();
+    expected == actual && prose.iter().all(|line| local.by_ref().any(|candidate| candidate == line))
 }
 
 fn bundled_entry_fingerprints(root: &Path) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
@@ -1214,7 +1253,7 @@ fn inspect_with_bundles(
     let workspace = Directory::open_anchored(&w.path)?;
     let workspace_signature = workspace.identity()?;
     let recovery_clear = no_pending(&w).is_ok();
-    let integration_entries = integration_entry_fingerprints(root);
+    let integration_entries = integration_entry_templates(root);
     let defaults = root.join("default-skills");
     let local_presets = if real_directory(&defaults).is_ok() {
         bundled_entries.keys().filter_map(|name| {
@@ -1271,11 +1310,14 @@ fn inspect_with_bundles(
             let unmarked = fs::symlink_metadata(path.join(MARKER))
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
             let preset = unmarked && real_directory(&path).is_ok();
-            let fingerprint = preset.then(|| skill_entry_fingerprint(&path.join("SKILL.md"))).flatten();
-            let integration = (preset
-                && integration_entries.get(&name).is_some_and(|expected| {
-                    fingerprint.as_ref() == Some(expected)
-                })).then(|| "Nowledge Mem".to_string());
+            let entry = preset.then(|| skill_entry_bytes(&path.join("SKILL.md"))).flatten();
+            let fingerprint = entry.as_ref().map(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)));
+            let integration_status = entry.as_deref().and_then(|entry| {
+                let template = integration_entries.get(&name)?;
+                if entry == template { Some(status) }
+                else { matches_integration_variant(template, entry, &name).then_some("integration_variant") }
+            });
+            let integration = integration_status.map(|_| "Nowledge Mem".to_string());
             let verified_bundle = preset && integration.is_none()
                 && bundled_entries.get(&name).is_some_and(|fingerprints| {
                     fingerprint.is_some_and(|fingerprint| fingerprints.contains(&fingerprint))
@@ -1284,7 +1326,7 @@ fn inspect_with_bundles(
             // only current application bytes authorize state changes.
             let bundled = verified_bundle || (preset && integration.is_none()
                 && local_presets.get(&name).is_some_and(|expected| fingerprint.as_ref() == Some(expected)));
-            let status = if bundled && !verified_bundle { "preset_variant" } else { status };
+            let status = integration_status.unwrap_or_else(|| if bundled && !verified_bundle { "preset_variant" } else { status });
             let removable_link = linked && cfg!(unix) && crate::library::validate_name(&name).is_ok()
                 && observed(&path).is_ok();
             let source = found.as_ref().map(|m| m.source.clone()).or_else(|| {
@@ -2380,6 +2422,87 @@ mod tests {
         assert_eq!(inspect_in(&root, &project).unwrap()[0].integration.as_deref(), Some("Nowledge Mem"));
         std::os::unix::fs::symlink(&template, &entry).unwrap();
         assert!(inspect_in(&root, &project).unwrap().iter().find(|item| item.state == "active").unwrap().integration.is_none());
+    }
+
+    #[test]
+    fn adapted_integrations_keep_origin_without_mutation_rights() {
+        for name in ["distill-memory", "read-working-memory", "save-thread", "search-memory", "status"] {
+            let (_temp, root, project, _source) = fixture();
+            let template = root.join("default-skills").join(name);
+            let body = format!("---\nname: {name}\ndescription: Use Nowledge Mem from Proma\n---\n# Integration\nUse Nowledge Mem on explicit request.\n```bash\nnmem status\n```\nKeep the original session messages.\n");
+            let adapted = format!("{}\nLocal workspace routing: choose this project's memory space.\n", body.replace("nmem status", "NMEM_SPACE=project nmem status"));
+            fs::create_dir_all(&template).unwrap();
+            fs::write(template.join("SKILL.md"), &body).unwrap();
+            for directory in ["skills", "skills-inactive"] {
+                let entry = project.join(directory).join(name);
+                fs::create_dir_all(entry.join("local-data")).unwrap();
+                fs::write(entry.join("SKILL.md"), &adapted).unwrap();
+                fs::write(entry.join("local-data/ADAPTATION.md"), "Keep project routing.").unwrap();
+            }
+            let scan = inspect_in(&root, &project).unwrap();
+            assert_eq!(scan.len(), 2);
+            for copy in &scan {
+                assert_eq!(copy.integration.as_deref(), Some("Nowledge Mem"), "{name}");
+                assert_eq!(copy.status, "integration_variant");
+                assert!(!copy.managed && !copy.bundled && !copy.removable && !copy.can_toggle());
+                assert!(set_enabled_path_in(&root, &copy.path, copy.state == "inactive").is_err());
+                assert_eq!(fs::read_to_string(copy.path.join("SKILL.md")).unwrap(), adapted);
+                assert_eq!(fs::read_to_string(copy.path.join("local-data/ADAPTATION.md")).unwrap(), "Keep project routing.");
+            }
+            assert_eq!(crate::proma_batch::installation_key(&scan[0]), crate::proma_batch::installation_key(&scan[1]));
+            assert_eq!(crate::proma_batch::installation_key(&scan[0]), format!("proma:integration:Nowledge Mem:{name}"));
+        }
+    }
+
+    #[test]
+    fn adapted_integrations_require_matching_identity_and_unmarked_real_files() {
+        let (_temp, root, project, _source) = fixture();
+        let template = root.join("default-skills/save-thread");
+        let entry = project.join("skills/save-thread");
+        let body = "---\nname: save-thread\ndescription: Save a Proma session to Nowledge Mem\n---\n# Save Thread\nSave the current session to Nowledge Mem.\n";
+        let adapted = format!("{body}\nUse this project's memory space.\n");
+        fs::create_dir_all(&template).unwrap();
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(template.join("SKILL.md"), body).unwrap();
+        fs::write(entry.join("SKILL.md"), &adapted).unwrap();
+        assert_eq!(inspect_in(&root, &project).unwrap()[0].integration.as_deref(), Some("Nowledge Mem"));
+        for impostor in [
+            "A same-name user skill mentioning Nowledge Mem.",
+            "---\nname: other\ndescription: Save a Proma session to Nowledge Mem\n---\nNowledge Mem.\n",
+            "---\nname: save-thread\ndescription: An unrelated skill\n---\nNowledge Mem.\n",
+            "---\nname: save-thread\ndescription: Save a Proma session to Nowledge Mem\n---\nAn unrelated body.\n",
+            "---\nname: save-thread\ndescription: Save a Proma session to Nowledge Mem\n---\nThis custom skill only mentions Nowledge Mem.\n",
+            "---\nname: save-thread\ndescription: [invalid metadata\n---\nNowledge Mem.\n",
+        ] {
+            fs::write(entry.join("SKILL.md"), impostor).unwrap();
+            let copy = inspect_in(&root, &project).unwrap().remove(0);
+            assert!(copy.integration.is_none() && !copy.bundled && !copy.removable && !copy.can_toggle());
+        }
+        fs::write(entry.join("SKILL.md"), &adapted).unwrap();
+        fs::remove_file(template.join("SKILL.md")).unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].integration.is_none());
+        fs::write(template.join("SKILL.md"), body).unwrap();
+        fs::write(entry.join(MARKER), "invalid managed marker").unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].integration.is_none());
+        fs::remove_file(entry.join(MARKER)).unwrap();
+        fs::remove_file(entry.join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(template.join("SKILL.md"), entry.join("SKILL.md")).unwrap();
+        assert!(inspect_in(&root, &project).unwrap()[0].integration.is_none());
+    }
+
+    #[test]
+    fn integration_variants_do_not_read_template_prose_from_code_blocks() {
+        let header = "---\nname: save-thread\ndescription: Save a session to Nowledge Mem\n---\n";
+        let prose = "# Save Thread\nSave the current session to Nowledge Mem.\n";
+        let template = format!("{header}{prose}");
+        let adapted = format!("{template}\nUse this workspace's memory space.\n");
+        assert!(matches_integration_variant(template.as_bytes(), adapted.as_bytes(), "save-thread"));
+        for quoted in [
+            format!("{header}```text\n~~~\n{prose}~~~\n```\n"),
+            format!("{header}````text\n```\n{prose}```\n````\n"),
+        ] {
+            assert!(!matches_integration_variant(template.as_bytes(), quoted.as_bytes(), "save-thread"));
+        }
     }
 
     #[test]
