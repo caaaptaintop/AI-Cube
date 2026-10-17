@@ -376,7 +376,7 @@ impl SkillLibrary {
                 }
                 self.config.library_dir = plan.to.clone();
                 self.registry = registry;
-                self.save_storage(&data, registry_lock.as_ref().context("登记锁已释放，未提交配置")?, &recovery)
+                self.save_storage(&data, registry_lock.as_deref().context("登记锁已释放，未提交配置")?, &recovery)
             })();
             if result.is_err() { self.config = config_before; self.registry = registry_before; }
             return result.with_context(|| format!("切换库失败；原配置恢复材料：{}", recovery.display()));
@@ -460,7 +460,7 @@ impl SkillLibrary {
             }
             #[cfg(windows)]
             let data = handle(&self.data_dir)?;
-            self.save_storage(&data, registry_lock.as_ref().context("登记锁已释放，未提交配置")?, &recovery)
+            self.save_storage(&data, registry_lock.as_deref().context("登记锁已释放，未提交配置")?, &recovery)
         })();
         if let Err(error) = result {
             #[cfg(windows)]
@@ -728,6 +728,51 @@ pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_released_locks_do_not_remain_held_by_forked_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        fs::create_dir(&root).unwrap();
+        for kind in 0..3 {
+            let acquire = || match kind {
+                0 => super::super::storage_parent_lock(&root),
+                1 => super::super::registry_file_lock(&root),
+                _ => handle(&root).and_then(|directory| directory.lock(Path::new("registry.lock"))),
+            };
+            let held = acquire().unwrap();
+            assert!(acquire().is_err());
+            let mut pipe = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                unsafe { libc::close(pipe[0]); libc::close(pipe[1]); }
+                panic!("fork probe failed");
+            }
+            if child == 0 {
+                // Only async-signal-safe calls after fork in this test binary.
+                unsafe {
+                    libc::close(pipe[1]);
+                    let mut byte = 0u8;
+                    let read = libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                    libc::_exit(if read == 1 { 0 } else { 74 });
+                }
+            }
+            unsafe { libc::close(pipe[0]); }
+            drop(held);
+            let reacquired = acquire();
+            let mut status = 0;
+            unsafe {
+                let byte = 1u8;
+                libc::write(pipe[1], (&byte as *const u8).cast(), 1);
+                libc::close(pipe[1]);
+                libc::waitpid(child, &mut status, 0);
+            }
+            assert_eq!(status, 0);
+            assert!(reacquired.is_ok(), "lock kind {kind} retained by child after owner scope ended");
+        }
+    }
 
     #[cfg(windows)]
     #[test]
