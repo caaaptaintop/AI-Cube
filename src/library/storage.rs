@@ -88,6 +88,13 @@ fn normalized(path: &Path) -> Result<PathBuf> {
 
 fn real_path(path: &Path, allow_missing: bool) -> Result<PathBuf> {
     let path = normalized(path)?;
+    #[cfg(windows)]
+    {
+        let mut components = path.components();
+        if matches!(components.next(), Some(Component::Prefix(_)))
+            && !matches!(components.next(), Some(Component::RootDir))
+        { bail!("存储位置必须包含完整的 Windows 根目录"); }
+    }
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
@@ -694,6 +701,17 @@ mod tests {
             assert!(real_path(&missing, false).is_err());
             assert_eq!(real_path(path.ancestors().last().unwrap(), false).unwrap(), path.ancestors().last().unwrap());
         }
+        let prefix_only = Path::new(r"\\?\UNC\pleat-invalid-host\pleat-invalid-share");
+        assert!(prefix_only.is_absolute());
+        assert!(real_path(prefix_only, false).is_err());
+        assert!(real_path(prefix_only, true).is_err());
+
+        let real = canonical.join("real");
+        let link = canonical.join("junction");
+        fs::create_dir(&real).unwrap();
+        directory_link::create(&real, &link).unwrap();
+        assert!(real_path(&link, false).is_err());
+        assert!(real_path(&link.join("missing"), true).is_err());
     }
 
     #[cfg(windows)]
