@@ -705,6 +705,13 @@ pub(crate) fn migrated_source(source: &Path) -> Option<PathBuf> {
                 let Some(root) = resolve(&record.to, &mut branch) else { continue; };
                 if !alias_target_matches(&canonical, &root) || identity(&root).ok().as_ref() != Some(&record.identity) { continue; }
                 let target = canonical.join(relative);
+                let target = match real_path(&target, false) {
+                    Ok(target) => target,
+                    Err(_) => match resolve(&target, &mut branch) {
+                        Some(target) => target,
+                        None => continue,
+                    },
+                };
                 if real_path(&target, false).is_ok() && identity(&target).ok().as_ref() == Some(expected) {
                     return Some(target);
                 }
@@ -1218,6 +1225,33 @@ mod tests {
         existing_library(&target, "replacement directory");
         assert_eq!(migrated_source(&old_source), None);
         fs::remove_file(target.join(ALIASES)).unwrap();
+        assert_eq!(migrated_source(&old_source), None);
+    }
+
+    #[test]
+    fn storage_alias_chains_survive_app_data_then_library_move() {
+        let (temp, mut library) = fixture();
+        let old_source = library.config.library_dir.join("demo");
+        let data_target = root(&temp).join("Pleat");
+        let plan = library.plan_storage_change(StorageAction::MoveAppData, &data_target).unwrap();
+        library.apply_storage_change(&plan).unwrap();
+        let next_source = library.config.library_dir.join("demo");
+        let library_target = root(&temp).join("relocated-library");
+        let plan = library.plan_storage_change(StorageAction::MoveLibrary, &library_target).unwrap();
+        library.apply_storage_change(&plan).unwrap();
+        let expected = library_target.join("demo");
+        assert_eq!(migrated_source(&old_source), Some(expected.clone()));
+        assert_eq!(migrated_source(&next_source), Some(expected));
+        let unapproved = root(&temp).join("unapproved");
+        directory_link::create(&library_target, &unapproved).unwrap();
+        let approved_link = next_source.parent().unwrap();
+        directory_link::remove(approved_link, directory_link::inspect(approved_link).unwrap().unwrap()).unwrap();
+        directory_link::create(&unapproved, approved_link).unwrap();
+        assert_eq!(migrated_source(&old_source), None);
+        directory_link::remove(approved_link, directory_link::inspect(approved_link).unwrap().unwrap()).unwrap();
+        directory_link::create(&library_target, approved_link).unwrap();
+        fs::rename(library_target.join("demo"), library_target.join("original-demo")).unwrap();
+        existing_library(&library_target, "replacement directory");
         assert_eq!(migrated_source(&old_source), None);
     }
 
