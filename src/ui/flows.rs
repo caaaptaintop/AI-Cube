@@ -89,11 +89,13 @@ impl KitterApp {
     pub(super) fn open_install_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_installed_agents();
         self.install_flow.modal = true;
-        self.install_flow.global = self.projects_view.global_project_view;
+        let project = (self.shell.page == Page::Projects && !self.projects_view.global_project_view)
+            .then_some(self.projects_view.open_project.as_ref()).flatten();
+        self.install_flow.global = project.is_none();
         self.install_flow.project_picker_open = false;
         self.install_flow.project_search.update(cx, |input, cx| input.set_value("", window, cx));
         self.install_flow.project_scroll.set_offset(point(px(0.), px(0.)));
-        self.install_flow.selected_projects = self.projects_view.open_project.iter()
+        self.install_flow.selected_projects = project.into_iter()
             .filter(|path| dirs::home_dir().as_ref() != Some(*path))
             .cloned().collect();
         self.install_flow.selected_targets.clear();

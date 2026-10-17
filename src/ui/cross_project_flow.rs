@@ -64,15 +64,13 @@ impl CrossProjectState {
     }
 
     fn select_initial_destinations(&mut self, catalog: &Catalog) {
-        if let Some(project) = self.initial_project.take() {
+        if self.agents.contains("proma") && let Some(project) = self.initial_project.take().filter(|p| self.projects.contains(p)) {
             let archived = catalog.projects.iter().any(|p| p.path == project && p.archived);
-            if self.agents.contains("proma") {
-                self.workspaces.extend(catalog.proma.iter().flat_map(|c| &c.workspaces)
-                    .filter(|w| w.workspace.project_root_path.as_ref().unwrap_or(&w.workspace.path) == &project)
-                    .filter(|w| !w.workspace.archived || archived)
-                    .filter(|w| w.error.is_none())
-                    .map(|w| w.workspace.id.clone()));
-            }
+            self.workspaces.extend(catalog.proma.iter().flat_map(|c| &c.workspaces)
+                .filter(|w| w.workspace.project_root_path.as_ref().unwrap_or(&w.workspace.path) == &project)
+                .filter(|w| !w.workspace.archived || archived)
+                .filter(|w| w.error.is_none())
+                .map(|w| w.workspace.id.clone()));
         }
         if let Some(paths) = &self.conversion_paths {
             self.workspaces = catalog.proma.iter().flat_map(|c| &c.workspaces)
@@ -199,6 +197,7 @@ impl KitterApp {
         let Some(catalog) = self.cross_project.catalog.clone() else { return; };
         if self.cross_project.busy || self.cross_project.loading { return; }
         let state = &mut self.cross_project;
+        state.select_initial_destinations(&catalog);
         state.plan_generation = state.plan_generation.wrapping_add(1);
         let generation = state.plan_generation;
         let (action, skills, agents, projects, workspaces, conversion_paths) = (state.action, state.skills.clone(), state.agents.clone(), state.projects.clone(), state.workspaces.clone(), state.conversion_paths.clone());
@@ -632,6 +631,115 @@ mod tests {
         let visible = vec!["first".to_string(), "second".to_string()];
         toggle_visible(&mut selected, &visible); assert_eq!(selected.len(), 3);
         toggle_visible(&mut selected, &visible); assert_eq!(selected, BTreeSet::from(["hidden".to_string()]));
+    }
+
+    #[cfg(all(feature = "ui-test", unix))]
+    #[test]
+    fn management_context_follows_agent_changes_without_reselecting_workspaces() {
+        use super::*;
+        use std::fs;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let project = base.join("Project A");
+        let other = base.join("Project B");
+        let proma = base.join("proma");
+        fs::create_dir(&project).unwrap(); fs::create_dir(&other).unwrap();
+        let mut workspaces = Vec::new();
+        for (id, root, archived) in [("a", &project, false), ("review", &project, false),
+            ("archive", &project, true), ("b", &other, false)] {
+            fs::create_dir_all(proma.join("agent-workspaces").join(id).join("skills")).unwrap();
+            workspaces.push(serde_json::json!({"id":id,"slug":id,"name":id,"projectRootPath":root,"archived":archived}));
+        }
+        fs::write(proma.join("agent-workspaces.json"), serde_json::to_vec(&serde_json::json!({"version":2,"workspaces":workspaces})).unwrap()).unwrap();
+        let installed = crate::agents::AGENT_ICON_ORDER.iter().filter(|a| ["codex", "proma"].contains(&a.id)).copied().collect::<Vec<_>>();
+        let catalog = Arc::new(Catalog::scan(vec![], vec![], installed.clone(), Some(&proma)));
+        let mut test = TestAppContext::single(); test.update(gpui_component::init);
+        let (app, cx) = test.add_window_view({ let data = base.join("data"); move |window, cx| KitterApp::new_in(data, window, cx) });
+        app.update_in(cx, |app, _, cx| {
+            app.model.installed_agents = installed;
+            let state = &mut app.cross_project;
+            state.catalog = Some(catalog.clone());
+            state.agents = BTreeSet::from(["codex".into()]);
+            state.projects = BTreeSet::from([project.clone()]);
+            state.initial_project = Some(project.clone());
+            state.select_initial_destinations(&catalog);
+            assert!(state.workspaces.is_empty(), "Codex must not select Proma destinations");
+            app.open_dialog(DialogKind::CrossProject, cx); app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("cross-project-agent-proma").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked(); cx.refresh().unwrap();
+        cx.read_entity(&app, |app, _| assert_eq!(app.cross_project.workspaces,
+            BTreeSet::from(["a".into(), "review".into()]), "adding Proma must select this project's active workspaces"));
+        let bounds = cx.debug_bounds("cross-project-workspace-a").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked(); cx.refresh().unwrap();
+        for _ in 0..2 {
+            let bounds = cx.debug_bounds("cross-project-agent-proma").unwrap();
+            cx.simulate_click(bounds.center(), Modifiers::none());
+            cx.run_until_parked(); cx.refresh().unwrap();
+        }
+        cx.read_entity(&app, |app, _| assert_eq!(app.cross_project.workspaces, BTreeSet::from(["review".into()]), "explicit deselection must survive toggling agents"));
+        app.update_in(cx, |app, _, cx| {
+            app.cross_project.agents = BTreeSet::from(["codex".into()]);
+            app.cross_project.workspaces.clear(); app.cross_project.initial_project = Some(project.clone());
+            app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("cross-project-presets").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked(); cx.refresh().unwrap();
+        cx.read_entity(&app, |app, _| assert_eq!(app.cross_project.workspaces, BTreeSet::from(["a".into(), "review".into()]), "preset management must inherit the same current project"));
+        app.update_in(cx, |app, _, cx| {
+            app.cross_project.initial_project = None; app.cross_project.projects.clear();
+            app.cross_project.workspaces.clear(); app.cross_project.preset_mode = false;
+            app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("cross-project-presets").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.read_entity(&app, |app, _| assert!(app.cross_project.workspaces.is_empty(), "library entry without project context must not select any workspace"));
+        app.update_in(cx, |app, _, cx| {
+            app.cross_project.agents = BTreeSet::from(["codex".into()]);
+            app.cross_project.initial_project = Some(project.clone());
+            app.update_cross_project_plan(cx);
+        });
+        cx.run_until_parked(); cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("cross-project-agent-proma").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.read_entity(&app, |app, _| assert!(app.cross_project.workspaces.is_empty(), "explicitly deselected projects must not acquire workspace selections"));
+    }
+
+    #[cfg(feature = "ui-test")]
+    #[test]
+    fn management_install_dialog_uses_only_the_visible_project_context() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("Project A"); let other = temp.path().join("Project B");
+        std::fs::create_dir(&project).unwrap(); std::fs::create_dir(&other).unwrap();
+        let mut test = TestAppContext::single(); test.update(gpui_component::init);
+        let (app, cx) = test.add_window_view({ let data = temp.path().join("data"); move |window, cx| KitterApp::new_in(data, window, cx) });
+        app.update_in(cx, |app, window, cx| {
+            app.shell.page = Page::Projects; app.projects_view.global_project_view = false;
+            app.projects_view.open_project = Some(project.clone());
+            app.open_install_dialog(window, cx);
+            assert!(!app.install_flow.global);
+            assert_eq!(app.install_flow.selected_projects, BTreeSet::from([project.clone()]));
+            app.shell.page = Page::Skills;
+            app.open_install_dialog(window, cx);
+            assert!(app.install_flow.global, "library install must not inherit the previously viewed project");
+            assert!(app.install_flow.selected_projects.is_empty());
+            app.shell.page = Page::Projects; app.projects_view.open_project = Some(other.clone());
+            app.open_install_dialog(window, cx);
+            assert_eq!(app.install_flow.selected_projects, BTreeSet::from([other.clone()]));
+            app.projects_view.global_project_view = true;
+            app.open_install_dialog(window, cx);
+            assert!(app.install_flow.global);
+            assert!(app.install_flow.selected_projects.is_empty(), "global management must not retain a hidden project selection");
+        });
     }
 
     #[cfg(all(feature = "ui-test", unix))]
