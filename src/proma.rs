@@ -273,7 +273,7 @@ struct Marker {
 
 fn marker(path: &Path, w: &Workspace) -> Result<Marker> {
     real_directory(path)?;
-    let m: Marker = read_json(&path.join(MARKER))?;
+    let mut m: Marker = read_json(&path.join(MARKER))?;
     if m.schema != 1
         || m.workspace_id != w.id
         || m.workspace_slug != w.slug
@@ -281,6 +281,9 @@ fn marker(path: &Path, w: &Workspace) -> Result<Marker> {
         || !m.source.is_absolute()
     {
         bail!("Proma 安装标记与工作区身份不符");
+    }
+    if let Some(source) = crate::library::storage::migrated_source(&m.source) {
+        m.source = source;
     }
     Ok(m)
 }
@@ -467,12 +470,21 @@ fn plan_install_at(
     }
     .to_string();
     let local_data_path = source.join("local-data");
-    let local_data = match fs::symlink_metadata(&local_data_path) {
+    let mut local_data = match fs::symlink_metadata(&local_data_path) {
         Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Some(local_data_path),
         Ok(_) => bail!("来源 local-data 必须是实体目录"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
+    // Existing copies retain their exact local-data link after a controlled
+    // root move. Their marker and content hashes are not rewritten by a move.
+    if let Ok(m) = marker(existing, &workspace)
+        && m.source == source
+        && let Some(previous) = m.local_data
+        && storage_local_data(&previous, &source)
+    {
+        local_data = Some(previous);
+    }
     #[cfg(test)]
     BEFORE_PLAN_OBSERVATION.with(|hook| {
         if let Some(callback) = hook.borrow_mut().take() { callback(); }
@@ -520,6 +532,13 @@ fn adaptation(content: &str, source: &Path, local_data: bool) -> String {
         }
     }
     format!("{bridge}{text}")
+}
+
+fn storage_local_data(path: &Path, source: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new("local-data"))
+        && path.parent().and_then(crate::library::storage::migrated_source).as_deref() == Some(source)
+        && path.canonicalize().ok() == source.join("local-data").canonicalize().ok()
+        && path.is_dir()
 }
 
 fn copy_package(plan: &InstallPlan, output: &Directory) -> Result<Marker> {
@@ -622,7 +641,7 @@ fn recheck(plan: &InstallPlan) -> Result<()> {
         || plan
             .local_data
             .as_ref()
-            .is_some_and(|p| *p != plan.source.join("local-data"))
+            .is_some_and(|p| *p != plan.source.join("local-data") && !storage_local_data(p, &plan.source))
     {
         bail!("Proma 安装计划路径或动作无效");
     }
@@ -1810,6 +1829,61 @@ mod tests {
         .unwrap();
         fs::write(source.join("local-data/private.env"), "fixture-secret").unwrap();
         (temp, root, project, source)
+    }
+
+    #[test]
+    fn storage_controlled_move_keeps_marker_and_private_link_then_allows_same_source_update() {
+        let (temp, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        let copy = project.join("skills/example");
+        let marker_before = fs::read(copy.join(MARKER)).unwrap();
+        let private_link = fs::read_link(copy.join("local-data")).unwrap();
+        let source_root = source.parent().unwrap().canonicalize().unwrap();
+        let old_source = source.canonicalize().unwrap();
+        let mut library = crate::SkillLibrary::open_in(temp.path().canonicalize().unwrap().join("Kitter")).unwrap();
+        library.config.library_dir = source_root;
+        library.save().unwrap();
+        let target = temp.path().canonicalize().unwrap().join("moved-library");
+        let plan = library.plan_storage_change(crate::library::StorageAction::MoveLibrary, &target).unwrap();
+        library.apply_storage_change(&plan).unwrap();
+        let moved_source = target.join("example");
+        let workspace = workspace_for_path(&root, &project).unwrap();
+        assert_eq!(marker(&copy, &workspace).unwrap().source, moved_source);
+        assert_eq!(fs::read(copy.join(MARKER)).unwrap(), marker_before);
+        assert_eq!(fs::read_link(copy.join("local-data")).unwrap(), private_link);
+        assert_eq!(clean_marker(&copy, &workspace).unwrap().source, moved_source);
+        let unchanged = plan_install(&root, &project, &old_source, "example").unwrap();
+        assert_eq!(unchanged.action, "unchanged");
+        assert_eq!(unchanged.local_data, Some(private_link.clone()));
+        apply_plan(&unchanged).unwrap();
+        assert_eq!(fs::read(copy.join(MARKER)).unwrap(), marker_before);
+        fs::write(moved_source.join("SKILL.md"), "---\nname: example\n---\nUpdated public fixture\n").unwrap();
+        let update = plan_install(&root, &project, &moved_source, "example").unwrap();
+        assert_eq!(update.action, "update");
+        assert_eq!(update.local_data, Some(private_link.clone()));
+        apply_plan(&update).unwrap();
+        assert_eq!(fs::read_link(copy.join("local-data")).unwrap(), private_link);
+        assert_eq!(fs::read(copy.join("local-data/private.env")).unwrap(), b"fixture-secret");
+        fs::write(copy.join("SKILL.md"), "local copy edit").unwrap();
+        assert!(plan_install(&root, &project, &moved_source, "example").is_err());
+        let mut other_workspace = workspace.clone();
+        other_workspace.id = "different-workspace".into();
+        assert!(marker(&copy, &other_workspace).is_err());
+    }
+
+    #[test]
+    fn storage_unapproved_source_alias_does_not_inherit_proma_marker_rights() {
+        let (temp, root, project, source) = fixture();
+        apply_plan(&plan_install(&root, &project, &source, "example").unwrap()).unwrap();
+        let original_root = source.parent().unwrap().canonicalize().unwrap();
+        let target = temp.path().canonicalize().unwrap().join("uncontrolled-library");
+        fs::rename(&original_root, &target).unwrap();
+        crate::directory_link::create(&target, &original_root).unwrap();
+        let workspace = workspace_for_path(&root, &project).unwrap();
+        let copy = project.join("skills/example");
+        assert_eq!(marker(&copy, &workspace).unwrap().source, original_root.join("example"));
+        assert!(plan_install(&root, &project, &target.join("example"), "example").is_err());
+        assert!(clean_marker(&copy, &workspace).is_ok());
     }
 
     fn builtin_fixture() -> (

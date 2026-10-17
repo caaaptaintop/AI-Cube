@@ -8,6 +8,7 @@ impl KitterApp {
     }
 
     pub(super) fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.settings_storage.busy { return; }
         if self.cross_project_busy() { return; }
         if self
             .shell
@@ -38,6 +39,9 @@ impl KitterApp {
         self.groups_flow.edit = None;
         self.groups_flow.delete_pending = None;
         self.groups_flow.move_skills.clear();
+        self.settings_storage.action = None;
+        self.settings_storage.plan = None;
+        self.settings_storage.error = None;
         self.shell.dialog_body = None;
         cx.notify();
     }
