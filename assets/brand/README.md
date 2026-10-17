@@ -34,4 +34,4 @@ just macos-icon
 
 只改变产品显示、品牌图形和桌面安装包名称。bundle identifier 仍为 `dev.kitter.app`，内部可执行文件仍为 `Kitter`，Cargo 包与 CLI 命令仍为 `kitter`，签名仍沿用原脚本。应用数据目录仍为 `Kitter`；技能、钥匙串、配置格式与既有来源/下载地址均不因改名而迁移。
 
-`LICENSE` 与 `THIRD_PARTY_LICENSES.md` 保持原文，打包时随应用分发；关于区域保留 Kitter、what1f/kitter 和 Apache-2.0 署名。本地构建不代表公开发布，也不代表三端运行验收已完成。
+`LICENSE` 与 `THIRD_PARTY_LICENSES.md` 保持原文，打包时随应用分发；关于区域的署名简化为“基于 Kitter”，下方“项目主页”指向本项目 GitHub，不显示裸网址。本地构建不代表公开发布，也不代表三端运行验收已完成。

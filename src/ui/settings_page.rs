@@ -221,9 +221,20 @@ impl KitterApp {
                     .child(div().mt(px(2.)).text_size(px(12.)).text_color(p.secondary)
                         .child(format!("{} · {}", self.tr("版本", "Version"), env!("CARGO_PKG_VERSION"))))
                     .child(div().mt(px(8.)).text_size(px(12.)).text_color(p.muted)
-                        .child(self.tr("基于 Kitter · Apache-2.0 · 感谢 Kitter 贡献者", "Based on Kitter · Apache-2.0 · Kitter contributors")))
-                    .child(div().mt(px(2.)).text_size(px(12.)).text_color(p.muted)
-                        .child("what1f/kitter")),
+                        .child(self.tr("基于 Kitter", "Based on Kitter")))
+                    .child(
+                        div().mt(px(6.)).flex().child(
+                            gpui_base::Link::new("about-project-home")
+                                .href("https://github.com/caaaptaintop/AI-Cube")
+                                .open_with(|href, _, _, cx| cx.open_url(href))
+                                .accessibility_label(self.tr("项目主页", "Project homepage"))
+                                .text_size(px(12.))
+                                .text_color(p.accent)
+                                .cursor_pointer()
+                                .hover(|link| link.underline())
+                                .child(self.tr("项目主页", "Project homepage")),
+                        ),
+                    ),
             );
 
         div()
